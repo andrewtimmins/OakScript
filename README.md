@@ -39,8 +39,8 @@ Complete execution environment with comprehensive error handling:
 
 ## File Types
 
-- **`.oak`** - OakScript source files (Type EEE)
-- **`.eef`** - Compiled bytecode files (Type EEF)
+- OakScript source files (Type &EEE)
+- Compiled bytecode files (Type &EEF)
 
 ## Commands
 
@@ -278,8 +278,8 @@ end
 #### File Inclusion
 ```oakscript
 // Include other script files
-include "utilities.oak"
-include "constants.oak"
+#include "utilities"
+#include "constants"
 ```
 
 ### Built-in Functions
@@ -332,9 +332,9 @@ hex_val = fromhex("FF")         // From hexadecimal: 255
 ```oakscript
 // File management
 exists = exists("filename")           // Check if file exists
-written = writefile("log.txt", "Hello") // Write to file
-appended = appendfile("log.txt", "World") // Append to file
-content = readfile("data.txt")        // Read file contents
+written = writefile("<filepath$dir>.log", "Hello") // Write to file
+appended = appendfile("<filepath$dir>.log", "World") // Append to file
+content = readfile("<filepath$dir>.log")        // Read file contents
 ```
 
 #### System & SWI Functions
@@ -430,10 +430,25 @@ OakScript/
 ## Development
 
 ### Building
-```bash
-make clean
-make all
+
+OakScript is built using the Acorn C/C++ compiler and AMU (Acorn Make Utility) on RISC OS:
+
 ```
+*AMU clean
+*AMU all
+```
+
+**Requirements:**
+- Acorn C/C++ Development Suite
+- AMU (Acorn Make Utility)  
+- CMHG (C Module Header Generator)
+- RISC OS development environment
+
+**Build Process:**
+1. The Makefile uses AMU-specific syntax and RISC OS path conventions
+2. CMHG generates the module header from `cmhg.header`
+3. Acorn C compiler builds all source files with RISC OS-specific flags
+4. Final output is a RISC OS module (`OakScript`) ready for loading
 
 ### Testing
 The `Examples/` directory contains comprehensive test scripts that exercise all language features and opcodes.
