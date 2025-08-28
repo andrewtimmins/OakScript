@@ -1,0 +1,442 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <kernel.h>
+#include "h.memory"
+#include "h.engine"
+#include "h.swi"
+#include "h.debug"
+
+#ifndef __uintptr_t_defined
+typedef unsigned int uintptr_t;
+#define __uintptr_t_defined
+#endif
+
+#ifndef _KERNEL_DECLS_DONE
+#define _KERNEL_DECLS_DONE
+extern void _kernel_exit(int);
+extern int _kernel_oswrch(int);
+#endif
+
+/* Static variables for SWI handling */
+static int last_swi_status = 0;
+static _kernel_swi_regs last_swi_regs; /* Store last SWI register results */
+
+/* Convert SWI name to number using OS_SWINumberFromString */
+int swi_name_to_number(const char *name) {
+    /* Use OS_SWINumberFromString SWI (&39) */
+    _kernel_swi_regs regs;
+    mod_memset(&regs, 0, sizeof(regs));
+    regs.r[0] = 0;  /* flags (usually 0) */
+    regs.r[1] = (int)(uintptr_t)name;
+    
+    /* According to clibhdrs/swis, OS_SWINumberFromString = 0x00000039 */
+    _kernel_oserror *err = _kernel_swi(0x00000039, &regs, &regs);
+    if (!err) {
+        return regs.r[0]; /* SWI number returned in R0 */
+    }
+    
+    /* Try to parse as hex or decimal number if name lookup fails */
+    if (name[0] == '0' && (name[1] == 'x' || name[1] == 'X')) {
+        int v = 0, i = 2, c;
+        while ((c = name[i]) != 0) {
+            if (c >= '0' && c <= '9') {
+                v = v * 16 + (c - '0');
+            } else if (c >= 'a' && c <= 'f') {
+                v = v * 16 + (c - 'a' + 10);
+            } else if (c >= 'A' && c <= 'F') {
+                v = v * 16 + (c - 'A' + 10);
+            } else {
+                break;
+            }
+            i++;
+        }
+        return v;
+    } else if (name[0] >= '0' && name[0] <= '9') {
+        int v = 0, i = 0, c;
+        while ((c = name[i]) != 0 && c >= '0' && c <= '9') {
+            v = v * 10 + (c - '0');
+            i++;
+        }
+        return v;
+    } else if (name[0] == '&') {
+        /* RISC OS style hex (&FF) */
+        int v = 0, i = 1, c;
+        while ((c = name[i]) != 0) {
+            if (c >= '0' && c <= '9') {
+                v = v * 16 + (c - '0');
+            } else if (c >= 'a' && c <= 'f') {
+                v = v * 16 + (c - 'a' + 10);
+            } else if (c >= 'A' && c <= 'F') {
+                v = v * 16 + (c - 'A' + 10);
+            } else {
+                break;
+            }
+            i++;
+        }
+        return v;
+    }
+    
+    /* Report error and exit */
+    char *p = "OS_SWINumberFromString failed for: ";
+    while (*p) { _kernel_oswrch(*p++); }
+    p = (char*)name;
+    while (*p) { _kernel_oswrch(*p++); }
+    if (err) {
+        _kernel_oswrch(' ');
+        _kernel_oswrch('-');
+        _kernel_oswrch(' ');
+        p = err->errmess;
+        while (*p) { _kernel_oswrch(*p++); }
+    }
+    _kernel_oswrch('\n');
+    _kernel_exit(1);
+    return 0; /* avoid implicit return warning */
+}
+
+/* Prepare SWI parameters in registers */
+int prepare_swi_parameters(_kernel_swi_regs *regs, int param_count, void **params, VarType *param_types) {
+    if (param_count > 10) {
+        printf("Too many SWI parameters (max 10)\n");
+        return -1;
+    }
+    
+    /* Clear all registers first */
+    mod_memset(regs, 0, sizeof(*regs));
+    
+    /* Set parameters in registers R0-R9 */
+    for (int i = 0; i < param_count; i++) {
+        switch (param_types[i]) {
+            case VAR_INT:
+                regs->r[i] = *(int*)params[i];
+                break;
+                
+            case VAR_STRING:
+                regs->r[i] = (int)(uintptr_t)params[i];
+                break;
+                
+            case VAR_BUFFER:
+            case VAR_BLOCK:
+            case VAR_ARRAY:
+            case VAR_BYTES:
+                regs->r[i] = (int)(uintptr_t)params[i];
+                break;
+                
+            case VAR_POINTER:
+                regs->r[i] = (int)(uintptr_t)(*(void**)params[i]);
+                break;
+                
+            case VAR_REFERENCE:
+                /* References should be resolved before calling this function */
+                printf("Warning: Unresolved reference in SWI parameter %d\n", i);
+                regs->r[i] = 0;
+                break;
+        }
+    }
+    
+    return 0;
+}
+
+/* Handle SWI output parameters */
+void handle_swi_output_parameters(int param_count, void **params, VarType *param_types, _kernel_swi_regs *regs) {
+    /* For now, we don't automatically update output parameters */
+    /* This would need more sophisticated parameter direction tracking */
+    /* The calling code can check registers manually if needed */
+}
+
+/* Execute a SWI call */
+int swi_call(const char *swi_name, int param_count, void **params, VarType *param_types) {
+    /* Get SWI number */
+    int swi_number = swi_name_to_number(swi_name);
+    
+    /* Prepare registers */
+    _kernel_swi_regs regs;
+    if (prepare_swi_parameters(&regs, param_count, params, param_types) != 0) {
+        return -1;
+    }
+    
+    /* Execute SWI */
+    _kernel_oserror *err = _kernel_swi(swi_number, &regs, &regs);
+    
+    /* Store register results */
+    mod_memcpy(&last_swi_regs, &regs, sizeof(last_swi_regs));
+    
+    /* Handle output parameters */
+    handle_swi_output_parameters(param_count, params, param_types, &regs);
+    
+    /* Set status */
+    if (err) {
+        last_swi_status = err->errnum;
+        printf("SWI Error: %s\n", err->errmess);
+        return err->errnum;
+    } else {
+        last_swi_status = 0;
+        return regs.r[0]; /* Return R0 as result */
+    }
+}
+
+/* Get last SWI execution status */
+int get_last_swi_status(void) {
+    return last_swi_status;
+}
+
+/* Set SWI execution status */
+void set_last_swi_status(int status) {
+    last_swi_status = status;
+}
+
+/* Get all register results from last SWI call */
+void get_last_swi_registers(int *regs_out) {
+    for (int i = 0; i < 10; i++) {
+        regs_out[i] = last_swi_regs.r[i];
+    }
+}
+
+/* Simple SWI execution with register values */
+int swi_execute_with_registers(const char *swi_name, int *input_regs, int reg_count) {
+    /* Get SWI number */
+    int swi_number = swi_name_to_number(swi_name);
+#ifdef SWI_DEBUG
+    printf("Debug: SWI %s resolved to number &%X\n", swi_name, swi_number);
+#endif
+    
+    if (swi_number == 0) {
+        printf("Error: Failed to resolve SWI name: %s\n", swi_name);
+        return 0;
+    }
+    
+    /* Initialize registers */
+    _kernel_swi_regs regs;
+    mod_memset(&regs, 0, sizeof(regs));
+    
+    /* Copy input registers */
+    for (int i = 0; i < reg_count && i < 10; i++) {
+        regs.r[i] = input_regs[i];
+        
+#ifdef SWI_DEBUG
+        printf("Debug: Setting R%d = &%X (%d)\n", i, input_regs[i], input_regs[i]);
+#endif
+    }
+    
+    /* Execute SWI */
+    
+#ifdef SWI_DEBUG
+    printf("Debug: Executing SWI &%X\n", swi_number);
+#endif
+    _kernel_oserror *err = _kernel_swi(swi_number, &regs, &regs);
+    
+    /* Store register results */
+    mod_memcpy(&last_swi_regs, &regs, sizeof(last_swi_regs));
+    
+    /* Debug output */
+#ifdef SWI_DEBUG
+    printf("Debug: SWI returned - R0=&%X R1=&%X R2=&%X\n", regs.r[0], regs.r[1], regs.r[2]);
+#endif
+    
+    /* Set status */
+    if (err) {
+        last_swi_status = err->errnum;
+        return 0; /* Return 0 for failure */
+    } else {
+        last_swi_status = 0;
+        return 1; /* Return 1 for success */
+    }
+}
+
+/* Execute SWI with safe out-strings/buffers; write back to variables if named */
+int swi_execute_with_out_strings(const char *swi_name,
+                                 int *input_regs,
+                                 int reg_count,
+                                 const SwiOutString *outs,
+                                 int outs_count) {
+    /* Resolve SWI */
+    int swi_number = swi_name_to_number(swi_name);
+    if (swi_number == 0) {
+        last_swi_status = 1;
+        return 0;
+    }
+
+    _kernel_swi_regs regs;
+    mod_memset(&regs, 0, sizeof(regs));
+
+    /* Copy input regs */
+    for (int i = 0; i < reg_count && i < 10; i++) {
+        regs.r[i] = input_regs[i];
+    }
+
+    /* Allocate DA-backed out buffers and wire into regs */
+    char *allocated[10];
+    mod_memset(allocated, 0, sizeof(allocated));
+    size_t capacities[10];
+    mod_memset(capacities, 0, sizeof(capacities));
+
+    for (int i = 0; i < outs_count; i++) {
+        int ri = outs[i].reg_index;
+        if (ri < 0 || ri >= 10) continue;
+        size_t cap = outs[i].capacity ? outs[i].capacity : 1024;
+        char *buf = (char*)mod_malloc(cap);
+        if (!buf) continue;
+        allocated[ri] = buf;
+        capacities[ri] = cap;
+        /* Seed with initial contents if provided */
+        if (outs[i].initial) {
+            size_t lin = mod_strlen(outs[i].initial);
+            if (lin >= cap) lin = cap - 1;
+            mod_memcpy(buf, outs[i].initial, lin);
+            buf[lin] = '\0';
+        } else {
+            if (cap) buf[0] = '\0';
+        }
+        regs.r[ri] = (int)(uintptr_t)buf;
+    }
+
+    /* Call SWI */
+    if (debug_is_enabled()) {
+        debug_printf("swi_handler: calling %s with regs ", swi_name);
+        for (int i = 0; i < 10; i++) {
+            debug_printf("r%d=%d ", i, regs.r[i]);
+        }
+        debug_printf("\n");
+    }
+    
+    _kernel_oserror *err = _kernel_swi(swi_number, &regs, &regs);
+    mod_memcpy(&last_swi_regs, &regs, sizeof(last_swi_regs));
+    last_swi_status = err ? err->errnum : 0;
+    
+    if (debug_is_enabled()) {
+        if (err) {
+            debug_printf("swi_handler: %s returned error %d: %s\n", swi_name, err->errnum, err->errmess);
+        } else {
+            debug_printf("swi_handler: %s returned ", swi_name);
+            for (int i = 0; i < 10; i++) {
+                debug_printf("r%d=%d ", i, regs.r[i]);
+            }
+            debug_printf("\n");
+        }
+    }
+
+    /* Write back to named variables (string) if provided */
+    if (!err) {
+        for (int i = 0; i < outs_count; i++) {
+            int ri = outs[i].reg_index;
+            if (ri < 0 || ri >= 10) continue;
+            char *buf = allocated[ri];
+            if (!buf) continue;
+            /* Ensure NUL-termination */
+            if (capacities[ri] > 0) buf[capacities[ri] - 1] = '\0';
+            if (outs[i].var_name && outs[i].var_name[0]) {
+                /* Replace target variable as string */
+                set_variable_value(outs[i].var_name, VAR_STRING, buf);
+            }
+        }
+    }
+
+    /* Free all temporary buffers; set_variable_value duplicates content */
+    for (int r = 0; r < 10; r++) {
+        if (allocated[r]) {
+            mod_free(allocated[r]);
+        }
+    }
+
+    return err ? 0 : 1;
+}
+
+/* Forward declarations for OakScript parsing */
+extern char* evaluate_string_expr(void);
+extern Token* next_token(void);
+extern Token* peek_token(void);
+extern int expression(void);
+extern void set_variable_value(const char *name, VarType type, void *value);
+extern void* get_variable_value(const char *name, VarType *type);
+extern char* mod_strdup(const char *s);
+extern void mod_free(void *ptr);
+
+/* Global SWI result storage (should be in script.c but accessing here) */
+extern int global_swi_regs[10];
+
+/* Builtin function wrappers for OakScript */
+int swi_builtin_call(void) {
+    // Parse the SWI name
+    char *swi_name = evaluate_string_expr();
+    if (!swi_name) {
+        printf("swi expects SWI name\n");
+        exit(1);
+    }
+    
+    // Handle parameters
+    int input_regs[10] = {0};
+    int param_count = 0;
+    SwiOutString outs[10];
+    int outs_count = 0;
+    char *string_params[10] = {NULL};
+    
+    while (peek_token()->type == TOKEN_COMMA && param_count < 10) {
+        next_token(); // consume ','
+        Token *arg_tok = peek_token();
+        
+        if (arg_tok->type == TOKEN_INT) {
+            next_token();
+            input_regs[param_count] = arg_tok->value;
+        } else if (arg_tok->type == TOKEN_STRING) {
+            next_token();
+            string_params[param_count] = mod_strdup(arg_tok->lexeme);
+            input_regs[param_count] = (int)(uintptr_t)string_params[param_count];
+        } else if (arg_tok->type == TOKEN_IDENT) {
+            VarType t; 
+            void *val = get_variable_value(arg_tok->lexeme, &t);
+            if (!val) { 
+                printf("Undefined variable in swi param\n"); 
+                exit(1); 
+            }
+            next_token();
+            
+            if (t == VAR_INT) {
+                input_regs[param_count] = *(int*)val;
+            } else if (t == VAR_FLOAT) {
+                input_regs[param_count] = (int)(*(float*)val);
+            } else if (t == VAR_BOOL) {
+                input_regs[param_count] = *(int*)val ? 1 : 0;
+            } else if (t == VAR_TIME) {
+                input_regs[param_count] = (int)(*(unsigned int*)val);
+            } else if (t == VAR_STRING) {
+                // Automatic out-string buffer in Rn, write back to this variable
+                outs[outs_count].reg_index = param_count;
+                outs[outs_count].var_name = arg_tok->lexeme;
+                outs[outs_count].initial = (const char*)val;
+                outs[outs_count].capacity = 1024;
+                outs_count++;
+                input_regs[param_count] = 0;
+            } else {
+                input_regs[param_count] = (int)(uintptr_t)val;
+            }
+        }
+        param_count++;
+    }
+    
+    // Centralized call with out-string descriptors (if any)
+    int success = swi_execute_with_out_strings(swi_name, input_regs, param_count, outs, outs_count);
+    
+    for (int i = 0; i < param_count; i++) {
+        if (string_params[i]) mod_free(string_params[i]);
+    }
+    
+    if (success) {
+        int reg_results[10]; 
+        get_last_swi_registers(reg_results);
+        for (int i = 0; i < 10; i++) {
+            global_swi_regs[i] = reg_results[i];
+        }
+    } else {
+        for (int i = 0; i < 10; i++) {
+            global_swi_regs[i] = 0;
+        }
+        return -1;
+    }
+    
+    mod_free(swi_name);
+    return global_swi_regs[0]; // Return R0 by default
+}
+
+int swi_builtin_error(void) {
+    return get_last_swi_status();
+}

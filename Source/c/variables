@@ -1,0 +1,582 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include "h.memory"
+#include "h.engine"
+#include "h.variables"
+
+/* Global variable storage */
+Variable variables[MAX_VARS];
+int var_count = 0;
+
+/* Find variable by name, return index or -1 if not found */
+int find_variable(const char *name) {
+    for (int i = 0; i < var_count; i++) {
+        if (mod_strcmp(variables[i].name, name) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* Clean up a variable's allocated memory */
+void cleanup_variable(int index) {
+    if (index < 0 || index >= var_count) return;
+    
+    Variable *var = &variables[index];
+    
+    switch (var->type) {
+        case VAR_STRING:
+            if (var->value.string_value) {
+                mod_free(var->value.string_value);
+                var->value.string_value = NULL;
+            }
+            break;
+        
+        case VAR_BUFFER:
+            if (var->value.buffer_value.data) {
+                mod_free(var->value.buffer_value.data);
+                var->value.buffer_value.data = NULL;
+                var->value.buffer_value.size = 0;
+            }
+            break;
+        
+        case VAR_BLOCK:
+            if (var->value.block_value.data) {
+                mod_free(var->value.block_value.data);
+                var->value.block_value.data = NULL;
+                var->value.block_value.size = 0;
+            }
+            break;
+        
+        case VAR_ARRAY:
+            if (var->value.array_value.data) {
+                mod_free(var->value.array_value.data);
+                var->value.array_value.data = NULL;
+                var->value.array_value.count = 0;
+            }
+            break;
+        
+        case VAR_BYTES:
+            if (var->value.bytes_value.data) {
+                mod_free(var->value.bytes_value.data);
+                var->value.bytes_value.data = NULL;
+                var->value.bytes_value.size = 0;
+            }
+            break;        case VAR_FILE:
+            if (var->value.file_value && var->value.file_value != (void*)stdin && 
+                var->value.file_value != (void*)stdout && var->value.file_value != (void*)stderr) {
+                fclose((FILE*)var->value.file_value);
+                var->value.file_value = NULL;
+            }
+            break;
+            
+        case VAR_INT:
+        case VAR_POINTER:
+        case VAR_REFERENCE:
+        case VAR_FLOAT:
+        case VAR_BOOL:
+        case VAR_TIME:
+            /* No dynamic memory to clean up */
+            break;
+    }
+    
+    /* Clear the entire union to prevent stale pointer access */
+    /* Use simple assignment instead of memset for RISC OS compatibility */
+    var->value.int_value = 0;
+}
+
+/* Set variable value, creating new variable if needed */
+void set_variable_value(const char *name, VarType type, void *value) {
+    int index = find_variable(name);
+    
+    if (index == -1) {
+        /* Create new variable */
+        if (var_count >= MAX_VARS) {
+            printf("Too many variables\n");
+            exit(1);
+        }
+        
+        index = var_count;
+        mod_strcpy(variables[index].name, name);
+        /* Clear the union for new variables - use simple assignment */
+        variables[index].value.int_value = 0;
+        variables[index].is_const = false; // Initialize as non-constant
+        var_count++;
+    } else {
+        /* Clean up existing variable */
+        cleanup_variable(index);
+    }
+    
+    /* Set new type and value */
+    variables[index].type = type;
+    
+    switch (type) {
+        case VAR_INT:
+            variables[index].value.int_value = *(int*)value;
+            break;
+            
+        case VAR_STRING:
+            variables[index].value.string_value = mod_strdup((char*)value);
+            break;
+            
+        case VAR_BUFFER: {
+            int size = *(int*)value;
+            variables[index].value.buffer_value.capacity = size;
+            variables[index].value.buffer_value.size = 0;
+            variables[index].value.buffer_value.data = mod_malloc(size);
+            if (variables[index].value.buffer_value.data) {
+                variables[index].value.buffer_value.data[0] = '\0';
+            }
+            break;
+        }
+        
+        case VAR_POINTER:
+            variables[index].value.pointer_value = value;
+            break;
+            
+        case VAR_BLOCK: {
+            int *params = (int*)value;
+            int size = params[0];
+            int element_size = params[1];
+            variables[index].value.block_value.size = size;
+            variables[index].value.block_value.element_size = element_size;
+            variables[index].value.block_value.data = mod_malloc(size);
+            if (variables[index].value.block_value.data) {
+                mod_memset(variables[index].value.block_value.data, 0, size);
+            }
+            break;
+        }
+        
+        case VAR_ARRAY: {
+            int capacity = *(int*)value;
+            variables[index].value.array_value.capacity = capacity;
+            variables[index].value.array_value.count = 0;
+            variables[index].value.array_value.data = mod_malloc(capacity * sizeof(int));
+            break;
+        }
+        
+        case VAR_BYTES: {
+            int capacity = *(int*)value;
+            variables[index].value.bytes_value.capacity = capacity;
+            variables[index].value.bytes_value.size = 0;
+            variables[index].value.bytes_value.data = mod_malloc(capacity);
+            if (variables[index].value.bytes_value.data) {
+                mod_memset(variables[index].value.bytes_value.data, 0, capacity);
+            }
+            break;
+        }
+        
+        case VAR_REFERENCE: {
+            char *ref_name = (char*)value;
+            mod_strcpy(variables[index].value.reference_value.ref_name, ref_name);
+            variables[index].value.reference_value.ref_type = VAR_INT; // default
+            break;
+        }
+        
+        case VAR_FLOAT:
+            variables[index].value.float_value = *(float*)value;
+            break;
+            
+        case VAR_FILE:
+            variables[index].value.file_value = value;  // Store as void*
+            break;
+            
+        case VAR_BOOL:
+            variables[index].value.bool_value = *(int*)value;  // Store as int
+            break;
+            
+        case VAR_TIME:
+            variables[index].value.time_value = *(unsigned int*)value;  // Store as unsigned int
+            break;
+    }
+}
+
+/* Get variable value and type */
+void* get_variable_value(const char *name, VarType *type) {
+    int index = find_variable(name);
+    if (index == -1) {
+        char error_msg[128];
+        sprintf(error_msg, "Undefined variable: %s", name);
+        set_error(error_msg);
+        return NULL;
+    }
+    
+    *type = variables[index].type;
+    
+    switch (variables[index].type) {
+        case VAR_INT:
+            return &variables[index].value.int_value;
+            
+        case VAR_STRING:
+            return variables[index].value.string_value;
+            
+        case VAR_BUFFER:
+            return variables[index].value.buffer_value.data;
+            
+        case VAR_POINTER:
+            return &variables[index].value.pointer_value;
+            
+        case VAR_BLOCK:
+            return variables[index].value.block_value.data;
+            
+        case VAR_ARRAY:
+            return variables[index].value.array_value.data;
+            
+        case VAR_BYTES:
+            return variables[index].value.bytes_value.data;
+            
+        case VAR_REFERENCE: {
+            /* Resolve reference recursively */
+            const char *ref_name = variables[index].value.reference_value.ref_name;
+            return get_variable_value(ref_name, type);
+        }
+        
+        case VAR_FLOAT:
+            return &variables[index].value.float_value;
+            
+        case VAR_FILE:
+            return &variables[index].value.file_value;
+            
+        case VAR_BOOL:
+            return &variables[index].value.bool_value;
+            
+        case VAR_TIME:
+            return &variables[index].value.time_value;
+    }
+    
+    return NULL;
+}
+
+/* Helper function to create a buffer variable */
+void create_buffer_variable(const char *name, int size) {
+    set_variable_value(name, VAR_BUFFER, &size);
+}
+
+/* Helper function to update buffer content after SWI call */
+void update_buffer_variable(const char *name, const char *new_content) {
+    int index = find_variable(name);
+    if (index != -1 && variables[index].type == VAR_BUFFER) {
+        int len = mod_strlen(new_content);
+        if (len < variables[index].value.buffer_value.capacity) {
+            mod_strcpy(variables[index].value.buffer_value.data, new_content);
+            variables[index].value.buffer_value.size = len;
+        }
+    }
+}
+
+/* Clean up all variables */
+void cleanup_all_variables(void) {
+    for (int i = 0; i < var_count; i++) {
+        cleanup_variable(i);
+    }
+    var_count = 0;
+}
+
+/* Get current variable count */
+int get_variable_count(void) {
+    return var_count;
+}
+
+/* Variable access functions for compatibility */
+Variable* get_variable_by_index(int index) {
+    if (index < 0 || index >= var_count) return NULL;
+    return &variables[index];
+}
+
+Variable* get_variables_array(void) {
+    return variables;
+}
+
+int* get_var_count_ptr(void) {
+    return &var_count;
+}
+
+/* Get variable type name as string */
+const char* get_variable_type_name(VarType type) {
+    switch (type) {
+        case VAR_INT: return "Integer";
+        case VAR_STRING: return "String";
+        case VAR_BUFFER: return "Buffer";
+        case VAR_POINTER: return "Pointer";
+        case VAR_BLOCK: return "Block";
+        case VAR_ARRAY: return "Array";
+        case VAR_BYTES: return "Bytes";
+        case VAR_REFERENCE: return "Reference";
+        case VAR_FLOAT: return "Float";
+        case VAR_FILE: return "File";
+        case VAR_BOOL: return "Boolean";
+        case VAR_TIME: return "Time";
+        default: return "Unknown";
+    }
+}
+
+/* Print variable information for debugging */
+void print_variable_info(const char *name) {
+    int index = find_variable(name);
+    if (index == -1) {
+        printf("Variable '%s' not found\n", name);
+        return;
+    }
+    
+    Variable *var = &variables[index];
+    printf("Variable: %s\n", var->name);
+    printf("Type: %s\n", get_variable_type_name(var->type));
+    
+    switch (var->type) {
+        case VAR_INT:
+            printf("Value: %d\n", var->value.int_value);
+            break;
+            
+        case VAR_STRING:
+            printf("Value: \"%s\"\n", var->value.string_value ? var->value.string_value : "(null)");
+            break;
+            
+        case VAR_BUFFER:
+            printf("Capacity: %d bytes\n", var->value.buffer_value.capacity);
+            printf("Size: %d bytes\n", var->value.buffer_value.size);
+            printf("Content: \"%s\"\n", var->value.buffer_value.data ? var->value.buffer_value.data : "(null)");
+            break;
+            
+        case VAR_BLOCK:
+            printf("Size: %d bytes\n", var->value.block_value.size);
+            printf("Element size: %d bytes\n", var->value.block_value.element_size);
+            break;
+            
+        case VAR_ARRAY:
+            printf("Capacity: %d elements\n", var->value.array_value.capacity);
+            printf("Count: %d elements\n", var->value.array_value.count);
+            break;
+            
+        case VAR_BYTES:
+            printf("Capacity: %d bytes\n", var->value.bytes_value.capacity);
+            printf("Size: %d bytes\n", var->value.bytes_value.size);
+            break;
+            
+        case VAR_REFERENCE:
+            printf("References: %s\n", var->value.reference_value.ref_name);
+            break;
+            
+        case VAR_POINTER:
+            printf("Address: %p\n", var->value.pointer_value);
+            break;
+            
+        case VAR_FLOAT:
+            printf("Value: %g\n", var->value.float_value);
+            break;
+            
+        case VAR_FILE:
+            printf("File handle: %p\n", var->value.file_value);
+            if (var->value.file_value == (void*)stdin) printf("(stdin)\n");
+            else if (var->value.file_value == (void*)stdout) printf("(stdout)\n");
+            else if (var->value.file_value == (void*)stderr) printf("(stderr)\n");
+            break;
+            
+        case VAR_BOOL:
+            printf("Value: %s\n", var->value.bool_value ? "true" : "false");
+            break;
+            
+        case VAR_TIME:
+            printf("Time: %u (", var->value.time_value);
+            time_t temp_time = (time_t)var->value.time_value;
+            char *time_str = ctime(&temp_time);
+            if (time_str) {
+                // Remove newline from ctime output
+                time_str[mod_strlen(time_str)-1] = '\0';
+                printf("%s", time_str);
+            }
+            printf(")\n");
+            break;
+    }
+}
+
+/* Helper functions for creating new variable types */
+void create_float_variable(const char *name, float value) {
+    set_variable_value(name, VAR_FLOAT, &value);
+}
+
+void create_file_variable(const char *name, FILE *file) {
+    set_variable_value(name, VAR_FILE, (void*)file);
+}
+
+void create_bool_variable(const char *name, bool value) {
+    int int_value = value ? 1 : 0;
+    set_variable_value(name, VAR_BOOL, &int_value);
+}
+
+void create_time_variable(const char *name, time_t time) {
+    unsigned int uint_value = (unsigned int)time;
+    set_variable_value(name, VAR_TIME, &uint_value);
+}
+
+/* Forward declarations for expression parsing */
+extern int expression(void);
+extern Token* next_token(void);
+extern Token* peek_token(void);
+extern char* evaluate_string_expr(void);
+
+/* Builtin function wrappers for OakScript */
+int variable_builtin_block(void) {
+    int size = expression();
+    if (next_token()->type != TOKEN_COMMA) { printf("block expects two arguments\n"); exit(1); }
+    int element_size = expression();
+    if (next_token()->type != TOKEN_RPAREN) { printf("block expects ')'\n"); exit(1); }
+    
+    int params[2] = {size, element_size};
+    (void)params; // Suppress unused variable warning
+    // This would need a proper implementation - for now return 0
+    return 0;
+}
+
+int variable_builtin_array(void) {
+    int capacity = expression();
+    if (next_token()->type != TOKEN_RPAREN) { printf("array expects ')'\n"); exit(1); }
+    (void)capacity; // Suppress unused variable warning
+    // This would need a proper implementation - for now return 0
+    return 0;
+}
+
+int variable_builtin_bytes(void) {
+    int capacity = expression();
+    if (next_token()->type != TOKEN_RPAREN) { printf("bytes expects ')'\n"); exit(1); }
+    (void)capacity; // Suppress unused variable warning
+    // This would need a proper implementation - for now return 0
+    return 0;
+}
+
+int variable_builtin_reference(void) {
+    char *ref_name = evaluate_string_expr();
+    if (next_token()->type != TOKEN_RPAREN) { printf("reference expects ')'\n"); exit(1); }
+    if (ref_name) mod_free(ref_name);
+    // This would need a proper implementation - for now return 0
+    return 0;
+}
+
+int variable_builtin_array_set(void) {
+    // Get array variable name (not a string expression)
+    Token *array_token = next_token();
+    if (array_token->type != TOKEN_IDENT) { printf("array_set expects variable name\n"); exit(1); }
+    char *array_name = array_token->lexeme;
+    
+    if (next_token()->type != TOKEN_COMMA) { printf("array_set expects array name, index, and value\n"); exit(1); }
+    int index = expression();
+    if (next_token()->type != TOKEN_COMMA) { printf("array_set expects array name, index, and value\n"); exit(1); }
+    int value = expression();
+    if (next_token()->type != TOKEN_RPAREN) { printf("array_set expects ')'\n"); exit(1); }
+    
+    set_array_element(array_name, index, value);
+    return 0;
+}
+
+int variable_builtin_array_get(void) {
+    // Get array variable name (not a string expression)
+    Token *array_token = next_token();
+    if (array_token->type != TOKEN_IDENT) { printf("array_get expects variable name\n"); exit(1); }
+    char *array_name = array_token->lexeme;
+    
+    if (next_token()->type != TOKEN_COMMA) { printf("array_get expects array name and index\n"); exit(1); }
+    int index = expression();
+    if (next_token()->type != TOKEN_RPAREN) { printf("array_get expects ')'\n"); exit(1); }
+    
+    return get_array_element(array_name, index);
+}
+
+int variable_builtin_create_buffer(void) {
+    char *buffer_name = evaluate_string_expr();
+    if (next_token()->type != TOKEN_COMMA) { printf("create_buffer expects buffer name and size\n"); exit(1); }
+    int size = expression();
+    if (next_token()->type != TOKEN_RPAREN) { printf("create_buffer expects ')'\n"); exit(1); }
+    
+    if (buffer_name) {
+        create_buffer_variable(buffer_name, size);
+        mod_free(buffer_name);
+    }
+    return 0;
+}
+
+int variable_builtin_update_buffer(void) {
+    char *buffer_name = evaluate_string_expr();
+    if (next_token()->type != TOKEN_COMMA) { printf("update_buffer expects buffer name and content\n"); exit(1); }
+    char *content = evaluate_string_expr();
+    if (next_token()->type != TOKEN_RPAREN) { printf("update_buffer expects ')'\n"); exit(1); }
+    
+    if (buffer_name && content) {
+        update_buffer_variable(buffer_name, content);
+        mod_free(buffer_name);
+        mod_free(content);
+    }
+    return 0;
+}
+
+int variable_builtin_time(void) {
+    if (next_token()->type != TOKEN_RPAREN) { printf("time expects no arguments and ')'\n"); exit(1); }
+    return (int)time(NULL);
+}
+
+int variable_builtin_print_info(void) {
+    char *var_name = evaluate_string_expr();
+    if (next_token()->type != TOKEN_RPAREN) { printf("print_variable_info expects ')'\n"); exit(1); }
+    
+    if (var_name) {
+        print_variable_info(var_name);
+        mod_free(var_name);
+    }
+    return 0;
+}
+
+/* Array manipulation functions */
+void create_array_variable(const char *name, int size) {
+    int index = find_variable(name);
+    if (index == -1) {
+        index = var_count++;
+        mod_strcpy(variables[index].name, name);
+    }
+    
+    // Free existing data if any
+    if (variables[index].type == VAR_ARRAY && variables[index].value.array_value.data) {
+        mod_free(variables[index].value.array_value.data);
+    }
+    
+    variables[index].type = VAR_ARRAY;
+    variables[index].value.array_value.capacity = size;
+    variables[index].value.array_value.count = 0;
+    variables[index].value.array_value.data = (int*)mod_malloc(size * sizeof(int));
+    
+    if (variables[index].value.array_value.data) {
+        // Initialize array elements to 0
+        for (int i = 0; i < size; i++) {
+            variables[index].value.array_value.data[i] = 0;
+        }
+    }
+}
+
+void set_array_element(const char *name, int index, int value) {
+    int var_index = find_variable(name);
+    if (var_index != -1 && variables[var_index].type == VAR_ARRAY) {
+        if (index >= 0 && index < variables[var_index].value.array_value.capacity) {
+            // Expand array if needed
+            if (index >= variables[var_index].value.array_value.count) {
+                variables[var_index].value.array_value.count = index + 1;
+            }
+            variables[var_index].value.array_value.data[index] = value;
+        } else {
+            printf("Array index %d out of bounds for array %s\n", index, name);
+        }
+    } else {
+        printf("Variable %s is not an array or does not exist\n", name);
+    }
+}
+
+int get_array_element(const char *name, int index) {
+    int var_index = find_variable(name);
+    if (var_index != -1 && variables[var_index].type == VAR_ARRAY) {
+        if (index >= 0 && index < variables[var_index].value.array_value.count) {
+            return variables[var_index].value.array_value.data[index];
+        } else {
+            printf("Array index %d out of bounds for array %s\n", index, name);
+            return 0;
+        }
+    } else {
+        printf("Variable %s is not an array or does not exist\n", name);
+        return 0;
+    }
+}

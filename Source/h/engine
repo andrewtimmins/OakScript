@@ -1,0 +1,159 @@
+#ifndef SCRIPT_ENGINE_H
+#define SCRIPT_ENGINE_H
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <stdbool.h>
+#include <time.h>
+
+// Constants
+#define MAX_TOKENS 5000
+#define MAX_VAR_NAME 32
+#define MAX_VARS 100
+#define MAX_PARAMS 10
+#define MAX_COMMAND_LENGTH 1024
+#define MAX_ARG_LENGTH 256
+#define MAX_LEXEME_LENGTH 1024
+#define MAX_SWI_ARGS 10
+
+// Type definitions
+typedef enum {
+    TOKEN_INT, TOKEN_FLOAT, TOKEN_IDENT, TOKEN_ASSIGN, TOKEN_PLUS, TOKEN_MINUS,
+    TOKEN_MULTIPLY, TOKEN_DIVIDE, TOKEN_SEMICOLON, TOKEN_PRINT,
+    TOKEN_LPAREN, TOKEN_RPAREN, TOKEN_IF, TOKEN_THEN, TOKEN_ELSE,
+    TOKEN_END, TOKEN_EQ, TOKEN_NEQ, TOKEN_LT, TOKEN_GT, TOKEN_LTE,
+    TOKEN_GTE, TOKEN_WHILE, TOKEN_DO, TOKEN_FOR, TOKEN_TO, TOKEN_STEP,
+    TOKEN_BREAK, TOKEN_CONTINUE, TOKEN_TRUE, TOKEN_FALSE, TOKEN_AND,
+    TOKEN_OR, TOKEN_NOT, TOKEN_FUNCTION, TOKEN_RETURN, TOKEN_COMMA,
+    TOKEN_INCLUDE, TOKEN_STRING, TOKEN_EXEC, TOKEN_EOF,
+    // Quick wins: New token types
+    TOKEN_INCREMENT, TOKEN_DECREMENT, TOKEN_PLUS_ASSIGN, TOKEN_MINUS_ASSIGN,
+    TOKEN_MULTIPLY_ASSIGN, TOKEN_DIVIDE_ASSIGN, TOKEN_SWITCH, TOKEN_CASE,
+    TOKEN_DEFAULT, TOKEN_CONST, TOKEN_LBRACKET, TOKEN_RBRACKET, TOKEN_DOT,
+    TOKEN_TRY, TOKEN_CATCH
+} TokenType;
+
+typedef struct {
+    TokenType type;
+    char lexeme[MAX_LEXEME_LENGTH];
+    int value;
+    float float_value;
+    int line;
+    char file[256];
+} Token;
+
+typedef enum {
+    VAR_INT,
+    VAR_STRING,
+    VAR_BUFFER,    // A mutable buffer for SWI output
+    VAR_POINTER,   // A pointer to memory
+    VAR_BLOCK,     // Fixed-size data block (like icon/window blocks)
+    VAR_ARRAY,     // Array of integers
+    VAR_BYTES,     // Raw byte array (no null termination)
+    VAR_REFERENCE, // Reference to another variable
+    VAR_FLOAT,     // Floating-point numbers
+    VAR_FILE,      // File handles for I/O operations
+    VAR_BOOL,      // Boolean true/false values
+    VAR_TIME       // Date/time values
+} VarType;
+
+typedef struct {
+    char name[MAX_VAR_NAME];
+    VarType type;
+    bool is_const;  // Flag to indicate if this is a constant
+    union {
+        int int_value;
+        char* string_value;
+        struct {
+            char* data;
+            int size;
+            int capacity;
+        } buffer_value;
+        void* pointer_value;
+        struct {
+            void* data;
+            int size;
+            int element_size;
+        } block_value;
+        struct {
+            int* data;
+            int count;
+            int capacity;
+        } array_value;
+        struct {
+            unsigned char* data;
+            int size;
+            int capacity;
+        } bytes_value;
+        struct {
+            char ref_name[MAX_VAR_NAME];
+            VarType ref_type;
+        } reference_value;
+        float float_value;
+        void* file_value;  // Use void* instead of FILE* to avoid issues
+        int bool_value;    // Use int instead of bool to avoid issues
+        unsigned int time_value;  // Use unsigned int instead of time_t
+    } value;
+} Variable;
+
+typedef struct {
+    char name[MAX_VAR_NAME];
+    int param_count;
+    char param_names[MAX_PARAMS][MAX_VAR_NAME];
+    int body_start;
+    int body_end;
+} Function;
+
+typedef struct {
+    char* source;
+    bool has_includes;
+} ProcessedSource;
+
+// Global variables
+extern Token tokens[];
+extern int token_count;
+extern int current_token;
+
+extern Variable variables[];
+extern int var_count;
+
+extern Function functions[];
+extern int function_count;
+
+// Function declarations
+extern char* strdup(const char* s);
+extern void print_tokens(void);
+extern char* read_file(const char* filename);
+extern void tokenize_with_includes(char* source, const char* source_filename);
+extern Token* next_token(void);
+extern Token* peek_token(void);
+extern int find_variable(const char* name);
+extern void* get_variable_value(const char* name, VarType* type);
+extern void set_variable_value(const char* name, VarType type, void* value);
+extern int factor(void);
+extern int term(void);
+extern bool condition(void);
+extern void if_statement(void);
+extern void while_statement(void);
+extern void switch_statement(void);
+extern void try_statement(void);
+extern void set_error(const char* message);
+extern void function_declaration(void);
+extern int exec_external(void);
+extern ProcessedSource process_includes(const char* source);
+extern void interpret(void);
+extern void reset_script_globals(void);
+extern int run_script_from_source(const char* source, const char* filename);
+extern char* evaluate_string_expr(void);
+
+// Global SWI result storage
+extern int global_swi_regs[10];
+
+// Module interface functions
+extern int init_script_engine(void);
+extern void cleanup_script_engine(void);
+extern int run_script_file(const char* filename);
+
+#endif /* SCRIPT_ENGINE_H */

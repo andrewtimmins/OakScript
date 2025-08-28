@@ -1,0 +1,142 @@
+#include <stdarg.h>
+#include <stdio.h>
+#include "h.debug"
+#include "h.memory"
+#include "h.engine"
+#include "kernel.h"
+#include "swis.h"
+
+static bool g_debug_enabled = false;
+static char *g_debug_logpath = NULL;     // owned copy of path provided
+static int g_debug_handle = -1;          // RISC OS file handle when logging to file
+
+void debug_on(void) {
+    if (!g_debug_enabled) {
+        if (g_debug_logpath && g_debug_handle < 0) {
+            // Use the original RISC OS path directly - no expansion needed
+            const _kernel_oserror *err = NULL;
+            int handle = -1;
+            
+            // Open for output (reason code 0x80 = output, creates if needed)
+            err = _swix(OS_Find, _INR(0,1)|_OUT(0), 0x80, g_debug_logpath, &handle);
+            if (!err && handle > 0) {
+                g_debug_handle = handle;
+            }
+        }
+        g_debug_enabled = true;
+    }
+}
+
+void debug_off(void) { 
+    g_debug_enabled = false; 
+    if (g_debug_handle >= 0) {
+        _swix(OS_Find, _INR(0,1), 0, g_debug_handle); 
+        g_debug_handle = -1; 
+    }
+}
+
+void debug_logpath(const char *path) {
+    if (!g_debug_enabled) {
+        if (g_debug_handle >= 0) { _swix(OS_Find, _INR(0,1), 0, g_debug_handle); g_debug_handle = -1; }
+        if (g_debug_logpath) { mod_free(g_debug_logpath); g_debug_logpath = NULL; }
+        if (path && path[0] != '\0') { g_debug_logpath = mod_strdup(path); }
+    }
+}
+
+bool debug_is_enabled(void) { return g_debug_enabled; }
+
+void debug_printf(const char *fmt, ...) {
+    if (!g_debug_enabled) return;
+    va_list ap;
+    va_start(ap, fmt);
+    char buf[512];
+    vsprintf(buf, fmt, ap);
+    if (g_debug_handle >= 0) {
+        int len = mod_strlen(buf);
+        int written = 0;
+        const _kernel_oserror *err = _swix(OS_GBPB, _INR(0,3)|_OUT(3), 
+                                          2,           // reason: write bytes
+                                          g_debug_handle,  // file handle
+                                          buf,         // buffer
+                                          len,         // bytes to write
+                                          &written);   // bytes actually written
+        
+        if (err) {
+            // Close the invalid handle and fall back to screen
+            g_debug_handle = -1;
+        }
+    } else {
+        for (char *p = buf; *p; ++p) {
+            _swix(OS_WriteC, _IN(0), (int)(unsigned char)(*p));
+        }
+    }
+    va_end(ap);
+}
+
+/* Forward declarations for token parsing */
+extern Token* next_token(void);
+extern Token* peek_token(void);
+extern char* evaluate_string_expr(void);
+extern void mod_free(void *ptr);
+
+// Builtin function wrappers for OakScript functions
+int debug_builtin_on(void) {
+    if (peek_token()->type != TOKEN_RPAREN) { 
+        printf("debug_on expects no arguments and ')'\n"); 
+        exit(1);
+    }
+    next_token(); // consume ')'
+    debug_on();
+    return 0;
+}
+
+int debug_builtin_off(void) {
+    if (peek_token()->type != TOKEN_RPAREN) { 
+        printf("debug_off expects no arguments and ')'\n"); 
+        exit(1);
+    }
+    next_token(); // consume ')'
+    debug_off();
+    return 0;
+}
+
+int debug_builtin_print(void) {
+    char *msg = NULL;
+    // Allow optional single string expression; empty is fine
+    if (peek_token()->type != TOKEN_RPAREN) {
+        msg = evaluate_string_expr();
+    }
+    if (peek_token()->type != TOKEN_RPAREN) { 
+        printf("debug_print expects optional single string and ')'\n"); 
+        if (msg) mod_free(msg); 
+        exit(1);
+    } 
+    next_token(); // consume ')'
+    if (msg) { 
+        debug_printf("%s\n", msg); 
+        mod_free(msg); 
+    } else { 
+        debug_printf("\n"); 
+    }
+    return 0;
+}
+
+int debug_builtin_logpath(void) {
+    char *path = NULL;
+    if (peek_token()->type != TOKEN_RPAREN) {
+        path = evaluate_string_expr();
+    }
+    if (peek_token()->type != TOKEN_RPAREN) { 
+        printf("debug_logpath expects optional single string and ')'\n"); 
+        if (path) mod_free(path); 
+        exit(1);
+    }
+    next_token(); // consume ')'
+    if (path) {
+        debug_logpath(path);
+        mod_free(path);
+    } else {
+        debug_logpath(NULL); // Reset to default output
+    }
+    return 0;
+}

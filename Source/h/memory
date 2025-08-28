@@ -1,0 +1,28 @@
+// Module-aware memory allocation using a private OS_DynamicArea
+// All malloc/free/calloc/realloc go via this dynamic area heap
+
+#ifndef OAKSCRPT_MODMEM_H
+#define OAKSCRPT_MODMEM_H
+
+#include <stddef.h>
+
+void *mod_malloc(size_t size);
+void  mod_free(void *ptr);
+void *mod_realloc(void *ptr, size_t newsize);
+void *mod_calloc(size_t n, size_t size);
+char *mod_strdup(const char *s);
+void  mod_free_all(void);
+int   mod_init(size_t initial_size, size_t max_size);
+void  mod_shutdown(void);
+
+/* Safe memory manipulation functions for relocatable modules */
+void *mod_memcpy(void *dest, const void *src, size_t n);
+void *mod_memset(void *s, int c, size_t n);
+size_t mod_strlen(const char *s);
+int mod_strcmp(const char *s1, const char *s2);
+int mod_strncmp(const char *s1, const char *s2, size_t n);
+char *mod_strcpy(char *dest, const char *src);
+char *mod_strncpy(char *dest, const char *src, size_t n);
+size_t mod_strcspn(const char *s, const char *reject);
+
+#endif // OAKSCRPT_MODMEM_H

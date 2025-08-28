@@ -1,0 +1,847 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "kernel.h"
+#include "swis.h"
+#include "h.compile"
+#include "h.engine"
+#include "h.memory"
+
+/* Simple tokenizer for bytecode compilation */
+typedef struct {
+    const char *source;
+    int pos;
+    int length;
+} simple_tokenizer_t;
+
+/* Bytecode generation buffer */
+typedef struct {
+    unsigned char *code;
+    int capacity;
+    int size;
+    char *data_section;
+    int data_capacity;
+    int data_size;
+} bytecode_buffer_t;
+
+static void init_tokenizer(simple_tokenizer_t *tok, const char *source)
+{
+    tok->source = source;
+    tok->pos = 0;
+    tok->length = mod_strlen(source);
+}
+
+static void skip_whitespace(simple_tokenizer_t *tok)
+{
+    while (tok->pos < tok->length && (tok->source[tok->pos] == ' ' || 
+           tok->source[tok->pos] == '\t' || tok->source[tok->pos] == '\n' || 
+           tok->source[tok->pos] == '\r')) {
+        tok->pos++;
+    }
+}
+
+static int emit_opcode(bytecode_buffer_t *buf, opcode_t op)
+{
+    if (buf->size >= buf->capacity) return -1;
+    buf->code[buf->size++] = (unsigned char)op;
+    return 0;
+}
+
+static int emit_int(bytecode_buffer_t *buf, int value)
+{
+    if (buf->size + 4 > buf->capacity) return -1;
+    memcpy(buf->code + buf->size, &value, 4);
+    buf->size += 4;
+    return 0;
+}
+
+static int emit_string_ref(bytecode_buffer_t *buf, const char *str)
+{
+    // Add string to data section and emit offset
+    int str_len = mod_strlen(str);
+    if (buf->data_size + str_len + 1 > buf->data_capacity) return -1;
+    
+    int offset = buf->data_size;
+    mod_strcpy(buf->data_section + buf->data_size, str);
+    buf->data_size += str_len + 1;
+    
+    return emit_int(buf, offset);
+}
+
+/* Helper function to check if character is alphanumeric or underscore */
+static int is_identifier_char(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || 
+           (c >= '0' && c <= '9') || (c == '_');
+}
+
+/* Helper function to check if character is a digit */
+static int is_digit(char c) {
+    return (c >= '0' && c <= '9');
+}
+
+/* Parse an identifier and return its length */
+static int parse_identifier(simple_tokenizer_t *tok, char *buffer, int max_len) {
+    int len = 0;
+    int start_pos = tok->pos;
+    
+    // First character must be letter or underscore
+    if (tok->pos < tok->length && 
+        ((tok->source[tok->pos] >= 'a' && tok->source[tok->pos] <= 'z') ||
+         (tok->source[tok->pos] >= 'A' && tok->source[tok->pos] <= 'Z') ||
+         tok->source[tok->pos] == '_')) {
+        
+        while (tok->pos < tok->length && is_identifier_char(tok->source[tok->pos]) && len < max_len - 1) {
+            buffer[len++] = tok->source[tok->pos++];
+        }
+        buffer[len] = '\0';
+        return len;
+    }
+    
+    tok->pos = start_pos; // Reset position if not valid identifier
+    return 0;
+}
+
+/* Parse an integer literal */
+static int parse_integer(simple_tokenizer_t *tok) {
+    int value = 0;
+    int start_pos = tok->pos;
+    
+    if (tok->pos < tok->length && is_digit(tok->source[tok->pos])) {
+        while (tok->pos < tok->length && is_digit(tok->source[tok->pos])) {
+            value = value * 10 + (tok->source[tok->pos] - '0');
+            tok->pos++;
+        }
+        return value;
+    }
+    
+    tok->pos = start_pos; // Reset if not a number
+    return 0;
+}
+
+/* Parse a simple arithmetic expression (left to right evaluation) */
+static int parse_expression(simple_tokenizer_t *tok, bytecode_buffer_t *buf) {
+    // Parse first operand
+    if (is_digit(tok->source[tok->pos])) {
+        // Integer literal
+        int value = parse_integer(tok);
+        if (emit_opcode(buf, OP_LOAD_INT) < 0 || emit_int(buf, value) < 0) {
+            return -1;
+        }
+    } else {
+        // Variable or function call
+        char var_name[64];
+        int len = parse_identifier(tok, var_name, sizeof(var_name));
+        if (len <= 0) {
+            printf("Error: Expected number or variable in expression\n");
+            return -1;
+        }
+        
+        // Check if this is a function call (identifier followed by '(')
+        skip_whitespace(tok);
+        if (tok->pos < tok->length && tok->source[tok->pos] == '(') {
+            // Function call
+            tok->pos++; // consume '('
+            skip_whitespace(tok);
+            
+            // Parse function arguments (if any)
+            int arg_count = 0;
+            while (tok->pos < tok->length && tok->source[tok->pos] != ')') {
+                // Parse argument expression
+                if (is_digit(tok->source[tok->pos])) {
+                    // Integer literal argument
+                    int value = parse_integer(tok);
+                    if (emit_opcode(buf, OP_LOAD_INT) < 0 || emit_int(buf, value) < 0) {
+                        return -1;
+                    }
+                } else {
+                    // Variable argument
+                    char arg_name[64];
+                    int len = parse_identifier(tok, arg_name, sizeof(arg_name));
+                    if (len <= 0) {
+                        printf("Error: Expected argument in function call\n");
+                        return -1;
+                    }
+                    if (emit_opcode(buf, OP_LOAD_VAR) < 0 || emit_string_ref(buf, arg_name) < 0) {
+                        return -1;
+                    }
+                }
+                arg_count++;
+                
+                skip_whitespace(tok);
+                if (tok->pos < tok->length && tok->source[tok->pos] == ',') {
+                    tok->pos++; // consume ','
+                    skip_whitespace(tok);
+                } else if (tok->pos < tok->length && tok->source[tok->pos] == ')') {
+                    break; // End of arguments
+                } else {
+                    printf("Error: Expected ',' or ')' in function call\n");
+                    return -1;
+                }
+            }
+            
+            if (tok->pos < tok->length && tok->source[tok->pos] == ')') {
+                tok->pos++; // consume ')'
+                // Emit function call bytecode
+                if (emit_opcode(buf, OP_CALL_BUILTIN) < 0 || emit_string_ref(buf, var_name) < 0) {
+                    return -1;
+                }
+            } else {
+                printf("Error: Expected ')' to close function call\n");
+                return -1;
+            }
+        } else {
+            // Regular variable
+            if (emit_opcode(buf, OP_LOAD_VAR) < 0 || emit_string_ref(buf, var_name) < 0) {
+                return -1;
+            }
+        }
+    }
+    
+    // Parse operators and operands
+    while (tok->pos < tok->length) {
+        skip_whitespace(tok);
+        if (tok->pos >= tok->length) break;
+        
+        // Check for comparison operators first (they're longer)
+        if (tok->pos + 1 < tok->length) {
+            char op1 = tok->source[tok->pos];
+            char op2 = tok->source[tok->pos + 1];
+            
+            if ((op1 == '=' && op2 == '=') || (op1 == '!' && op2 == '=') ||
+                (op1 == '<' && op2 == '=') || (op1 == '>' && op2 == '=')) {
+                tok->pos += 2; // Consume two-char operator
+                skip_whitespace(tok);
+                
+                // Parse right operand
+                if (is_digit(tok->source[tok->pos])) {
+                    int value = parse_integer(tok);
+                    if (emit_opcode(buf, OP_LOAD_INT) < 0 || emit_int(buf, value) < 0) {
+                        return -1;
+                    }
+                } else {
+                    char var_name[64];
+                    int len = parse_identifier(tok, var_name, sizeof(var_name));
+                    if (len <= 0) {
+                        printf("Error: Expected number or variable after comparison\n");
+                        return -1;
+                    }
+                    
+                    // Check for function call
+                    skip_whitespace(tok);
+                    if (tok->pos < tok->length && tok->source[tok->pos] == '(') {
+                        tok->pos++; // consume '('
+                        skip_whitespace(tok);
+                        
+                        // Parse function arguments
+                        while (tok->pos < tok->length && tok->source[tok->pos] != ')') {
+                            if (is_digit(tok->source[tok->pos])) {
+                                int value = parse_integer(tok);
+                                if (emit_opcode(buf, OP_LOAD_INT) < 0 || emit_int(buf, value) < 0) {
+                                    return -1;
+                                }
+                            } else {
+                                char arg_name[64];
+                                int arg_len = parse_identifier(tok, arg_name, sizeof(arg_name));
+                                if (arg_len <= 0) {
+                                    printf("Error: Expected argument in function call\n");
+                                    return -1;
+                                }
+                                if (emit_opcode(buf, OP_LOAD_VAR) < 0 || emit_string_ref(buf, arg_name) < 0) {
+                                    return -1;
+                                }
+                            }
+                            
+                            skip_whitespace(tok);
+                            if (tok->pos < tok->length && tok->source[tok->pos] == ',') {
+                                tok->pos++; // consume ','
+                                skip_whitespace(tok);
+                            } else if (tok->pos < tok->length && tok->source[tok->pos] == ')') {
+                                break;
+                            } else {
+                                printf("Error: Expected ',' or ')' in function call\n");
+                                return -1;
+                            }
+                        }
+                        
+                        if (tok->pos < tok->length && tok->source[tok->pos] == ')') {
+                            tok->pos++; // consume ')'
+                            if (emit_opcode(buf, OP_CALL_BUILTIN) < 0 || emit_string_ref(buf, var_name) < 0) {
+                                return -1;
+                            }
+                        } else {
+                            printf("Error: Expected ')' to close function call\n");
+                            return -1;
+                        }
+                    } else {
+                        if (emit_opcode(buf, OP_LOAD_VAR) < 0 || emit_string_ref(buf, var_name) < 0) {
+                            return -1;
+                        }
+                    }
+                }
+                
+                // Emit comparison operation
+                if (op1 == '=' && op2 == '=') {
+                    if (emit_opcode(buf, OP_CMP_EQ) < 0) return -1;
+                } else if (op1 == '!' && op2 == '=') {
+                    if (emit_opcode(buf, OP_CMP_NE) < 0) return -1;
+                } else if (op1 == '<' && op2 == '=') {
+                    if (emit_opcode(buf, OP_CMP_LE) < 0) return -1;
+                } else if (op1 == '>' && op2 == '=') {
+                    if (emit_opcode(buf, OP_CMP_GE) < 0) return -1;
+                }
+                continue;
+            }
+        }
+        
+        // Check for single-character operators
+        char op = tok->source[tok->pos];
+        if (op == '+' || op == '-' || op == '*' || op == '/' || op == '<' || op == '>') {
+            tok->pos++; // Consume operator
+            skip_whitespace(tok);
+            
+            // Parse right operand
+            if (is_digit(tok->source[tok->pos])) {
+                // Integer literal
+                int value = parse_integer(tok);
+                if (emit_opcode(buf, OP_LOAD_INT) < 0 || emit_int(buf, value) < 0) {
+                    return -1;
+                }
+            } else {
+                // Variable or function call
+                char var_name[64];
+                int len = parse_identifier(tok, var_name, sizeof(var_name));
+                if (len <= 0) {
+                    printf("Error: Expected number or variable after operator\n");
+                    return -1;
+                }
+                
+                // Check for function call
+                skip_whitespace(tok);
+                if (tok->pos < tok->length && tok->source[tok->pos] == '(') {
+                    tok->pos++; // consume '('
+                    skip_whitespace(tok);
+                    
+                    // Parse function arguments
+                    while (tok->pos < tok->length && tok->source[tok->pos] != ')') {
+                        if (is_digit(tok->source[tok->pos])) {
+                            int value = parse_integer(tok);
+                            if (emit_opcode(buf, OP_LOAD_INT) < 0 || emit_int(buf, value) < 0) {
+                                return -1;
+                            }
+                        } else {
+                            char arg_name[64];
+                            int arg_len = parse_identifier(tok, arg_name, sizeof(arg_name));
+                            if (arg_len <= 0) {
+                                printf("Error: Expected argument in function call\n");
+                                return -1;
+                            }
+                            if (emit_opcode(buf, OP_LOAD_VAR) < 0 || emit_string_ref(buf, arg_name) < 0) {
+                                return -1;
+                            }
+                        }
+                        
+                        skip_whitespace(tok);
+                        if (tok->pos < tok->length && tok->source[tok->pos] == ',') {
+                            tok->pos++; // consume ','
+                            skip_whitespace(tok);
+                        } else if (tok->pos < tok->length && tok->source[tok->pos] == ')') {
+                            break;
+                        } else {
+                            printf("Error: Expected ',' or ')' in function call\n");
+                            return -1;
+                        }
+                    }
+                    
+                    if (tok->pos < tok->length && tok->source[tok->pos] == ')') {
+                        tok->pos++; // consume ')'
+                        if (emit_opcode(buf, OP_CALL_BUILTIN) < 0 || emit_string_ref(buf, var_name) < 0) {
+                            return -1;
+                        }
+                    } else {
+                        printf("Error: Expected ')' to close function call\n");
+                        return -1;
+                    }
+                } else {
+                    if (emit_opcode(buf, OP_LOAD_VAR) < 0 || emit_string_ref(buf, var_name) < 0) {
+                        return -1;
+                    }
+                }
+            }
+            
+            // Emit the operation
+            switch (op) {
+                case '+':
+                    if (emit_opcode(buf, OP_ADD) < 0) return -1;
+                    break;
+                case '-':
+                    if (emit_opcode(buf, OP_SUB) < 0) return -1;
+                    break;
+                case '*':
+                    if (emit_opcode(buf, OP_MUL) < 0) return -1;
+                    break;
+                case '/':
+                    if (emit_opcode(buf, OP_DIV) < 0) return -1;
+                    break;
+                case '<':
+                    if (emit_opcode(buf, OP_CMP_LT) < 0) return -1;
+                    break;
+                case '>':
+                    if (emit_opcode(buf, OP_CMP_GT) < 0) return -1;
+                    break;
+            }
+        } else {
+            // Not an operator, stop parsing expression
+            break;
+        }
+    }
+    
+    return 0;
+}
+
+/*
+ * Enhanced bytecode compiler - handles variables, assignments, and print statements
+ */
+static int compile_to_bytecode(const char *source, bytecode_buffer_t *buf)
+{
+    simple_tokenizer_t tok;
+    init_tokenizer(&tok, source);
+    
+    printf("Compiling OakScript to bytecode...\n");
+    
+    while (tok.pos < tok.length) {
+        skip_whitespace(&tok);
+        if (tok.pos >= tok.length) break;
+        
+        // Look for "print" statements
+        if (mod_strncmp(tok.source + tok.pos, "print", 5) == 0 && 
+            (tok.pos + 5 >= tok.length || !is_identifier_char(tok.source[tok.pos + 5]))) {
+            
+            tok.pos += 5;
+            skip_whitespace(&tok);
+            
+            // Parse what to print: string literal, integer, or variable
+            if (tok.source[tok.pos] == '"') {
+                // String literal
+                tok.pos++; // Skip opening quote
+                int start = tok.pos;
+                
+                // Find closing quote
+                while (tok.pos < tok.length && tok.source[tok.pos] != '"') {
+                    tok.pos++;
+                }
+                
+                if (tok.pos >= tok.length) {
+                    printf("Error: Unterminated string literal\n");
+                    return -1;
+                }
+                
+                // Extract string
+                int str_len = tok.pos - start;
+                char *str = (char*)mod_malloc(str_len + 1);
+                if (!str) return -1;
+                
+                mod_strncpy(str, tok.source + start, str_len);
+                str[str_len] = '\0';
+                
+                // Emit bytecode: LOAD_STRING, PRINT_STRING
+                if (emit_opcode(buf, OP_LOAD_STRING) < 0 ||
+                    emit_string_ref(buf, str) < 0 ||
+                    emit_opcode(buf, OP_PRINT_STRING) < 0) {
+                    mod_free(str);
+                    return -1;
+                }
+                
+                mod_free(str);
+                tok.pos++; // Skip closing quote
+                
+            } else {
+                // Parse arithmetic expression or single value
+                if (parse_expression(&tok, buf) < 0) {
+                    return -1;
+                }
+                // Print the result (which is now on top of stack)
+                if (emit_opcode(buf, OP_PRINT) < 0) {
+                    return -1;
+                }
+            }
+        }
+        // Look for variable assignments: identifier = value
+        else if (is_identifier_char(tok.source[tok.pos])) {
+            char var_name[64];
+            int len = parse_identifier(&tok, var_name, sizeof(var_name));
+            
+            if (len > 0) {
+                skip_whitespace(&tok);
+                
+                // Check for assignment operator
+                if (tok.pos < tok.length && tok.source[tok.pos] == '=') {
+                    tok.pos++; // Skip '='
+                    skip_whitespace(&tok);
+                    
+                    // Parse the value to assign
+                    if (tok.source[tok.pos] == '"') {
+                        // String assignment
+                        tok.pos++; // Skip opening quote
+                        int start = tok.pos;
+                        
+                        while (tok.pos < tok.length && tok.source[tok.pos] != '"') {
+                            tok.pos++;
+                        }
+                        
+                        if (tok.pos >= tok.length) {
+                            printf("Error: Unterminated string literal in assignment\n");
+                            return -1;
+                        }
+                        
+                        int str_len = tok.pos - start;
+                        char *str = (char*)mod_malloc(str_len + 1);
+                        if (!str) return -1;
+                        
+                        mod_strncpy(str, tok.source + start, str_len);
+                        str[str_len] = '\0';
+                        
+                        // Emit: LOAD_STRING, STORE_VAR
+                        if (emit_opcode(buf, OP_LOAD_STRING) < 0 ||
+                            emit_string_ref(buf, str) < 0 ||
+                            emit_opcode(buf, OP_STORE_VAR) < 0 ||
+                            emit_string_ref(buf, var_name) < 0) {
+                            mod_free(str);
+                            return -1;
+                        }
+                        
+                        mod_free(str);
+                        tok.pos++; // Skip closing quote
+                        
+                    } else {
+                        // Parse arithmetic expression or single value for assignment
+                        if (parse_expression(&tok, buf) < 0) {
+                            return -1;
+                        }
+                        
+                        // Store the result in the variable
+                        if (emit_opcode(buf, OP_STORE_VAR) < 0 ||
+                            emit_string_ref(buf, var_name) < 0) {
+                            return -1;
+                        }
+                    }
+                } else {
+                    // Just skip unrecognized identifiers for now
+                    while (tok.pos < tok.length && tok.source[tok.pos] != '\n') {
+                        tok.pos++;
+                    }
+                }
+            } else {
+                // Skip to next line if not a valid identifier
+                while (tok.pos < tok.length && tok.source[tok.pos] != '\n') {
+                    tok.pos++;
+                }
+            }
+        }
+        // Look for control flow statements
+        else if (mod_strncmp(tok.source + tok.pos, "if", 2) == 0 && 
+                 (tok.pos + 2 >= tok.length || !is_identifier_char(tok.source[tok.pos + 2]))) {
+            
+            tok.pos += 2; // Skip "if"
+            skip_whitespace(&tok);
+            
+            // Parse condition expression
+            if (parse_expression(&tok, buf) < 0) {
+                return -1;
+            }
+            
+            skip_whitespace(&tok);
+            
+            // Expect "then"
+            if (mod_strncmp(tok.source + tok.pos, "then", 4) == 0) {
+                tok.pos += 4;
+            }
+            
+            // Emit conditional jump (will be patched later)
+            int jump_addr = buf->size;
+            if (emit_opcode(buf, OP_JUMP_IF_FALSE) < 0 || emit_int(buf, 0) < 0) {
+                return -1;
+            }
+            
+            // Skip to next line for if body
+            while (tok.pos < tok.length && tok.source[tok.pos] != '\n') {
+                tok.pos++;
+            }
+            
+            // Parse if body (simplified - just find the end)
+            int if_body_start = buf->size;
+            int lines_processed = 0;
+            
+            while (tok.pos < tok.length && lines_processed < 10) { // Limit to prevent infinite loops
+                skip_whitespace(&tok);
+                if (tok.pos >= tok.length) break;
+                
+                // Check for "end"
+                if (mod_strncmp(tok.source + tok.pos, "end", 3) == 0 && 
+                    (tok.pos + 3 >= tok.length || !is_identifier_char(tok.source[tok.pos + 3]))) {
+                    tok.pos += 3; // Skip "end"
+                    break;
+                }
+                
+                // Process one statement in if body (simplified)
+                if (mod_strncmp(tok.source + tok.pos, "print", 5) == 0) {
+                    // Handle print in if body
+                    tok.pos += 5;
+                    skip_whitespace(&tok);
+                    
+                    if (tok.source[tok.pos] == '"') {
+                        // String literal
+                        tok.pos++;
+                        int start = tok.pos;
+                        while (tok.pos < tok.length && tok.source[tok.pos] != '"') {
+                            tok.pos++;
+                        }
+                        
+                        int str_len = tok.pos - start;
+                        char *str = (char*)mod_malloc(str_len + 1);
+                        if (!str) return -1;
+                        
+                        mod_strncpy(str, tok.source + start, str_len);
+                        str[str_len] = '\0';
+                        
+                        if (emit_opcode(buf, OP_LOAD_STRING) < 0 ||
+                            emit_string_ref(buf, str) < 0 ||
+                            emit_opcode(buf, OP_PRINT_STRING) < 0) {
+                            mod_free(str);
+                            return -1;
+                        }
+                        
+                        mod_free(str);
+                        tok.pos++; // Skip closing quote
+                    } else {
+                        // Expression
+                        if (parse_expression(&tok, buf) < 0) {
+                            return -1;
+                        }
+                        if (emit_opcode(buf, OP_PRINT) < 0) {
+                            return -1;
+                        }
+                    }
+                }
+                
+                // Skip to next line
+                while (tok.pos < tok.length && tok.source[tok.pos] != '\n') {
+                    tok.pos++;
+                }
+                lines_processed++;
+            }
+            
+            // Patch the jump address
+            int current_addr = buf->size;
+            mod_memcpy(buf->code + jump_addr + 1, &current_addr, 4);
+        }
+        else if (mod_strncmp(tok.source + tok.pos, "while", 5) == 0 && 
+                 (tok.pos + 5 >= tok.length || !is_identifier_char(tok.source[tok.pos + 5]))) {
+            
+            int loop_start = buf->size;
+            tok.pos += 5; // Skip "while"
+            skip_whitespace(&tok);
+            
+            // Parse condition expression
+            if (parse_expression(&tok, buf) < 0) {
+                return -1;
+            }
+            
+            // Emit conditional jump (will be patched later)
+            int jump_addr = buf->size;
+            if (emit_opcode(buf, OP_JUMP_IF_FALSE) < 0 || emit_int(buf, 0) < 0) {
+                return -1;
+            }
+            
+            // Skip to next line for while body
+            while (tok.pos < tok.length && tok.source[tok.pos] != '\n') {
+                tok.pos++;
+            }
+            
+            // Parse while body (simplified)
+            int lines_processed = 0;
+            
+            while (tok.pos < tok.length && lines_processed < 10) {
+                skip_whitespace(&tok);
+                if (tok.pos >= tok.length) break;
+                
+                // Check for "end"
+                if (mod_strncmp(tok.source + tok.pos, "end", 3) == 0 && 
+                    (tok.pos + 3 >= tok.length || !is_identifier_char(tok.source[tok.pos + 3]))) {
+                    tok.pos += 3; // Skip "end"
+                    break;
+                }
+                
+                // Process one statement in while body
+                if (mod_strncmp(tok.source + tok.pos, "print", 5) == 0) {
+                    // Handle print in while body
+                    tok.pos += 5;
+                    skip_whitespace(&tok);
+                    
+                    if (parse_expression(&tok, buf) < 0) {
+                        return -1;
+                    }
+                    if (emit_opcode(buf, OP_PRINT) < 0) {
+                        return -1;
+                    }
+                }
+                
+                // Skip to next line
+                while (tok.pos < tok.length && tok.source[tok.pos] != '\n') {
+                    tok.pos++;
+                }
+                lines_processed++;
+            }
+            
+            // Jump back to loop start
+            if (emit_opcode(buf, OP_JUMP) < 0 || emit_int(buf, loop_start) < 0) {
+                return -1;
+            }
+            
+            // Patch the exit jump address
+            int current_addr = buf->size;
+            mod_memcpy(buf->code + jump_addr + 1, &current_addr, 4);
+        }
+        // Skip to next line or statement for anything else
+        else {
+            while (tok.pos < tok.length && tok.source[tok.pos] != '\n') {
+                tok.pos++;
+            }
+        }
+    }
+    
+    // Emit exit instruction
+    emit_opcode(buf, OP_EXIT);
+    
+    printf("Generated %d bytes of bytecode, %d bytes of data\n", buf->size, buf->data_size);
+    return 0;
+}
+
+/*
+ * Script compilation to bytecode
+ */
+int compile_script_to_bytecode(const char *source_file, const char *output_file)
+{
+    printf("Compiling '%s' to bytecode '%s'...\n", source_file, output_file);
+    
+    // Step 1: Read the source script
+    FILE *source = fopen(source_file, "r");
+    if (!source) {
+        printf("Error: Cannot open source file '%s'\n", source_file);
+        return 1;
+    }
+    
+    // Get file size
+    fseek(source, 0, SEEK_END);
+    long script_size = ftell(source);
+    fseek(source, 0, SEEK_SET);
+    
+    if (script_size <= 0) {
+        printf("Error: Source file is empty or invalid\n");
+        fclose(source);
+        return 2;
+    }
+    
+    // Read script content using module-safe memory
+    char *script_content = (char*)mod_malloc(script_size + 1);
+    if (!script_content) {
+        printf("Error: Cannot allocate memory for script\n");
+        fclose(source);
+        return 3;
+    }
+    
+    size_t read_size = fread(script_content, 1, script_size, source);
+    fclose(source);
+    
+    if (read_size != (size_t)script_size) {
+        printf("Error: Failed to read complete script file\n");
+        mod_free(script_content);
+        return 4;
+    }
+    script_content[script_size] = '\0';
+    
+    // Step 2: Initialize bytecode buffer using module-safe memory
+    bytecode_buffer_t buf;
+    buf.capacity = 8192;
+    buf.code = (unsigned char*)mod_malloc(buf.capacity);
+    buf.size = 0;
+    buf.data_capacity = 4096;
+    buf.data_section = (char*)mod_malloc(buf.data_capacity);
+    buf.data_size = 0;
+    
+    if (!buf.code || !buf.data_section) {
+        printf("Error: Cannot allocate bytecode buffers\n");
+        mod_free(script_content);
+        if (buf.code) mod_free(buf.code);
+        if (buf.data_section) mod_free(buf.data_section);
+        return 5;
+    }
+    
+    // Step 3: Compile to bytecode
+    if (compile_to_bytecode(script_content, &buf) < 0) {
+        printf("Error: Bytecode compilation failed\n");
+        mod_free(script_content);
+        mod_free(buf.code);
+        mod_free(buf.data_section);
+        return 6;
+    }
+    
+    // Step 4: Write bytecode file
+    FILE *output = fopen(output_file, "wb");
+    if (!output) {
+        printf("Error: Cannot create output file '%s'\n", output_file);
+        mod_free(script_content);
+        mod_free(buf.code);
+        mod_free(buf.data_section);
+        return 7;
+    }
+    
+    // Write header
+    oakscode_header_t header;
+    mod_strcpy(header.magic, "OAKSCODE");
+    header.version = 1;
+    header.code_size = buf.size;
+    header.data_size = buf.data_size;
+    
+    if (fwrite(&header, sizeof(header), 1, output) != 1) {
+        printf("Error: Failed to write header\n");
+        fclose(output);
+        mod_free(script_content);
+        mod_free(buf.code);
+        mod_free(buf.data_section);
+        return 8;
+    }
+    
+    // Write bytecode
+    if (fwrite(buf.code, 1, buf.size, output) != (size_t)buf.size) {
+        printf("Error: Failed to write bytecode\n");
+        fclose(output);
+        mod_free(script_content);
+        mod_free(buf.code);
+        mod_free(buf.data_section);
+        return 9;
+    }
+    
+    // Write data section
+    if (buf.data_size > 0) {
+        if (fwrite(buf.data_section, 1, buf.data_size, output) != (size_t)buf.data_size) {
+            printf("Error: Failed to write data section\n");
+            fclose(output);
+            mod_free(script_content);
+            mod_free(buf.code);
+            mod_free(buf.data_section);
+            return 10;
+        }
+    }
+    
+    fclose(output);
+    mod_free(script_content);
+    mod_free(buf.code);
+    mod_free(buf.data_section);
+    
+    // Set file type to &EEF for OakScript bytecode
+    _swix(OS_File, _INR(0,2), 18, output_file, 0xEEF);
+    
+    printf("Successfully compiled to bytecode file '%s'\n", output_file);
+    printf("File type set to &EEF (OakScript Bytecode)\n");
+    return 0;
+}

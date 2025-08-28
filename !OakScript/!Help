@@ -1,0 +1,18 @@
+OakScript
+=========
+
+Version 0.04
+Copyright (c) Andrew Timmins, 2025.
+
+OakScript is a lightweight, easy-to-read scripting language designed for rapid prototyping, automation,
+and educational purposes.
+
+Its syntax is simple and intuitive, making it accessible for both beginners and experienced programmers.
+
+OakScript supports core programming concepts such as variables, arithmetic, strings, booleans,
+floating-point numbers, arrays, and buffers.
+
+With clear structure and straight forward commands, OakScript enables users to quickly write script for a variety of tasks,
+From basic calculations to more complex logic and data manipulation.
+
+

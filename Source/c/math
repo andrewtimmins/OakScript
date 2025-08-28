@@ -1,0 +1,212 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include "h.math"
+#include "h.engine"
+
+/* Basic arithmetic functions */
+int math_add(int a, int b) {
+    return a + b;
+}
+
+int math_subtract(int a, int b) {
+    return a - b;
+}
+
+int math_multiply(int a, int b) {
+    return a * b;
+}
+
+int math_divide(int a, int b) {
+    if (b == 0) {
+        return 0; /* Avoid division by zero */
+    }
+    return a / b;
+}
+
+int math_modulo(int a, int b) {
+    if (b == 0) {
+        return 0; /* Avoid modulo by zero */
+    }
+    return a % b;
+}
+
+/* Advanced math functions */
+int math_min(int a, int b) {
+    return (a < b) ? a : b;
+}
+
+int math_max(int a, int b) {
+    return (a > b) ? a : b;
+}
+
+int math_abs(int a) {
+    return (a < 0) ? -a : a;
+}
+
+int math_square(int a) {
+    return a * a;
+}
+
+int math_power(int base, int exponent) {
+    if (exponent < 0) return 0;
+    if (exponent == 0) return 1;
+    
+    int result = 1;
+    for (int i = 0; i < exponent; i++) {
+        result *= base;
+    }
+    return result;
+}
+
+int math_isqrt(int n) {
+    if (n < 0) return 0;
+    if (n == 0) return 0;
+    
+    int x = n;
+    int y = (x + 1) / 2;
+    while (y < x) {
+        x = y;
+        y = (x + n / x) / 2;
+    }
+    return x;
+}
+
+int math_clamp(int value, int min_val, int max_val) {
+    if (value < min_val) return min_val;
+    if (value > max_val) return max_val;
+    return value;
+}
+
+/* Random number functions */
+void math_srand(unsigned int seed) {
+    srand(seed);
+}
+
+int math_rand(void) {
+    return rand();
+}
+
+int math_rand_range(int min_val, int max_val) {
+    if (max_val <= min_val) return min_val;
+    return min_val + (rand() % (max_val - min_val + 1));
+}
+
+/* Forward declarations for expression parsing */
+extern int expression(void);
+extern Token* next_token(void);
+extern Token* peek_token(void);
+
+/* Utility functions for builtin function calls */
+int math_builtin_add(void) {
+    int a = expression();
+    if (next_token()->type != TOKEN_COMMA) { printf("add expects two arguments\n"); exit(1); }
+    int b = expression();
+    if (next_token()->type != TOKEN_RPAREN) { printf("add expects ')'\n"); exit(1); }
+    return math_add(a, b);
+}
+
+int math_builtin_subtract(void) {
+    int a = expression();
+    if (next_token()->type != TOKEN_COMMA) { printf("subtract expects two arguments\n"); exit(1); }
+    int b = expression();
+    if (next_token()->type != TOKEN_RPAREN) { printf("subtract expects ')'\n"); exit(1); }
+    return math_subtract(a, b);
+}
+
+int math_builtin_multiply(void) {
+    int a = expression();
+    if (next_token()->type != TOKEN_COMMA) { printf("multiply expects two arguments\n"); exit(1); }
+    int b = expression();
+    if (next_token()->type != TOKEN_RPAREN) { printf("multiply expects ')'\n"); exit(1); }
+    return math_multiply(a, b);
+}
+
+int math_builtin_divide(void) {
+    int a = expression();
+    if (next_token()->type != TOKEN_COMMA) { printf("divide expects two arguments\n"); exit(1); }
+    int b = expression();
+    if (next_token()->type != TOKEN_RPAREN) { printf("divide expects ')'\n"); exit(1); }
+    return math_divide(a, b);
+}
+
+int math_builtin_mod(void) {
+    int a = expression();
+    if (next_token()->type != TOKEN_COMMA) { printf("mod expects two arguments\n"); exit(1); }
+    int b = expression();
+    if (next_token()->type != TOKEN_RPAREN) { printf("mod expects ')'\n"); exit(1); }
+    return math_modulo(a, b);
+}
+
+int math_builtin_min(void) {
+    int a = expression();
+    if (next_token()->type != TOKEN_COMMA) { printf("min expects two arguments\n"); exit(1); }
+    int b = expression();
+    if (next_token()->type != TOKEN_RPAREN) { printf("min expects ')'\n"); exit(1); }
+    return math_min(a, b);
+}
+
+int math_builtin_max(void) {
+    int a = expression();
+    if (next_token()->type != TOKEN_COMMA) { printf("max expects two arguments\n"); exit(1); }
+    int b = expression();
+    if (next_token()->type != TOKEN_RPAREN) { printf("max expects ')'\n"); exit(1); }
+    return math_max(a, b);
+}
+
+int math_builtin_abs(void) {
+    int a = expression();
+    if (next_token()->type != TOKEN_RPAREN) { printf("abs expects ')'\n"); exit(1); }
+    return math_abs(a);
+}
+
+int math_builtin_square(void) {
+    int a = expression();
+    if (next_token()->type != TOKEN_RPAREN) { printf("square expects ')'\n"); exit(1); }
+    return math_square(a);
+}
+
+int math_builtin_clamp(void) {
+    int value = expression();
+    if (next_token()->type != TOKEN_COMMA) { printf("clamp expects three arguments\n"); exit(1); }
+    int min_val = expression();
+    if (next_token()->type != TOKEN_COMMA) { printf("clamp expects three arguments\n"); exit(1); }
+    int max_val = expression();
+    if (next_token()->type != TOKEN_RPAREN) { printf("clamp expects ')'\n"); exit(1); }
+    return math_clamp(value, min_val, max_val);
+}
+
+int math_builtin_pow(void) {
+    int base = expression();
+    if (next_token()->type != TOKEN_COMMA) { printf("pow expects two arguments\n"); exit(1); }
+    int exponent = expression();
+    if (next_token()->type != TOKEN_RPAREN) { printf("pow expects ')'\n"); exit(1); }
+    return math_power(base, exponent);
+}
+
+int math_builtin_isqrt(void) {
+    int n = expression();
+    if (next_token()->type != TOKEN_RPAREN) { printf("isqrt expects ')'\n"); exit(1); }
+    return math_isqrt(n);
+}
+
+int math_builtin_srand(void) {
+    int seed = expression();
+    if (next_token()->type != TOKEN_RPAREN) { printf("srand expects ')'\n"); exit(1); }
+    math_srand((unsigned int)seed);
+    return 0;
+}
+
+int math_builtin_rand(void) {
+    // Check if we have arguments (for range) or no arguments
+    if (peek_token()->type == TOKEN_RPAREN) {
+        next_token(); // consume ')'
+        return math_rand();
+    } else {
+        int min_val = expression();
+        if (next_token()->type != TOKEN_COMMA) { printf("rand expects 0 or 2 arguments\n"); exit(1); }
+        int max_val = expression();
+        if (next_token()->type != TOKEN_RPAREN) { printf("rand expects ')'\n"); exit(1); }
+        return math_rand_range(min_val, max_val);
+    }
+}

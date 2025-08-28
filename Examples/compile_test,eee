@@ -1,0 +1,140 @@
+print "OakScript Bytecode Comprehensive Test"
+
+print "=== Testing Basic Operations ==="
+
+print "1. String literals and OP_LOAD_STRING/OP_PRINT_STRING:"
+print "Hello World"
+
+print "2. Integer literals and OP_LOAD_INT/OP_PRINT_INT:"
+print 42
+
+print "3. Variable assignment and OP_STORE_VAR:"
+x = 10
+y = 5
+name = "OakScript"
+
+print "4. Variable loading and OP_LOAD_VAR:"
+print x
+print y
+print name
+
+print "=== Testing Arithmetic Operations ==="
+
+print "5. Addition (OP_ADD):"
+print x + y
+
+print "6. Subtraction (OP_SUB):"
+print x - y
+
+print "7. Multiplication (OP_MUL):"
+print x * y
+
+print "8. Division (OP_DIV):"
+print x / y
+
+print "9. Complex arithmetic expressions:"
+result = x + y * 2
+print result
+
+print "=== Testing Comparison Operations ==="
+
+print "10. Equal comparison (OP_CMP_EQ):"
+if x == 10 then
+    print "x equals 10"
+end
+
+print "11. Not equal comparison (OP_CMP_NE):"
+if x != 5 then
+    print "x does not equal 5"
+end
+
+print "12. Less than comparison (OP_CMP_LT):"
+if y < x then
+    print "y is less than x"
+end
+
+print "13. Less than or equal comparison (OP_CMP_LE):"
+if y <= x then
+    print "y is less than or equal to x"
+end
+
+print "14. Greater than comparison (OP_CMP_GT):"
+if x > y then
+    print "x is greater than y"
+end
+
+print "15. Greater than or equal comparison (OP_CMP_GE):"
+if x >= y then
+    print "x is greater than or equal to y"
+end
+
+print "=== Testing Control Flow ==="
+
+print "16. If statement with OP_JUMP_IF_FALSE:"
+if x > 0 then
+    print "x is positive"
+end
+
+print "17. While loop with OP_JUMP and OP_JUMP_IF_FALSE:"
+counter = 0
+while counter < 3
+    print counter
+    counter = counter + 1
+end
+
+print "18. Nested control flow:"
+i = 1
+while i <= 2
+    if i == 1 then
+        print "First iteration"
+    end
+    if i == 2 then
+        print "Second iteration"
+    end
+    i = i + 1
+end
+
+print "=== Testing Mixed Operations ==="
+
+print "19. Variables in expressions:"
+a = 7
+b = 3
+sum = a + b
+diff = a - b
+product = a * b
+quotient = a / b
+print sum
+print diff
+print product
+print quotient
+
+print "20. Comparison results in variables:"
+is_equal = a == 7
+is_greater = a > b
+print is_equal
+print is_greater
+
+print "=== Testing Function Calls ==="
+
+print "21. Built-in function calls (OP_CALL_BUILTIN):"
+num1 = 15
+num2 = 23
+positive_num = 42
+
+print "Testing abs() function with literal:"
+print abs(15)
+
+print "Testing abs() function with variable:"
+print abs(positive_num)
+
+print "Testing min() function:"
+print min(num1, num2)
+
+print "Testing max() function:"
+print max(num1, num2)
+
+print "Testing file_exists() function (no args):"
+print file_exists()
+
+print "=== All Opcode Tests Complete ==="
+print "Program will now exit with OP_EXIT"

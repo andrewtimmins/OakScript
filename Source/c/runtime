@@ -1,0 +1,672 @@
+#include <stdio.h>
+#include <string.h>
+#include "h.runtime"
+#include "h.memory"
+
+/* Runtime variable storage */
+#define MAX_RUNTIME_VARS 100
+
+typedef enum {
+    RT_VAR_INT,
+    RT_VAR_STRING
+} runtime_var_type_t;
+
+typedef struct {
+    char name[64];
+    runtime_var_type_t type;
+    union {
+        int int_value;
+        char *string_value;
+    } value;
+    int is_used;
+} runtime_variable_t;
+
+static runtime_variable_t runtime_vars[MAX_RUNTIME_VARS];
+static int runtime_var_count = 0;
+
+/* Runtime stack for values */
+#define MAX_STACK_SIZE 100
+typedef struct {
+    runtime_var_type_t type;
+    union {
+        int int_value;
+        char *string_value;
+    } value;
+} stack_value_t;
+
+static stack_value_t runtime_stack[MAX_STACK_SIZE];
+static int stack_top = -1;
+
+/* Stack operations */
+static void push_int(int value) {
+    if (stack_top < MAX_STACK_SIZE - 1) {
+        stack_top++;
+        runtime_stack[stack_top].type = RT_VAR_INT;
+        runtime_stack[stack_top].value.int_value = value;
+    }
+}
+
+static void push_string(const char *value) {
+    if (stack_top < MAX_STACK_SIZE - 1) {
+        stack_top++;
+        runtime_stack[stack_top].type = RT_VAR_STRING;
+        runtime_stack[stack_top].value.string_value = mod_strdup(value);
+    }
+}
+
+static stack_value_t pop_value() {
+    stack_value_t result = {RT_VAR_INT, {0}};
+    if (stack_top >= 0) {
+        result = runtime_stack[stack_top];
+        stack_top--;
+    }
+    return result;
+}
+
+/* Variable operations */
+static void store_variable(const char *name, stack_value_t value) {
+    // Look for existing variable
+    for (int i = 0; i < runtime_var_count; i++) {
+        if (runtime_vars[i].is_used && mod_strcmp(runtime_vars[i].name, name) == 0) {
+            // Free old string value if necessary
+            if (runtime_vars[i].type == RT_VAR_STRING && runtime_vars[i].value.string_value) {
+                mod_free(runtime_vars[i].value.string_value);
+            }
+            
+            // Update variable
+            runtime_vars[i].type = value.type;
+            if (value.type == RT_VAR_INT) {
+                runtime_vars[i].value.int_value = value.value.int_value;
+            } else {
+                runtime_vars[i].value.string_value = value.value.string_value;
+            }
+            return;
+        }
+    }
+    
+    // Create new variable
+    if (runtime_var_count < MAX_RUNTIME_VARS) {
+        mod_strcpy(runtime_vars[runtime_var_count].name, name);
+        runtime_vars[runtime_var_count].type = value.type;
+        if (value.type == RT_VAR_INT) {
+            runtime_vars[runtime_var_count].value.int_value = value.value.int_value;
+        } else {
+            runtime_vars[runtime_var_count].value.string_value = value.value.string_value;
+        }
+        runtime_vars[runtime_var_count].is_used = 1;
+        runtime_var_count++;
+    } else {
+        printf("Runtime error: Too many variables\n");
+    }
+}
+
+static void load_variable(const char *name) {
+    for (int i = 0; i < runtime_var_count; i++) {
+        if (runtime_vars[i].is_used && mod_strcmp(runtime_vars[i].name, name) == 0) {
+            if (runtime_vars[i].type == RT_VAR_INT) {
+                push_int(runtime_vars[i].value.int_value);
+            } else {
+                push_string(runtime_vars[i].value.string_value);
+            }
+            return;
+        }
+    }
+    
+    // Variable not found - push default value
+    printf("Runtime warning: Variable '%s' not found, using default\n", name);
+    push_int(0);
+}
+
+static void cleanup_runtime_vars() {
+    for (int i = 0; i < runtime_var_count; i++) {
+        if (runtime_vars[i].is_used && runtime_vars[i].type == RT_VAR_STRING && 
+            runtime_vars[i].value.string_value) {
+            mod_free(runtime_vars[i].value.string_value);
+        }
+        runtime_vars[i].is_used = 0;
+    }
+    runtime_var_count = 0;
+    
+    // Clean up stack
+    while (stack_top >= 0) {
+        stack_value_t val = pop_value();
+        if (val.type == RT_VAR_STRING && val.value.string_value) {
+            mod_free(val.value.string_value);
+        }
+    }
+}
+
+/*
+ * Bytecode runtime/interpreter
+ */
+int run_bytecode_file(const char *bytecode_file)
+{
+    printf("Running bytecode file '%s'...\n", bytecode_file);
+    
+    // Open bytecode file
+    FILE *file = fopen(bytecode_file, "rb");
+    if (!file) {
+        printf("Error: Cannot open bytecode file '%s'\n", bytecode_file);
+        return 1;
+    }
+    
+    // Read header
+    oakscode_header_t header;
+    if (fread(&header, sizeof(header), 1, file) != 1) {
+        printf("Error: Failed to read bytecode header\n");
+        fclose(file);
+        return 2;
+    }
+    
+    // Verify magic
+    if (mod_strncmp(header.magic, "OAKSCODE", 8) != 0) {
+        printf("Error: Invalid bytecode file format\n");
+        fclose(file);
+        return 3;
+    }
+    
+    printf("Bytecode version: %u, code: %u bytes, data: %u bytes\n", 
+           header.version, header.code_size, header.data_size);
+    
+    // Read bytecode using module-safe memory
+    unsigned char *code = (unsigned char*)mod_malloc(header.code_size);
+    if (!code || fread(code, 1, header.code_size, file) != header.code_size) {
+        printf("Error: Failed to read bytecode\n");
+        fclose(file);
+        if (code) mod_free(code);
+        return 4;
+    }
+    
+    // Read data section using module-safe memory
+    char *data = NULL;
+    if (header.data_size > 0) {
+        data = (char*)mod_malloc(header.data_size);
+        if (!data || fread(data, 1, header.data_size, file) != header.data_size) {
+            printf("Error: Failed to read data section\n");
+            fclose(file);
+            mod_free(code);
+            if (data) mod_free(data);
+            return 5;
+        }
+    }
+    
+    fclose(file);
+    
+    // Initialize runtime state
+    runtime_var_count = 0;
+    stack_top = -1;
+    
+    // Execute bytecode
+    int pc = 0;  // Program counter
+    
+    while (pc < (int)header.code_size) {
+        opcode_t op = (opcode_t)code[pc++];
+        
+        switch (op) {
+            case OP_NOP:
+                break;
+                
+            case OP_LOAD_INT: {
+                if (pc + 4 > (int)header.code_size) {
+                    printf("Runtime error: Truncated LOAD_INT instruction\n");
+                    goto cleanup;
+                }
+                int value;
+                mod_memcpy(&value, code + pc, 4);
+                pc += 4;
+                push_int(value);
+                break;
+            }
+                
+            case OP_LOAD_STRING: {
+                if (pc + 4 > (int)header.code_size) {
+                    printf("Runtime error: Truncated LOAD_STRING instruction\n");
+                    goto cleanup;
+                }
+                int offset;
+                mod_memcpy(&offset, code + pc, 4);
+                pc += 4;
+                
+                // Load string from data section
+                if (data && offset >= 0 && offset < (int)header.data_size) {
+                    push_string(data + offset);
+                } else {
+                    printf("Runtime error: Invalid string offset %d\n", offset);
+                    goto cleanup;
+                }
+                break;
+            }
+            
+            case OP_LOAD_VAR: {
+                if (pc + 4 > (int)header.code_size) {
+                    printf("Runtime error: Truncated LOAD_VAR instruction\n");
+                    goto cleanup;
+                }
+                int offset;
+                mod_memcpy(&offset, code + pc, 4);
+                pc += 4;
+                
+                if (data && offset >= 0 && offset < (int)header.data_size) {
+                    load_variable(data + offset);
+                } else {
+                    printf("Runtime error: Invalid variable name offset %d\n", offset);
+                    goto cleanup;
+                }
+                break;
+            }
+            
+            case OP_STORE_VAR: {
+                if (pc + 4 > (int)header.code_size) {
+                    printf("Runtime error: Truncated STORE_VAR instruction\n");
+                    goto cleanup;
+                }
+                int offset;
+                mod_memcpy(&offset, code + pc, 4);
+                pc += 4;
+                
+                if (stack_top < 0) {
+                    printf("Runtime error: No value on stack for STORE_VAR\n");
+                    goto cleanup;
+                }
+                
+                if (data && offset >= 0 && offset < (int)header.data_size) {
+                    stack_value_t value = pop_value();
+                    store_variable(data + offset, value);
+                } else {
+                    printf("Runtime error: Invalid variable name offset %d\n", offset);
+                    goto cleanup;
+                }
+                break;
+            }
+            
+            case OP_PRINT_INT: {
+                if (stack_top < 0) {
+                    printf("Runtime error: No value on stack for PRINT_INT\n");
+                    goto cleanup;
+                }
+                stack_value_t value = pop_value();
+                if (value.type == RT_VAR_INT) {
+                    printf("%d\n", value.value.int_value);
+                } else {
+                    printf("Runtime error: Expected integer for PRINT_INT\n");
+                    if (value.type == RT_VAR_STRING && value.value.string_value) {
+                        mod_free(value.value.string_value);
+                    }
+                    goto cleanup;
+                }
+                break;
+            }
+            
+            case OP_PRINT_STRING: {
+                if (stack_top < 0) {
+                    printf("Runtime error: No value on stack for PRINT_STRING\n");
+                    goto cleanup;
+                }
+                stack_value_t value = pop_value();
+                if (value.type == RT_VAR_STRING) {
+                    printf("%s\n", value.value.string_value);
+                    mod_free(value.value.string_value);
+                } else {
+                    printf("Runtime error: Expected string for PRINT_STRING\n");
+                    goto cleanup;
+                }
+                break;
+            }
+            
+
+            
+            case OP_ADD: {
+                if (stack_top < 1) {
+                    printf("Runtime error: Not enough values on stack for ADD\n");
+                    goto cleanup;
+                }
+                stack_value_t b = pop_value();
+                stack_value_t a = pop_value();
+                
+                if (a.type == RT_VAR_INT && b.type == RT_VAR_INT) {
+                    push_int(a.value.int_value + b.value.int_value);
+                } else {
+                    printf("Runtime error: ADD requires two integers\n");
+                    if (a.type == RT_VAR_STRING && a.value.string_value) mod_free(a.value.string_value);
+                    if (b.type == RT_VAR_STRING && b.value.string_value) mod_free(b.value.string_value);
+                    goto cleanup;
+                }
+                break;
+            }
+            
+            case OP_SUB: {
+                if (stack_top < 1) {
+                    printf("Runtime error: Not enough values on stack for SUB\n");
+                    goto cleanup;
+                }
+                stack_value_t b = pop_value();
+                stack_value_t a = pop_value();
+                
+                if (a.type == RT_VAR_INT && b.type == RT_VAR_INT) {
+                    push_int(a.value.int_value - b.value.int_value);
+                } else {
+                    printf("Runtime error: SUB requires two integers\n");
+                    if (a.type == RT_VAR_STRING && a.value.string_value) mod_free(a.value.string_value);
+                    if (b.type == RT_VAR_STRING && b.value.string_value) mod_free(b.value.string_value);
+                    goto cleanup;
+                }
+                break;
+            }
+            
+            case OP_MUL: {
+                if (stack_top < 1) {
+                    printf("Runtime error: Not enough values on stack for MUL\n");
+                    goto cleanup;
+                }
+                stack_value_t b = pop_value();
+                stack_value_t a = pop_value();
+                
+                if (a.type == RT_VAR_INT && b.type == RT_VAR_INT) {
+                    push_int(a.value.int_value * b.value.int_value);
+                } else {
+                    printf("Runtime error: MUL requires two integers\n");
+                    if (a.type == RT_VAR_STRING && a.value.string_value) mod_free(a.value.string_value);
+                    if (b.type == RT_VAR_STRING && b.value.string_value) mod_free(b.value.string_value);
+                    goto cleanup;
+                }
+                break;
+            }
+            
+            case OP_DIV: {
+                if (stack_top < 1) {
+                    printf("Runtime error: Not enough values on stack for DIV\n");
+                    goto cleanup;
+                }
+                stack_value_t b = pop_value();
+                stack_value_t a = pop_value();
+                
+                if (a.type == RT_VAR_INT && b.type == RT_VAR_INT) {
+                    if (b.value.int_value == 0) {
+                        printf("Runtime error: Division by zero\n");
+                        goto cleanup;
+                    }
+                    push_int(a.value.int_value / b.value.int_value);
+                } else {
+                    printf("Runtime error: DIV requires two integers\n");
+                    if (a.type == RT_VAR_STRING && a.value.string_value) mod_free(a.value.string_value);
+                    if (b.type == RT_VAR_STRING && b.value.string_value) mod_free(b.value.string_value);
+                    goto cleanup;
+                }
+                break;
+            }
+
+            case OP_CMP_EQ: {
+                if (stack_top < 1) {
+                    printf("Runtime error: Not enough values on stack for comparison\n");
+                    goto cleanup;
+                }
+                stack_value_t b = pop_value();
+                stack_value_t a = pop_value();
+                
+                if (a.type == RT_VAR_INT && b.type == RT_VAR_INT) {
+                    push_int(a.value.int_value == b.value.int_value ? 1 : 0);
+                } else {
+                    printf("Runtime error: Comparison requires two integers\n");
+                    if (a.type == RT_VAR_STRING && a.value.string_value) mod_free(a.value.string_value);
+                    if (b.type == RT_VAR_STRING && b.value.string_value) mod_free(b.value.string_value);
+                    goto cleanup;
+                }
+                break;
+            }
+            
+            case OP_CMP_NE: {
+                if (stack_top < 1) {
+                    printf("Runtime error: Not enough values on stack for comparison\n");
+                    goto cleanup;
+                }
+                stack_value_t b = pop_value();
+                stack_value_t a = pop_value();
+                
+                if (a.type == RT_VAR_INT && b.type == RT_VAR_INT) {
+                    push_int(a.value.int_value != b.value.int_value ? 1 : 0);
+                } else {
+                    printf("Runtime error: Comparison requires two integers\n");
+                    if (a.type == RT_VAR_STRING && a.value.string_value) mod_free(a.value.string_value);
+                    if (b.type == RT_VAR_STRING && b.value.string_value) mod_free(b.value.string_value);
+                    goto cleanup;
+                }
+                break;
+            }
+            
+            case OP_CMP_LT: {
+                if (stack_top < 1) {
+                    printf("Runtime error: Not enough values on stack for comparison\n");
+                    goto cleanup;
+                }
+                stack_value_t b = pop_value();
+                stack_value_t a = pop_value();
+                
+                if (a.type == RT_VAR_INT && b.type == RT_VAR_INT) {
+                    push_int(a.value.int_value < b.value.int_value ? 1 : 0);
+                } else {
+                    printf("Runtime error: Comparison requires two integers\n");
+                    if (a.type == RT_VAR_STRING && a.value.string_value) mod_free(a.value.string_value);
+                    if (b.type == RT_VAR_STRING && b.value.string_value) mod_free(b.value.string_value);
+                    goto cleanup;
+                }
+                break;
+            }
+            
+            case OP_CMP_LE: {
+                if (stack_top < 1) {
+                    printf("Runtime error: Not enough values on stack for comparison\n");
+                    goto cleanup;
+                }
+                stack_value_t b = pop_value();
+                stack_value_t a = pop_value();
+                
+                if (a.type == RT_VAR_INT && b.type == RT_VAR_INT) {
+                    push_int(a.value.int_value <= b.value.int_value ? 1 : 0);
+                } else {
+                    printf("Runtime error: Comparison requires two integers\n");
+                    if (a.type == RT_VAR_STRING && a.value.string_value) mod_free(a.value.string_value);
+                    if (b.type == RT_VAR_STRING && b.value.string_value) mod_free(b.value.string_value);
+                    goto cleanup;
+                }
+                break;
+            }
+            
+            case OP_CMP_GT: {
+                if (stack_top < 1) {
+                    printf("Runtime error: Not enough values on stack for comparison\n");
+                    goto cleanup;
+                }
+                stack_value_t b = pop_value();
+                stack_value_t a = pop_value();
+                
+                if (a.type == RT_VAR_INT && b.type == RT_VAR_INT) {
+                    push_int(a.value.int_value > b.value.int_value ? 1 : 0);
+                } else {
+                    printf("Runtime error: Comparison requires two integers\n");
+                    if (a.type == RT_VAR_STRING && a.value.string_value) mod_free(a.value.string_value);
+                    if (b.type == RT_VAR_STRING && b.value.string_value) mod_free(b.value.string_value);
+                    goto cleanup;
+                }
+                break;
+            }
+            
+            case OP_CMP_GE: {
+                if (stack_top < 1) {
+                    printf("Runtime error: Not enough values on stack for comparison\n");
+                    goto cleanup;
+                }
+                stack_value_t b = pop_value();
+                stack_value_t a = pop_value();
+                
+                if (a.type == RT_VAR_INT && b.type == RT_VAR_INT) {
+                    push_int(a.value.int_value >= b.value.int_value ? 1 : 0);
+                } else {
+                    printf("Runtime error: Comparison requires two integers\n");
+                    if (a.type == RT_VAR_STRING && a.value.string_value) mod_free(a.value.string_value);
+                    if (b.type == RT_VAR_STRING && b.value.string_value) mod_free(b.value.string_value);
+                    goto cleanup;
+                }
+                break;
+            }
+            
+            case OP_JUMP: {
+                if (pc + 4 > (int)header.code_size) {
+                    printf("Runtime error: Truncated JUMP instruction\n");
+                    goto cleanup;
+                }
+                int jump_addr;
+                mod_memcpy(&jump_addr, code + pc, 4);
+                pc = jump_addr;
+                break;
+            }
+            
+            case OP_JUMP_IF_FALSE: {
+                if (pc + 4 > (int)header.code_size) {
+                    printf("Runtime error: Truncated JUMP_IF_FALSE instruction\n");
+                    goto cleanup;
+                }
+                int jump_addr;
+                mod_memcpy(&jump_addr, code + pc, 4);
+                pc += 4;
+                
+                if (stack_top < 0) {
+                    printf("Runtime error: No value on stack for conditional jump\n");
+                    goto cleanup;
+                }
+                
+                stack_value_t condition = pop_value();
+                if (condition.type == RT_VAR_INT) {
+                    if (condition.value.int_value == 0) {
+                        pc = jump_addr; // Jump if false (zero)
+                    }
+                } else {
+                    printf("Runtime error: Conditional jump requires integer condition\n");
+                    if (condition.type == RT_VAR_STRING && condition.value.string_value) {
+                        mod_free(condition.value.string_value);
+                    }
+                    goto cleanup;
+                }
+                break;
+            }
+
+            case OP_PRINT: {
+                // Handle both int and string printing
+                if (stack_top < 0) {
+                    printf("Runtime error: No value on stack for PRINT\n");
+                    goto cleanup;
+                }
+                stack_value_t value = pop_value();
+                if (value.type == RT_VAR_INT) {
+                    printf("%d\n", value.value.int_value);
+                } else if (value.type == RT_VAR_STRING) {
+                    printf("%s\n", value.value.string_value);
+                    mod_free(value.value.string_value);
+                }
+                break;
+            }
+            
+            case OP_CALL_BUILTIN: {
+                // Read function name from data section
+                if (pc + 4 > (int)header.code_size) {
+                    printf("Runtime error: Truncated CALL_BUILTIN instruction\n");
+                    goto cleanup;
+                }
+                int string_offset;
+                mod_memcpy(&string_offset, code + pc, 4);
+                pc += 4;
+                
+                if (string_offset >= (int)header.data_size) {
+                    printf("Runtime error: Invalid string offset in CALL_BUILTIN\n");
+                    goto cleanup;
+                }
+                
+                char *func_name = (char *)(data + string_offset);
+                
+                // Handle built-in functions
+                if (mod_strcmp(func_name, "file_exists") == 0) {
+                    // For now, always return 0 (false) - no file checking in bytecode yet
+                    push_int(0);
+                } else if (mod_strcmp(func_name, "min") == 0) {
+                    // min() function - requires 2 arguments on stack
+                    if (stack_top < 1) {
+                        printf("Runtime error: min() requires 2 arguments\n");
+                        goto cleanup;
+                    }
+                    stack_value_t b = pop_value();
+                    stack_value_t a = pop_value();
+                    
+                    if (a.type == RT_VAR_INT && b.type == RT_VAR_INT) {
+                        push_int(a.value.int_value < b.value.int_value ? a.value.int_value : b.value.int_value);
+                    } else {
+                        printf("Runtime error: min() requires two integers\n");
+                        if (a.type == RT_VAR_STRING && a.value.string_value) mod_free(a.value.string_value);
+                        if (b.type == RT_VAR_STRING && b.value.string_value) mod_free(b.value.string_value);
+                        goto cleanup;
+                    }
+                } else if (mod_strcmp(func_name, "max") == 0) {
+                    // max() function - requires 2 arguments on stack
+                    if (stack_top < 1) {
+                        printf("Runtime error: max() requires 2 arguments\n");
+                        goto cleanup;
+                    }
+                    stack_value_t b = pop_value();
+                    stack_value_t a = pop_value();
+                    
+                    if (a.type == RT_VAR_INT && b.type == RT_VAR_INT) {
+                        push_int(a.value.int_value > b.value.int_value ? a.value.int_value : b.value.int_value);
+                    } else {
+                        printf("Runtime error: max() requires two integers\n");
+                        if (a.type == RT_VAR_STRING && a.value.string_value) mod_free(a.value.string_value);
+                        if (b.type == RT_VAR_STRING && b.value.string_value) mod_free(b.value.string_value);
+                        goto cleanup;
+                    }
+                } else if (mod_strcmp(func_name, "abs") == 0) {
+                    // abs() function - requires 1 argument on stack
+                    if (stack_top < 0) {
+                        printf("Runtime error: abs() requires 1 argument\n");
+                        goto cleanup;
+                    }
+                    stack_value_t a = pop_value();
+                    
+                    if (a.type == RT_VAR_INT) {
+                        push_int(a.value.int_value < 0 ? -a.value.int_value : a.value.int_value);
+                    } else {
+                        printf("Runtime error: abs() requires an integer\n");
+                        if (a.type == RT_VAR_STRING && a.value.string_value) mod_free(a.value.string_value);
+                        goto cleanup;
+                    }
+                } else {
+                    printf("Runtime error: Unknown built-in function '%s'\n", func_name);
+                    goto cleanup;
+                }
+                break;
+            }
+            
+            case OP_CALL_USER: {
+                // User-defined functions not yet implemented
+                printf("Runtime error: User-defined functions not yet supported\n");
+                goto cleanup;
+            }
+            
+            case OP_RETURN: {
+                // Function return not yet implemented
+                printf("Runtime error: Function return not yet supported\n");
+                goto cleanup;
+            }
+            
+            case OP_EXIT:
+                printf("Program completed successfully.\n");
+                goto cleanup;
+                
+            default:
+                printf("Runtime error: Unknown opcode %d at pc=%d\n", op, pc-1);
+                goto cleanup;
+        }
+    }
+    
+cleanup:
+    cleanup_runtime_vars();
+    mod_free(code);
+    if (data) mod_free(data);
+    return 0;
+}

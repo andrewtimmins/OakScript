@@ -1,0 +1,364 @@
+OakScript Bytecode Format Specification
+=======================================
+
+Version: 1.0
+Date: 2024
+
+OVERVIEW
+--------
+
+OakScript uses a custom bytecode format for compiled scripts. The bytecode consists
+of a header section followed by executable opcodes and data references. This format
+allows for efficient execution while maintaining platform independence.
+
+FILE FORMAT STRUCTURE
+---------------------
+
+1. Header (20 bytes)
+2. Code Section (variable length)
+3. String Data Section (variable length)
+
+HEADER FORMAT
+-------------
+
+The header is exactly 20 bytes and contains the following fields:
+
+Offset | Size | Field         | Description
+-------|------|---------------|------------------------------------------
+0      | 8    | magic         | "OAKSCODE" (8 ASCII characters)
+8      | 4    | version       | Format version (currently 1)
+12     | 4    | code_size     | Size of code section in bytes
+16     | 4    | data_size     | Size of string data section in bytes
+
+All multi-byte integers are stored in little-endian format.
+
+MAGIC NUMBER
+-----------
+The magic number "OAKSCODE" (0x4F414B53434F4445) identifies valid OakScript
+bytecode files. Any file not starting with this exact sequence is rejected.
+
+VERSION FIELD
+------------
+Currently set to 1. Future versions may extend the format while maintaining
+backward compatibility where possible.
+
+CODE SECTION
+-----------
+The code section immediately follows the header and contains a sequence of
+opcodes and their operands. Each opcode is 1 byte, followed by operands
+specific to that instruction.
+
+STRING DATA SECTION
+------------------
+The string data section contains null-terminated string literals referenced
+by string opcodes. Strings are stored sequentially with no padding.
+
+OPCODE REFERENCE
+---------------
+
+Each opcode is represented by a single byte value. Operands follow the opcode
+byte and vary in size depending on the instruction.
+
+BASIC OPERATIONS:
+
+OP_NOP (0x00)
+- No operation
+- Size: 1 byte
+- Stack effect: None
+- Description: Does nothing, used for padding or debugging
+
+OP_EXIT (0x01)
+- Exit program
+- Size: 1 byte
+- Stack effect: None
+- Description: Terminates execution immediately
+
+CONSTANT LOADING:
+
+OP_LOAD_INT (0x10)
+- Load integer constant
+- Size: 5 bytes (1 opcode + 4 data)
+- Format: [0x10][int32_value]
+- Stack effect: +1 (pushes integer)
+- Description: Pushes a 32-bit signed integer onto the stack
+
+OP_LOAD_FLOAT (0x11)
+- Load floating-point constant
+- Size: 5 bytes (1 opcode + 4 data)
+- Format: [0x11][float32_value]
+- Stack effect: +1 (pushes float)
+- Description: Pushes a 32-bit float onto the stack
+
+OP_LOAD_STRING (0x12)
+- Load string constant
+- Size: 5 bytes (1 opcode + 4 offset)
+- Format: [0x12][offset_into_data_section]
+- Stack effect: +1 (pushes string)
+- Description: Pushes string from data section onto stack
+
+VARIABLE OPERATIONS:
+
+OP_LOAD_VAR (0x20)
+- Load variable value
+- Size: 5 bytes (1 opcode + 4 offset)
+- Format: [0x20][name_offset_in_data_section]
+- Stack effect: +1 (pushes variable value)
+- Description: Looks up variable by name and pushes its value
+
+OP_STORE_VAR (0x21)
+- Store to variable
+- Size: 5 bytes (1 opcode + 4 offset)
+- Format: [0x21][name_offset_in_data_section]
+- Stack effect: -1 (pops value to store)
+- Description: Pops value from stack and stores in named variable
+
+OUTPUT OPERATIONS:
+
+OP_PRINT_INT (0x30)
+- Print integer
+- Size: 1 byte
+- Stack effect: -1 (pops integer)
+- Description: Pops integer from stack and prints it
+
+OP_PRINT_STRING (0x31)
+- Print string
+- Size: 1 byte
+- Stack effect: -1 (pops string)
+- Description: Pops string from stack and prints it
+
+ARITHMETIC OPERATIONS:
+
+OP_ADD (0x40)
+- Addition
+- Size: 1 byte
+- Stack effect: -1 (pops 2, pushes 1)
+- Description: Pops b, pops a, pushes (a + b)
+
+OP_SUB (0x41)
+- Subtraction
+- Size: 1 byte
+- Stack effect: -1 (pops 2, pushes 1)
+- Description: Pops b, pops a, pushes (a - b)
+
+OP_MUL (0x42)
+- Multiplication
+- Size: 1 byte
+- Stack effect: -1 (pops 2, pushes 1)
+- Description: Pops b, pops a, pushes (a * b)
+
+OP_DIV (0x43)
+- Division
+- Size: 1 byte
+- Stack effect: -1 (pops 2, pushes 1)
+- Description: Pops b, pops a, pushes (a / b)
+
+COMPARISON OPERATIONS:
+
+OP_CMP_EQ (0x50)
+- Equal comparison
+- Size: 1 byte
+- Stack effect: -1 (pops 2, pushes 1)
+- Description: Pops b, pops a, pushes 1 if a == b, else 0
+
+OP_CMP_NE (0x51)
+- Not equal comparison
+- Size: 1 byte
+- Stack effect: -1 (pops 2, pushes 1)
+- Description: Pops b, pops a, pushes 1 if a != b, else 0
+
+OP_CMP_LT (0x52)
+- Less than comparison
+- Size: 1 byte
+- Stack effect: -1 (pops 2, pushes 1)
+- Description: Pops b, pops a, pushes 1 if a < b, else 0
+
+OP_CMP_LE (0x53)
+- Less than or equal comparison
+- Size: 1 byte
+- Stack effect: -1 (pops 2, pushes 1)
+- Description: Pops b, pops a, pushes 1 if a <= b, else 0
+
+OP_CMP_GT (0x54)
+- Greater than comparison
+- Size: 1 byte
+- Stack effect: -1 (pops 2, pushes 1)
+- Description: Pops b, pops a, pushes 1 if a > b, else 0
+
+OP_CMP_GE (0x55)
+- Greater than or equal comparison
+- Size: 1 byte
+- Stack effect: -1 (pops 2, pushes 1)
+- Description: Pops b, pops a, pushes 1 if a >= b, else 0
+
+CONTROL FLOW:
+
+OP_JUMP (0x60)
+- Unconditional jump
+- Size: 5 bytes (1 opcode + 4 offset)
+- Format: [0x60][jump_offset]
+- Stack effect: None
+- Description: Sets program counter to specified offset
+
+OP_JUMP_IF_FALSE (0x61)
+- Conditional jump
+- Size: 5 bytes (1 opcode + 4 offset)
+- Format: [0x61][jump_offset]
+- Stack effect: -1 (pops condition)
+- Description: Pops value; if false/zero, jumps to offset
+
+OP_LOOP_START (0x62)
+- Mark loop beginning
+- Size: 1 byte
+- Stack effect: None
+- Description: Marks start of loop for break/continue
+
+OP_LOOP_END (0x63)
+- Mark loop end
+- Size: 1 byte
+- Stack effect: None
+- Description: Marks end of loop structure
+
+FUNCTION OPERATIONS:
+
+OP_CALL_BUILTIN (0x70)
+- Call built-in function
+- Size: 5 bytes (1 opcode + 4 offset)
+- Format: [0x70][function_name_offset]
+- Stack effect: Varies (depends on function)
+- Description: Calls built-in function by name
+
+OP_CALL_USER (0x71)
+- Call user-defined function
+- Size: 5 bytes (1 opcode + 4 offset)
+- Format: [0x71][function_name_offset]
+- Stack effect: Varies (depends on function)
+- Description: Calls user-defined function by name
+
+OP_RETURN (0x72)
+- Return from function
+- Size: 1 byte
+- Stack effect: Varies
+- Description: Returns from current function
+
+OPERAND ENCODING
+---------------
+
+Integer operands (4 bytes):
+- Stored in little-endian format
+- Signed 32-bit values
+- Range: -2,147,483,648 to 2,147,483,647
+
+Float operands (4 bytes):
+- IEEE 754 single-precision format
+- Stored in little-endian byte order
+
+String offset operands (4 bytes):
+- Unsigned 32-bit offset into string data section
+- Little-endian format
+- Points to null-terminated string
+
+Jump offset operands (4 bytes):
+- Signed 32-bit offset from current instruction
+- Little-endian format
+- Relative to the start of the jump instruction
+
+EXECUTION MODEL
+--------------
+
+The OakScript virtual machine uses a stack-based execution model:
+
+1. STACK: Values are pushed and popped from an execution stack
+2. PROGRAM COUNTER: Tracks current instruction position
+3. VARIABLES: Global variable storage with string keys
+4. MEMORY: Module-safe memory allocation using mod_malloc/mod_free
+
+EXAMPLE BYTECODE
+---------------
+
+Source code:
+    x = 5
+    y = 10
+    print x + y
+
+Compiled bytecode (hexadecimal):
+    [Header: 20 bytes]
+    4F414B53434F4445  // "OAKSCODE" magic
+    01000000            // version = 1
+    15000000            // code_size = 21
+    06000000            // data_size = 6
+
+    [Code: 21 bytes]
+    10 05000000         // OP_LOAD_INT 5
+    21 00000000         // OP_STORE_VAR "x" (offset 0)
+    10 0A000000         // OP_LOAD_INT 10
+    21 02000000         // OP_STORE_VAR "y" (offset 2)
+    20 00000000         // OP_LOAD_VAR "x" (offset 0)
+    20 02000000         // OP_LOAD_VAR "y" (offset 2)
+    40                  // OP_ADD
+    30                  // OP_PRINT_INT
+    01                  // OP_EXIT
+
+    [Data: 6 bytes]
+    78 00               // "x\0"
+    79 00               // "y\0"
+    00 00               // padding
+
+VALIDATION RULES
+---------------
+
+1. Magic number must be exactly "OAKSCODE"
+2. Version must be supported (currently only version 1)
+3. Code size must not exceed available data
+4. Data size must not exceed available data
+5. String offsets must point within data section
+6. Jump offsets must point to valid instruction boundaries
+7. Stack must not underflow during execution
+8. All strings in data section must be null-terminated
+
+ERROR HANDLING
+-------------
+
+Runtime errors include:
+- Invalid opcode encountered
+- Stack underflow
+- Invalid variable name
+- Division by zero
+- Invalid function name
+- Memory allocation failure
+- File format corruption
+
+SECURITY CONSIDERATIONS
+----------------------
+
+1. All memory allocation uses module-safe functions
+2. String operations use bounded functions to prevent overflows
+3. Stack depth is monitored to prevent overflow
+4. Jump targets are validated to prevent code injection
+5. Variable names are sanitized before storage
+
+PERFORMANCE NOTES
+----------------
+
+1. String lookups use linear search (suitable for small programs)
+2. Variable storage uses dynamic allocation
+3. Stack operations are optimized for speed
+4. Jump instructions use relative offsets for position independence
+5. Built-in functions are dispatched via string comparison
+
+FUTURE EXTENSIONS
+----------------
+
+Planned opcodes for future versions:
+- OP_CALL_NATIVE: Call native RISC OS functions
+- OP_ARRAY_GET/SET: Array operations
+- OP_STRING_CONCAT: String concatenation
+- OP_TRY/CATCH: Exception handling
+- OP_FOR_INIT/NEXT: For loop support
+
+COMPATIBILITY
+------------
+
+This bytecode format is designed for RISC OS systems but uses portable
+data formats to enable cross-platform development tools. The runtime
+depends on RISC OS-specific memory management but the bytecode itself
+is platform-neutral.

@@ -1,0 +1,3180 @@
+#include <stdio.h>    // for printf, NULL
+#include <stdlib.h>   // for exit, strtol, atoi
+#include <ctype.h>    // for isdigit
+#include <stdbool.h>
+#include <time.h>
+
+#include <kernel.h>
+#include "h.memory" // remap malloc/free to module-safe versions
+#include "h.engine"
+#include "h.variables"
+#include "h.string"
+#include "h.math"
+#include "h.swi"
+#include "h.debug"
+#ifndef __uintptr_t_defined
+typedef unsigned int uintptr_t;
+#define __uintptr_t_defined
+#endif
+
+// Forward declarations
+int swi_builtin(void);
+int swi_error_builtin(void);
+
+Token tokens[MAX_TOKENS];
+int token_count = 0;
+int current_token = 0;
+
+Function functions[MAX_VARS];
+int function_count = 0;
+static int last_exec_status = 0; // return code of last exec
+static int loop_depth = 0;             // track nested loop depth
+static bool loop_break_flag = false;   // signal to break current loop
+static bool loop_continue_flag = false;// signal to continue current loop
+
+// Global SWI result storage
+int global_swi_regs[10]; // Store last SWI register results
+
+// Track function execution/return to allow 'return' inside nested blocks
+static bool is_executing_function = false;
+static bool function_return_flag = false;
+static int function_return_value = 0;
+
+// Error handling state
+static bool is_in_try_block = false;
+static bool error_occurred = false;
+static char error_message[256] = "";
+
+// Error handling helper function
+void set_error(const char* message) {
+    if (is_in_try_block) {
+        error_occurred = true;
+        mod_strncpy(error_message, message, sizeof(error_message) - 1);
+        error_message[sizeof(error_message) - 1] = '\0';
+    } else {
+        printf("Error: %s\n", message);
+        exit(1);
+    }
+}
+
+void print_tokens(void) {
+    printf("Tokens:\n");
+    for (int i = 0; i < token_count; i++) {
+        printf("%d: Type %d", i, tokens[i].type);
+        if (tokens[i].type == TOKEN_IDENT || tokens[i].type == TOKEN_INT || tokens[i].type == TOKEN_FLOAT || tokens[i].type == TOKEN_STRING) {
+            printf(", Value: %s", tokens[i].lexeme);
+        }
+        printf("\n");
+    }
+}
+
+char* read_file(const char* filename) {
+    FILE* file = fopen(filename, "r");
+    if (!file) {
+        set_error("File not found or cannot be opened");
+        return NULL;
+    }
+
+    fseek(file, 0, SEEK_END);
+    long file_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+
+    char* content = mod_malloc((size_t)file_size + 1);
+    if (!content) {
+        set_error("Memory allocation failed");
+        fclose(file);
+        return NULL;
+    }
+
+    fread(content, 1, (size_t)file_size, file);
+    content[file_size] = '\0';
+    fclose(file);
+
+    return content;
+}
+
+// --- Macro expansion (from simple macro system) ---
+// Expand sequences like $$DATE$$ and $$TIME$$ inside a string buffer
+static void interpret_macro_text(const char *macro, char *out, size_t out_size) {
+    time_t now;
+    struct tm *timeinfo;
+    char buffer[80];
+
+    time(&now);
+    timeinfo = localtime(&now);
+
+    if (mod_strcmp(macro, "DATE") == 0) {
+        strftime(buffer, sizeof(buffer), "%Y-%m-%d", timeinfo);
+        snprintf(out, out_size, "%s", buffer);
+    } else if (mod_strcmp(macro, "TIME") == 0) {
+        strftime(buffer, sizeof(buffer), "%H:%M", timeinfo);
+        snprintf(out, out_size, "%s", buffer);
+    } else {
+        // Unknown macro: keep as-is with the $$ wrapper
+        snprintf(out, out_size, "$$%s$$", macro);
+    }
+}
+
+static void expand_macros_in_string(const char *input, char *output, size_t out_size) {
+    size_t out_index = 0;
+    for (size_t i = 0; input[i] != '\0' && out_index + 1 < out_size; ) {
+        if (input[i] == '$' && input[i + 1] == '$') {
+            // Parse macro name until next '$$'
+            i += 2; // skip opening $$
+            char macro_name[256];
+            size_t m = 0;
+            while (input[i] != '\0' && !(input[i] == '$' && input[i + 1] == '$')) {
+                if (m + 1 < sizeof(macro_name)) {
+                    macro_name[m++] = input[i];
+                }
+                i++;
+            }
+            macro_name[m] = '\0';
+
+            if (input[i] == '$' && input[i + 1] == '$') {
+                i += 2; // skip closing $$
+            }
+
+            char replacement[256];
+            interpret_macro_text(macro_name, replacement, sizeof(replacement));
+            size_t rlen = 0; /* compute length without strnlen for older libs */
+            while (rlen < sizeof(replacement) && replacement[rlen] != '\0') {
+                rlen++;
+            }
+            // Check if expansion would overflow output buffer
+            if (out_index + rlen >= out_size) {
+                // Truncate to available space
+                rlen = out_size - out_index - 1;
+            }
+            for (size_t k = 0; k < rlen && out_index + 1 < out_size; k++) {
+                output[out_index++] = replacement[k];
+            }
+        } else {
+            output[out_index++] = input[i++];
+        }
+    }
+    output[out_index] = '\0';
+}
+
+// ----- String helpers -----
+static void safe_strcat(char *dst, size_t dst_size, const char *src) {
+    size_t di = 0; while (di < dst_size && dst[di] != '\0') di++;
+    size_t si = 0;
+    while (src[si] != '\0' && di + 1 < dst_size) {
+        dst[di++] = src[si++];
+    }
+    if (di < dst_size) dst[di] = '\0';
+    else dst[dst_size - 1] = '\0';
+}
+
+static char *duplicate_cstring(const char *s) {
+    size_t n = 0; while (s[n] != '\0') n++;
+    char *p = (char*)mod_malloc(n + 1);
+    if (!p) return NULL;
+    for (size_t i = 0; i < n; i++) p[i] = s[i];
+    p[n] = '\0';
+    return p;
+}
+
+// Forward decls for string features
+char *evaluate_string_expr(void);
+static char *exec_capture_string(void);
+static char *int_to_string(int v);
+static void for_statement(void);
+Token *peek_token(void); // forward declaration for error reporting helpers
+
+// ----- Error reporting helpers -----
+static void set_token_meta(Token *t, int line, const char *filename) {
+    t->line = line;
+    if (filename && filename[0] != '\0') {
+        size_t i = 0; while (filename[i] != '\0' && i + 1 < sizeof(t->file)) { t->file[i] = filename[i]; i++; }
+        t->file[i] = '\0';
+    } else {
+        t->file[0] = '\0';
+    }
+}
+
+static void print_error_context(const char *message) {
+    Token *t = peek_token();
+    const char *fname = (t && t->file[0] != '\0') ? t->file : "<unknown>";
+    int l = t ? t->line : -1;
+    if (t && (t->type == TOKEN_IDENT || t->type == TOKEN_STRING)) {
+        printf("%s at %s:%d near '%s'\n", message, fname, l, t->lexeme);
+    } else if (t && t->type == TOKEN_INT) {
+        printf("%s at %s:%d near integer\n", message, fname, l);
+    } else {
+        printf("%s at %s:%d\n", message, fname, l);
+    }
+}
+
+void tokenize_with_includes(char *source, const char *source_filename) {
+    char *p = source;
+    int line_num = 1;
+    while (*p) {
+        // Check for token buffer overflow
+        if (token_count >= MAX_TOKENS - 1) {
+            printf("Too many tokens (max %d) in %s\n", MAX_TOKENS, 
+                   source_filename ? source_filename : "<unknown>");
+            exit(1);
+        }
+        if (mod_strncmp(p, "#include", 8) == 0) {
+            char inc_name[256];
+            sscanf(p, "#include \"%[^\"]\"", inc_name);
+            p += mod_strcspn(p, "\n");  // Move past the #include line
+            if (*p == '\n') { p++; line_num++; }
+            
+            char* included_content = read_file(inc_name);
+            tokenize_with_includes(included_content, inc_name);
+            mod_free(included_content);
+    } else if ((p[0] == '0' && (p[1] == 'x' || p[1] == 'X'))
+           || (p[0] == '&' && ((p[1] >= '0' && p[1] <= '9') || (p[1] >= 'a' && p[1] <= 'f') || (p[1] >= 'A' && p[1] <= 'F')))
+           || ascii_isdigit(*p)) {
+            int value = 0;
+            float float_value = 0.0f;
+            bool is_float = false;
+            bool is_hex = false;
+            char lexbuf[64];
+            int li = 0;
+
+            // Hex prefixes: 0x.. or &..
+            if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+                is_hex = true;
+                // copy prefix to lexeme buffer
+                if (li < (int)sizeof(lexbuf) - 1) lexbuf[li++] = *p;
+                p++;
+                if (li < (int)sizeof(lexbuf) - 1) lexbuf[li++] = *p;
+                p++;
+                while ((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F')) {
+                    int d = 0;
+                    if (*p >= '0' && *p <= '9') d = *p - '0';
+                    else if (*p >= 'a' && *p <= 'f') d = 10 + (*p - 'a');
+                    else d = 10 + (*p - 'A');
+                    value = (value << 4) + d;
+                    if (li < (int)sizeof(lexbuf) - 1) lexbuf[li++] = *p;
+                    p++;
+                }
+                lexbuf[li] = '\0';
+            } else if (p[0] == '&') {
+                is_hex = true;
+                if (li < (int)sizeof(lexbuf) - 1) lexbuf[li++] = *p;
+                p++;
+                while ((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F')) {
+                    int d = 0;
+                    if (*p >= '0' && *p <= '9') d = *p - '0';
+                    else if (*p >= 'a' && *p <= 'f') d = 10 + (*p - 'a');
+                    else d = 10 + (*p - 'A');
+                    value = (value << 4) + d;
+                    if (li < (int)sizeof(lexbuf) - 1) lexbuf[li++] = *p;
+                    p++;
+                }
+                lexbuf[li] = '\0';
+            } else {
+                // Parse integer part (decimal)
+                while (ascii_isdigit(*p)) {
+                    value = value * 10 + (*p - '0');
+                    if (li < (int)sizeof(lexbuf) - 1) lexbuf[li++] = *p;
+                    p++;
+                }
+            }
+            
+            // Check for decimal point
+            if (!is_hex && *p == '.') {
+                is_float = true;
+                p++; // Skip the '.'
+                float_value = (float)value;
+                float decimal_place = 0.1f;
+                
+                // Parse fractional part
+                while (ascii_isdigit(*p)) {
+                    float_value += (float)(*p - '0') * decimal_place;
+                    decimal_place *= 0.1f;
+                    if (li < (int)sizeof(lexbuf) - 1) lexbuf[li++] = *p;
+                    p++;
+                }
+                
+                tokens[token_count].type = TOKEN_FLOAT;
+                tokens[token_count].float_value = float_value;
+                sprintf(tokens[token_count].lexeme, "%g", float_value);
+            } else {
+                tokens[token_count].type = TOKEN_INT;
+                tokens[token_count].value = value;
+                // Preserve the original-like lexeme for readability
+                if (is_hex) {
+                    // Normalize to 0x... format in lexeme
+                    sprintf(tokens[token_count].lexeme, "%d", value);
+                } else {
+                    sprintf(tokens[token_count].lexeme, "%d", value);
+                }
+            }
+            
+            set_token_meta(&tokens[token_count], line_num, source_filename);
+            token_count++;
+        } else if (ascii_isalpha(*p) || *p == '_') {
+            char ident[MAX_VAR_NAME];
+            int i = 0;
+            while ((ascii_isalnum(*p) || *p == '_') && i < MAX_VAR_NAME - 1) {
+                ident[i++] = *p++;
+            }
+            ident[i] = '\0';
+            
+            // Check for identifier too long
+            if (i >= MAX_VAR_NAME - 1 && (ascii_isalnum(*p) || *p == '_')) {
+                printf("Identifier too long (max %d chars) at %s:%d\n", MAX_VAR_NAME - 1,
+                       source_filename ? source_filename : "<unknown>", line_num);
+                exit(1);
+            }
+            if (mod_strcmp(ident, "print") == 0) {
+                tokens[token_count].type = TOKEN_PRINT;
+            } else if (mod_strcmp(ident, "if") == 0) {
+                tokens[token_count].type = TOKEN_IF;
+            } else if (mod_strcmp(ident, "then") == 0) {
+                tokens[token_count].type = TOKEN_THEN;
+            } else if (mod_strcmp(ident, "else") == 0) {
+                tokens[token_count].type = TOKEN_ELSE;
+            } else if (mod_strcmp(ident, "end") == 0) {
+                tokens[token_count].type = TOKEN_END;
+            } else if (mod_strcmp(ident, "while") == 0) {
+                tokens[token_count].type = TOKEN_WHILE;
+            } else if (mod_strcmp(ident, "do") == 0) {
+                tokens[token_count].type = TOKEN_DO;
+            } else if (mod_strcmp(ident, "for") == 0) {
+                tokens[token_count].type = TOKEN_FOR;
+            } else if (mod_strcmp(ident, "to") == 0) {
+                tokens[token_count].type = TOKEN_TO;
+            } else if (mod_strcmp(ident, "step") == 0) {
+                tokens[token_count].type = TOKEN_STEP;
+            } else if (mod_strcmp(ident, "break") == 0) {
+                tokens[token_count].type = TOKEN_BREAK;
+            } else if (mod_strcmp(ident, "continue") == 0) {
+                tokens[token_count].type = TOKEN_CONTINUE;
+            } else if (mod_strcmp(ident, "true") == 0) {
+                tokens[token_count].type = TOKEN_TRUE;
+            } else if (mod_strcmp(ident, "false") == 0) {
+                tokens[token_count].type = TOKEN_FALSE;
+            } else if (mod_strcmp(ident, "function") == 0) {
+                tokens[token_count].type = TOKEN_FUNCTION;
+            } else if (mod_strcmp(ident, "return") == 0) {
+                tokens[token_count].type = TOKEN_RETURN;
+            } else if (mod_strcmp(ident, "exec") == 0) {
+                tokens[token_count].type = TOKEN_EXEC;
+            } else if (mod_strcmp(ident, "switch") == 0) {
+                tokens[token_count].type = TOKEN_SWITCH;
+            } else if (mod_strcmp(ident, "case") == 0) {
+                tokens[token_count].type = TOKEN_CASE;
+            } else if (mod_strcmp(ident, "default") == 0) {
+                tokens[token_count].type = TOKEN_DEFAULT;
+            } else if (mod_strcmp(ident, "const") == 0) {
+                tokens[token_count].type = TOKEN_CONST;
+            } else if (mod_strcmp(ident, "try") == 0) {
+                tokens[token_count].type = TOKEN_TRY;
+            } else if (mod_strcmp(ident, "catch") == 0) {
+                tokens[token_count].type = TOKEN_CATCH;
+            } else {
+                tokens[token_count].type = TOKEN_IDENT;
+            }
+            mod_strcpy(tokens[token_count].lexeme, ident);
+            set_token_meta(&tokens[token_count], line_num, source_filename);
+            token_count++;
+        } else if (*p == '=') {
+            if (*(p + 1) == '=') {
+                tokens[token_count].type = TOKEN_EQ;
+                set_token_meta(&tokens[token_count], line_num, source_filename);
+                token_count++;
+                p += 2;
+            } else {
+                tokens[token_count].type = TOKEN_ASSIGN;
+                set_token_meta(&tokens[token_count], line_num, source_filename);
+                token_count++;
+                p++;
+            }
+        } else if (*p == '!') {
+            if (*(p + 1) == '=') {
+                tokens[token_count].type = TOKEN_NEQ;
+                set_token_meta(&tokens[token_count], line_num, source_filename);
+                token_count++;
+                p += 2;
+            } else {
+                // Handle logical NOT operator
+                tokens[token_count].type = TOKEN_NOT;
+                set_token_meta(&tokens[token_count], line_num, source_filename);
+                token_count++;
+                p++;
+            }
+        } else if (*p == '<') {
+            if (*(p + 1) == '=') {
+                tokens[token_count].type = TOKEN_LTE;
+                set_token_meta(&tokens[token_count], line_num, source_filename);
+                token_count++;
+                p += 2;
+            } else {
+                tokens[token_count].type = TOKEN_LT;
+                set_token_meta(&tokens[token_count], line_num, source_filename);
+                token_count++;
+                p++;
+            }
+        } else if (*p == '>') {
+            if (*(p + 1) == '=') {
+                tokens[token_count].type = TOKEN_GTE;
+                set_token_meta(&tokens[token_count], line_num, source_filename);
+                token_count++;
+                p += 2;
+            } else {
+                tokens[token_count].type = TOKEN_GT;
+                set_token_meta(&tokens[token_count], line_num, source_filename);
+                token_count++;
+                p++;
+            }
+        } else if (*p == '&') {
+            if (*(p + 1) == '&') {
+                tokens[token_count].type = TOKEN_AND;
+                set_token_meta(&tokens[token_count], line_num, source_filename);
+                token_count++;
+                p += 2;
+            } else {
+                printf("Unexpected character: %c at %s:%d\n", *p, source_filename ? source_filename : "<unknown>", line_num);
+                exit(1);
+            }
+        } else if (*p == '|') {
+            if (*(p + 1) == '|') {
+                tokens[token_count].type = TOKEN_OR;
+                set_token_meta(&tokens[token_count], line_num, source_filename);
+                token_count++;
+                p += 2;
+            } else {
+                printf("Unexpected character: %c at %s:%d\n", *p, source_filename ? source_filename : "<unknown>", line_num);
+                exit(1);
+            }
+        } else if (*p == '+') {
+            if (*(p + 1) == '+') {
+                tokens[token_count].type = TOKEN_INCREMENT;
+                set_token_meta(&tokens[token_count], line_num, source_filename);
+                token_count++;
+                p += 2;
+            } else if (*(p + 1) == '=') {
+                tokens[token_count].type = TOKEN_PLUS_ASSIGN;
+                set_token_meta(&tokens[token_count], line_num, source_filename);
+                token_count++;
+                p += 2;
+            } else {
+                tokens[token_count].type = TOKEN_PLUS;
+                set_token_meta(&tokens[token_count], line_num, source_filename);
+                token_count++;
+                p++;
+            }
+        } else if (*p == '-') {
+            if (*(p + 1) == '-') {
+                tokens[token_count].type = TOKEN_DECREMENT;
+                set_token_meta(&tokens[token_count], line_num, source_filename);
+                token_count++;
+                p += 2;
+            } else if (*(p + 1) == '=') {
+                tokens[token_count].type = TOKEN_MINUS_ASSIGN;
+                set_token_meta(&tokens[token_count], line_num, source_filename);
+                token_count++;
+                p += 2;
+            } else {
+                tokens[token_count].type = TOKEN_MINUS;
+                set_token_meta(&tokens[token_count], line_num, source_filename);
+                token_count++;
+                p++;
+            }
+        } else if (*p == '*') {
+            if (*(p + 1) == '=') {
+                tokens[token_count].type = TOKEN_MULTIPLY_ASSIGN;
+                set_token_meta(&tokens[token_count], line_num, source_filename);
+                token_count++;
+                p += 2;
+            } else {
+                tokens[token_count].type = TOKEN_MULTIPLY;
+                set_token_meta(&tokens[token_count], line_num, source_filename);
+                token_count++;
+                p++;
+            }
+        } else if (*p == '/') {
+            if (*(p + 1) == '/') {  // Single-line comment
+                p += 2;
+                while (*p && *p != '\n') p++;
+                if (*p == '\n') { p++; line_num++; }
+            } else if (*(p + 1) == '*') {  // Multi-line comment
+                p += 2;
+                while (*p && !(*p == '*' && *(p + 1) == '/')) p++;
+                if (*p) p += 2;
+            } else if (*(p + 1) == '=') {
+                tokens[token_count].type = TOKEN_DIVIDE_ASSIGN;
+                set_token_meta(&tokens[token_count], line_num, source_filename);
+                token_count++;
+                p += 2;
+            } else {
+                tokens[token_count].type = TOKEN_DIVIDE;
+                set_token_meta(&tokens[token_count], line_num, source_filename);
+                token_count++;
+                p++;
+            }
+        } else if (*p == ';') {
+            tokens[token_count].type = TOKEN_SEMICOLON;
+            set_token_meta(&tokens[token_count], line_num, source_filename);
+            token_count++;
+            p++;
+        } else if (*p == '(') {
+            tokens[token_count].type = TOKEN_LPAREN;
+            set_token_meta(&tokens[token_count], line_num, source_filename);
+            token_count++;
+            p++;
+        } else if (*p == ')') {
+            tokens[token_count].type = TOKEN_RPAREN;
+            set_token_meta(&tokens[token_count], line_num, source_filename);
+            token_count++;
+            p++;
+        } else if (*p == ',') {
+            tokens[token_count].type = TOKEN_COMMA;
+            set_token_meta(&tokens[token_count], line_num, source_filename);
+            token_count++;
+            p++;
+        } else if (*p == '[') {
+            tokens[token_count].type = TOKEN_LBRACKET;
+            set_token_meta(&tokens[token_count], line_num, source_filename);
+            token_count++;
+            p++;
+        } else if (*p == ']') {
+            tokens[token_count].type = TOKEN_RBRACKET;
+            set_token_meta(&tokens[token_count], line_num, source_filename);
+            token_count++;
+            p++;
+        } else if (*p == '.') {
+            tokens[token_count].type = TOKEN_DOT;
+            set_token_meta(&tokens[token_count], line_num, source_filename);
+            token_count++;
+            p++;
+        } else if (*p == '"') {
+            p++; // Skip opening quote
+            int i = 0;
+            while (*p != '"' && *p != '\0' && i < MAX_LEXEME_LENGTH - 1) {
+                tokens[token_count].lexeme[i++] = *p++;
+            }
+            tokens[token_count].lexeme[i] = '\0';
+            
+            // Check for string too long
+            if (i >= MAX_LEXEME_LENGTH - 1 && *p != '"' && *p != '\0') {
+                printf("String literal too long (max %d chars) at %s:%d\n", MAX_LEXEME_LENGTH - 1, 
+                       source_filename ? source_filename : "<unknown>", line_num);
+                exit(1);
+            }
+            
+            if (*p == '"') {
+                p++; // Skip closing quote
+            } else {
+                printf("Unterminated string literal at %s:%d\n", source_filename ? source_filename : "<unknown>", line_num);
+                exit(1);
+            }
+            // Expand $$MACRO$$ sequences inside the string literal
+            char expanded[MAX_LEXEME_LENGTH];
+            expand_macros_in_string(tokens[token_count].lexeme, expanded, sizeof(expanded));
+            /* manual safe copy without relying on strnlen */
+            size_t copy_len = 0;
+            while (copy_len + 1 < MAX_LEXEME_LENGTH && expanded[copy_len] != '\0') {
+                tokens[token_count].lexeme[copy_len] = expanded[copy_len];
+                copy_len++;
+            }
+            tokens[token_count].lexeme[copy_len] = '\0';
+            set_token_meta(&tokens[token_count], line_num, source_filename);
+            tokens[token_count].type = TOKEN_STRING;
+            token_count++;
+    } else if (ascii_isspace(*p)) {
+            if (*p == '\n') line_num++;
+            p++;
+        } else {
+            printf("Unexpected character: %c at %s:%d\n", *p, source_filename ? source_filename : "<unknown>", line_num);
+            exit(1);
+        }
+    }
+    tokens[token_count].type = TOKEN_EOF;
+    set_token_meta(&tokens[token_count], line_num, source_filename);
+}
+
+Token *next_token(void) {
+    return &tokens[current_token++];
+}
+
+Token *peek_token(void) {
+    return &tokens[current_token];
+}
+
+Token *peek_ahead(int offset) {
+    if (current_token + offset >= token_count) {
+        return &tokens[token_count - 1]; // Return EOF token
+    }
+    return &tokens[current_token + offset];
+}
+
+// Variable management functions have been moved to c.variables module
+
+int expression(void);  // Forward declaration with explicit void
+
+int function_call(char *name);  // Forward declaration
+
+// Forward declarations for floating-point expression functions
+float float_factor(void);
+float float_term(void);
+float float_expression(void);
+
+// Floating-point expression parsing functions
+float float_factor(void) {
+    Token *token = peek_token();
+    if (token->type == TOKEN_INT) {
+        next_token();
+        return (float)(token->value);
+    } else if (token->type == TOKEN_FLOAT) {
+        next_token();
+        return token->float_value;
+    } else if (token->type == TOKEN_MINUS) {
+        // Unary minus
+        next_token();
+        float v = float_factor();
+        return -v;
+    } else if (token->type == TOKEN_TRUE) {
+        next_token();
+        return 1.0f;
+    } else if (token->type == TOKEN_FALSE) {
+        next_token();
+        return 0.0f;
+    } else if (token->type == TOKEN_IDENT) {
+        char name[MAX_VAR_NAME];
+        mod_strcpy(name, next_token()->lexeme);
+        if (peek_token()->type == TOKEN_LPAREN) {
+            // Function call - return as float
+            return (float)function_call(name);
+        } else {
+            VarType type;
+            void* value = get_variable_value(name, &type);
+            if (type == VAR_INT) {
+                return (float)(*(int*)value);
+            } else if (type == VAR_FLOAT) {
+                return *(float*)value;
+            } else if (type == VAR_BOOL) {
+                return *(int*)value ? 1.0f : 0.0f;
+            } else if (type == VAR_TIME) {
+                return (float)(*(unsigned int*)value);
+            } else {
+                return 0.0f; // Return 0.0 for non-numeric variables
+            }
+        }
+    } else if (token->type == TOKEN_LPAREN) {
+        next_token();  // Consume '('
+        float result = float_expression();
+        if (peek_token()->type != TOKEN_RPAREN) {
+            printf("Expected ')'\n");
+            exit(1);
+        }
+        next_token();  // Consume ')'
+        return result;
+    }
+    
+    print_error_context("Unexpected token in float factor");
+    exit(1);
+}
+
+float float_term(void) {
+    float left = float_factor();
+    while (peek_token()->type == TOKEN_MULTIPLY || peek_token()->type == TOKEN_DIVIDE) {
+        Token *op = next_token();
+        float right = float_factor();
+        if (op->type == TOKEN_MULTIPLY) {
+            left *= right;
+        } else {
+            if (right == 0.0f) {
+                printf("Division by zero\n");
+                exit(1);
+            }
+            left /= right;
+        }
+    }
+    return left;
+}
+
+float float_expression(void) {
+    float left = float_term();
+    while (peek_token()->type == TOKEN_PLUS || peek_token()->type == TOKEN_MINUS) {
+        Token *op = next_token();
+        float right = float_term();
+        if (op->type == TOKEN_PLUS) {
+            left += right;
+        } else {
+            left -= right;
+        }
+    }
+    return left;
+}
+
+int factor(void) {
+    Token *token = peek_token();
+    if (token->type == TOKEN_INT) {
+        next_token();
+        return token->value;
+    } else if (token->type == TOKEN_FLOAT) {
+        next_token();
+        return (int)(token->float_value); // Convert float to int for arithmetic
+    } else if (token->type == TOKEN_MINUS) {
+        // Unary minus
+        next_token();
+        int v = factor();
+        return -v;
+    } else if (token->type == TOKEN_TRUE) {
+        next_token();
+        return 1;
+    } else if (token->type == TOKEN_FALSE) {
+        next_token();
+        return 0;
+    } else if (token->type == TOKEN_STRING) {
+        next_token();
+        return 0; // Return 0 for non-numeric factors
+    } else if (token->type == TOKEN_IDENT) {
+        char name[MAX_VAR_NAME];
+        strcpy(name, next_token()->lexeme);
+        if (peek_token()->type == TOKEN_LPAREN) {
+            return function_call(name);
+        } else {
+            VarType type;
+            void* value = get_variable_value(name, &type);
+            if (!value) {
+                // Error already set by get_variable_value, but continue with 0
+                return 0;
+            }
+            if (type == VAR_INT) {
+                return *(int*)value;
+            } else if (type == VAR_FLOAT) {
+                return (int)(*(float*)value); // Convert float to int
+            } else if (type == VAR_BOOL) {
+                return *(int*)value ? 1 : 0; // Convert bool to int
+            } else if (type == VAR_TIME) {
+                return (int)(*(unsigned int*)value); // Convert time to int
+            } else {
+                return 0; // Return 0 for non-numeric variables (strings, files, etc.)
+            }
+        }
+    } else if (token->type == TOKEN_LPAREN) {
+        next_token();  // Consume '('
+        int result = expression();
+        if (peek_token()->type != TOKEN_RPAREN) {
+            printf("Expected ')'\n");
+            exit(1);
+        }
+        next_token();  // Consume ')'
+        return result;
+    } else if (token->type == TOKEN_LBRACKET) {
+        // Array literal syntax: [1, 2, 3, ...]
+        next_token();  // Consume '['
+        
+        // Create a temporary array variable name
+        char array_name[MAX_VAR_NAME];
+        sprintf(array_name, "__tmp_array_%d", current_token); // Unique temporary name
+        
+        // Count elements first
+        int element_count = 0;
+        int saved_token = current_token;
+        
+        while (peek_token()->type != TOKEN_RBRACKET && peek_token()->type != TOKEN_EOF) {
+            expression(); // Parse but don't use the value
+            element_count++;
+            if (peek_token()->type == TOKEN_COMMA) {
+                next_token(); // Consume comma
+            } else if (peek_token()->type != TOKEN_RBRACKET) {
+                printf("Expected ',' or ']' in array literal\n");
+                exit(1);
+            }
+        }
+        
+        // Reset to parse again and store values
+        current_token = saved_token;
+        
+        // Create the array variable
+        create_array_variable(array_name, element_count);
+        
+        // Parse and store elements
+        int index = 0;
+        while (peek_token()->type != TOKEN_RBRACKET && peek_token()->type != TOKEN_EOF) {
+            int value = expression();
+            set_array_element(array_name, index, value);
+            index++;
+            
+            if (peek_token()->type == TOKEN_COMMA) {
+                next_token(); // Consume comma
+            } else if (peek_token()->type != TOKEN_RBRACKET) {
+                printf("Expected ',' or ']' in array literal\n");
+                exit(1);
+            }
+        }
+        
+        if (peek_token()->type != TOKEN_RBRACKET) {
+            printf("Expected ']' to close array literal\n");
+            exit(1);
+        }
+        next_token(); // Consume ']'
+        
+        // Return the variable index or a reference to the array
+        return find_variable(array_name);
+    }
+    
+    // Final catch for TOKEN_FALSE if it somehow gets here
+    if (token->type == TOKEN_FALSE) {
+        next_token();
+        return 0;
+    }
+    
+    print_error_context("Unexpected token in factor");
+    exit(1);
+}
+
+int term(void) {
+    int left = factor();
+    while (peek_token()->type == TOKEN_MULTIPLY || peek_token()->type == TOKEN_DIVIDE) {
+        Token *op = next_token();
+        int right = factor();
+        if (op->type == TOKEN_MULTIPLY) {
+            left *= right;
+        } else {
+            if (right == 0) {
+                printf("Division by zero\n");
+                exit(1);
+            }
+            left /= right;
+        }
+    }
+    return left;
+}
+
+int expression(void) {
+    if (peek_token()->type == TOKEN_STRING) {
+        next_token(); // Consume the string token
+        return 0; // Return 0 for non-numeric expressions
+    }
+    int left = term();
+    while (peek_token()->type == TOKEN_PLUS || peek_token()->type == TOKEN_MINUS) {
+        Token *op = next_token();
+        int right = term();
+        if (op->type == TOKEN_PLUS) {
+            left += right;
+        } else {
+            left -= right;
+        }
+    }
+    return left;
+}
+
+bool condition(void) {
+    // Parse optional 'not'
+    bool negate = false;
+    if (peek_token()->type == TOKEN_NOT) { next_token(); negate = true; }
+
+    // Support boolean literals
+    if (peek_token()->type == TOKEN_TRUE) { next_token(); return !negate; }
+    if (peek_token()->type == TOKEN_FALSE) { next_token(); return negate; }
+
+    // Allow string equality and numeric comparisons
+    // Heuristic: if next token is STRING or IDENT referring to string var, use string compare
+    bool is_string_cmp = false;
+    if (peek_token()->type == TOKEN_STRING) is_string_cmp = true;
+    else if (peek_token()->type == TOKEN_IDENT) {
+        char name[MAX_VAR_NAME]; strcpy(name, peek_token()->lexeme);
+        int idx = find_variable(name);
+        if (idx != -1 && variables[idx].type == VAR_STRING) is_string_cmp = true;
+    }
+
+    bool result = false;
+    if (is_string_cmp) {
+        char *lhs = evaluate_string_expr();
+        Token *op = next_token();
+        char *rhs = evaluate_string_expr();
+        int cmp = 0;
+        if (lhs && rhs) cmp = mod_strcmp(lhs, rhs);
+        switch (op->type) {
+            case TOKEN_EQ: result = (cmp == 0); break;
+            case TOKEN_NEQ: result = (cmp != 0); break;
+            case TOKEN_LT: result = (cmp < 0); break;
+            case TOKEN_GT: result = (cmp > 0); break;
+            case TOKEN_LTE: result = (cmp <= 0); break;
+            case TOKEN_GTE: result = (cmp >= 0); break;
+            default: print_error_context("Unexpected comparison operator"); exit(1);
+        }
+        if (lhs) mod_free(lhs); if (rhs) mod_free(rhs);
+    } else {
+        int left = expression();
+        Token *op = peek_token();
+        // Check if next token is a comparison operator
+        if (op->type == TOKEN_EQ || op->type == TOKEN_NEQ || op->type == TOKEN_LT || 
+            op->type == TOKEN_GT || op->type == TOKEN_LTE || op->type == TOKEN_GTE) {
+            op = next_token();
+            int right = expression();
+            switch (op->type) {
+                case TOKEN_EQ: result = (left == right); break;
+                case TOKEN_NEQ: result = (left != right); break;
+                case TOKEN_LT: result = (left < right); break;
+                case TOKEN_GT: result = (left > right); break;
+                case TOKEN_LTE: result = (left <= right); break;
+                case TOKEN_GTE: result = (left >= right); break;
+            }
+        } else {
+            // No comparison operator, treat as boolean (0 = false, non-zero = true)
+            result = (left != 0);
+        }
+    }
+
+    if (negate) result = !result;
+
+    // Handle chained 'and'/'or'
+    while (peek_token()->type == TOKEN_AND || peek_token()->type == TOKEN_OR) {
+        TokenType op = next_token()->type;
+        bool rhs = condition();
+        if (op == TOKEN_AND) result = result && rhs; else result = result || rhs;
+    }
+    return result;
+}
+
+void statement(void);  // Forward declaration
+
+void if_statement(void) {
+    next_token(); // Consume 'if'
+    bool cond = condition();
+    if (next_token()->type != TOKEN_THEN) {
+        printf("Expected 'then' after condition\n");
+        exit(1);
+    }
+    
+    int nesting = 1;
+    while (nesting > 0 && peek_token()->type != TOKEN_EOF) {
+        if (peek_token()->type == TOKEN_IF) {
+            if (cond) {
+                statement();
+                if (function_return_flag) {
+                    return; // Propagate function return out of the if block
+                }
+            } else {
+                nesting++;
+                next_token(); // Skip 'if'
+                condition();  // Skip condition
+                if (next_token()->type != TOKEN_THEN) {
+                    printf("Expected 'then' after condition\n");
+                    exit(1);
+                }
+            }
+        } else if (peek_token()->type == TOKEN_END) {
+            nesting--;
+            next_token(); // Consume 'end'
+            if (nesting == 0) {
+                return;
+            }
+        } else if (peek_token()->type == TOKEN_ELSE && nesting == 1) {
+            next_token(); // Consume 'else'
+            if (!cond) {
+                cond = true; // Execute the else block
+            } else {
+                cond = false; // Skip the else block
+            }
+        } else if (cond) {
+            statement();
+            if (function_return_flag) {
+                return; // Propagate function return out of the if block
+            }
+        } else {
+            next_token();
+        }
+    }
+    
+    if (nesting > 0) {
+        printf("Expected 'end' after if-then-else block\n");
+        exit(1);
+    }
+}
+
+void while_statement(void) {
+    next_token(); // Consume 'while'
+    int condition_start = current_token;
+    bool cond = condition();
+    if (next_token()->type != TOKEN_DO) {
+        printf("Expected 'do' after while condition\n");
+        exit(1);
+    }
+    
+    int body_start = current_token;
+    loop_depth++;
+    while (cond) {
+        while (peek_token()->type != TOKEN_END && peek_token()->type != TOKEN_EOF) {
+            statement();
+            if (function_return_flag) { loop_depth--; return; }
+            if (loop_break_flag || loop_continue_flag) {
+                // Skip the rest of the loop body
+                while (peek_token()->type != TOKEN_END && peek_token()->type != TOKEN_EOF) next_token();
+                break;
+            }
+        }
+        if (peek_token()->type == TOKEN_EOF) {
+            printf("Expected 'end' after while loop body\n");
+            exit(1);
+        }
+        next_token(); // Consume 'end'
+        if (loop_break_flag) { loop_break_flag = false; break; }
+        if (loop_continue_flag) { loop_continue_flag = false; }
+        
+        // Re-evaluate the condition
+        current_token = condition_start;
+        cond = condition();
+        if (cond) {
+            current_token = body_start;
+        }
+    }
+    
+    // Skip to the end of the loop if condition is false
+    while (peek_token()->type != TOKEN_END && peek_token()->type != TOKEN_EOF) {
+        next_token();
+    }
+    if (peek_token()->type == TOKEN_EOF) {
+        printf("Expected 'end' after while loop body\n");
+        exit(1);
+    }
+    next_token(); // Consume 'end'
+    loop_depth--;
+}
+
+void function_declaration(void) {
+    next_token(); // Consume 'function'
+    
+    if (peek_token()->type != TOKEN_IDENT) {
+        printf("Expected function name\n");
+        exit(1);
+    }
+    
+    Function func;
+    strcpy(func.name, next_token()->lexeme);
+    
+    if (next_token()->type != TOKEN_LPAREN) {
+        printf("Expected '(' after function name\n");
+        exit(1);
+    }
+    
+    func.param_count = 0;
+    while (peek_token()->type != TOKEN_RPAREN) {
+        if (func.param_count >= MAX_PARAMS) {
+            printf("Too many parameters in function %s\n", func.name);
+            exit(1);
+        }
+        if (peek_token()->type != TOKEN_IDENT) {
+            printf("Expected parameter name\n");
+            exit(1);
+        }
+        strcpy(func.param_names[func.param_count], next_token()->lexeme);
+        func.param_count++;
+        
+        if (peek_token()->type == TOKEN_COMMA) {
+            next_token();
+        } else if (peek_token()->type != TOKEN_RPAREN) {
+            printf("Expected ',' or ')' in function declaration\n");
+            exit(1);
+        }
+    }
+    next_token(); // Consume ')'
+    
+    func.body_start = current_token;
+
+    // Skip the function body, correctly matching only the function's own 'end'.
+    // Track nested functions separately from block constructs (if/while/for).
+    int function_depth = 1;
+    int block_depth = 0;
+    while (function_depth > 0 && peek_token()->type != TOKEN_EOF) {
+        TokenType t = peek_token()->type;
+        if (t == TOKEN_FUNCTION) {
+            function_depth++;
+        } else if (t == TOKEN_IF || t == TOKEN_WHILE || t == TOKEN_FOR) {
+            block_depth++;
+        } else if (t == TOKEN_END) {
+            if (block_depth > 0) {
+                block_depth--;
+            } else {
+                function_depth--;
+            }
+        }
+        next_token();
+    }
+
+    if (function_depth > 0) {
+        printf("Unexpected EOF in function body\n");
+        exit(1);
+    }
+    
+    func.body_end = current_token - 1;
+    
+    functions[function_count++] = func;
+}
+
+int function_call(char *name) {
+    int func_index = -1;
+    for (int i = 0; i < function_count; i++) {
+        if (mod_strcmp(functions[i].name, name) == 0) {
+            func_index = i;
+            break;
+        }
+    }
+    
+    if (func_index == -1) {
+        // Built-in numeric functions
+        if (mod_strcmp(name, "swi") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after swi\n"); exit(1);} 
+            int result = swi_builtin_call();
+            if (next_token()->type != TOKEN_RPAREN) { printf("swi expects ')'\n"); exit(1);} 
+            return result;
+        } else if (mod_strcmp(name, "swi_error") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after swi_error\n"); exit(1);} 
+            if (next_token()->type != TOKEN_RPAREN) { printf("swi_error expects no arguments and ')'\n"); exit(1);} 
+            return swi_builtin_error();
+        } else if (mod_strcmp(name, "debug_on") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after debug_on\n"); exit(1);} 
+            return debug_builtin_on();
+        } else if (mod_strcmp(name, "debug_off") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after debug_off\n"); exit(1);} 
+            return debug_builtin_off();
+        } else if (mod_strcmp(name, "debug_print") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after debug_print\n"); exit(1);} 
+            return debug_builtin_print();
+        } else if (mod_strcmp(name, "debug_logpath") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after debug_logpath\n"); exit(1);} 
+            return debug_builtin_logpath();
+        } else if (mod_strcmp(name, "add") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after add\n"); exit(1);} 
+            return math_builtin_add();
+        } else if (mod_strcmp(name, "status") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after status\n"); exit(1);} 
+            if (next_token()->type != TOKEN_RPAREN) { printf("status expects no arguments and ')'\n"); exit(1);} 
+            return last_exec_status;
+        } else if (mod_strcmp(name, "subtract") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after subtract\n"); exit(1);} 
+            int a = expression();
+            if (next_token()->type != TOKEN_COMMA) { printf("subtract expects 2 arguments\n"); exit(1);} 
+            int b = expression();
+            if (next_token()->type != TOKEN_RPAREN) { printf("subtract expects ')'\n"); exit(1);} 
+            return a - b;
+        } else if (mod_strcmp(name, "multiply") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after multiply\n"); exit(1);} 
+            int a = expression();
+            if (next_token()->type != TOKEN_COMMA) { printf("multiply expects 2 arguments\n"); exit(1);} 
+            int b = expression();
+            if (next_token()->type != TOKEN_RPAREN) { printf("multiply expects ')'\n"); exit(1);} 
+            return a * b;
+        } else if (mod_strcmp(name, "divide") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after divide\n"); exit(1);} 
+            int a = expression();
+            if (next_token()->type != TOKEN_COMMA) { printf("divide expects 2 arguments\n"); exit(1);} 
+            int b = expression();
+            if (b == 0) { printf("Division by zero\n"); exit(1);} 
+            if (next_token()->type != TOKEN_RPAREN) { printf("divide expects ')'\n"); exit(1);} 
+            return a / b;
+        } else if (mod_strcmp(name, "mod") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after mod\n"); exit(1);} 
+            int a = expression();
+            if (next_token()->type != TOKEN_COMMA) { printf("mod expects 2 arguments\n"); exit(1);} 
+            int b = expression();
+            if (b == 0) { printf("Modulo by zero\n"); exit(1);} 
+            if (next_token()->type != TOKEN_RPAREN) { printf("mod expects ')'\n"); exit(1);} 
+            return a % b;
+        } else if (mod_strcmp(name, "min") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after min\n"); exit(1);} 
+            int a = expression();
+            if (next_token()->type != TOKEN_COMMA) { printf("min expects 2 arguments\n"); exit(1);} 
+            int b = expression();
+            if (next_token()->type != TOKEN_RPAREN) { printf("min expects ')'\n"); exit(1);} 
+            return (a < b) ? a : b;
+        } else if (mod_strcmp(name, "max") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after max\n"); exit(1);} 
+            int a = expression();
+            if (next_token()->type != TOKEN_COMMA) { printf("max expects 2 arguments\n"); exit(1);} 
+            int b = expression();
+            if (next_token()->type != TOKEN_RPAREN) { printf("max expects ')'\n"); exit(1);} 
+            return (a > b) ? a : b;
+        } else if (mod_strcmp(name, "abs") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after abs\n"); exit(1);} 
+            int a = expression();
+            if (next_token()->type != TOKEN_RPAREN) { printf("abs expects one argument and ')'\n"); exit(1);} 
+            return (a < 0) ? -a : a;
+        } else if (mod_strcmp(name, "square") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after square\n"); exit(1);} 
+            int a = expression();
+            if (next_token()->type != TOKEN_RPAREN) { printf("square expects one argument and ')'\n"); exit(1);} 
+            return a * a;
+        } else if (mod_strcmp(name, "trim") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after trim\n"); exit(1);} 
+            char *s = evaluate_string_expr();
+            if (next_token()->type != TOKEN_RPAREN) { printf("trim expects ')'\n"); exit(1);} 
+            if (!s) return 0; // Return 0 for null string as numeric value
+            int start = 0; while (s[start] && ascii_isspace(s[start])) start++;
+            int end = start; while (s[end]) end++; while (end > start && ascii_isspace(s[end - 1])) end--;
+            // For assignment to string variables, we need to handle this differently
+            // But for now, just return 0 since this is the numeric function call path
+            mod_free(s);
+            return 0;
+        } else if (mod_strcmp(name, "clamp") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after clamp\n"); exit(1);} 
+            int value = expression();
+            if (next_token()->type != TOKEN_COMMA) { printf("clamp expects 3 arguments\n"); exit(1);} 
+            int minval = expression();
+            if (next_token()->type != TOKEN_COMMA) { printf("clamp expects 3 arguments\n"); exit(1);} 
+            int maxval = expression();
+            if (next_token()->type != TOKEN_RPAREN) { printf("clamp expects ')'\n"); exit(1);} 
+            if (value < minval) return minval;
+            if (value > maxval) return maxval;
+            return value;
+        } else if (mod_strcmp(name, "pow") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after pow\n"); exit(1);} 
+            int base = expression();
+            if (next_token()->type != TOKEN_COMMA) { printf("pow expects 2 arguments\n"); exit(1);} 
+            int exp = expression();
+            if (next_token()->type != TOKEN_RPAREN) { printf("pow expects ')'\n"); exit(1);} 
+            int result = 1;
+            for (int i = 0; i < exp; i++) result *= base;
+            return result;
+        } else if (mod_strcmp(name, "isqrt") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after isqrt\n"); exit(1);} 
+            int n = expression();
+            if (next_token()->type != TOKEN_RPAREN) { printf("isqrt expects one argument and ')'\n"); exit(1);} 
+            if (n < 0) return 0;
+            int x = n;
+            int y = (x + 1) / 2;
+            while (y < x) { x = y; y = (x + n / x) / 2; }
+            return x;
+        } else if (mod_strcmp(name, "srand") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after srand\n"); exit(1);} 
+            int seed = expression();
+            if (next_token()->type != TOKEN_RPAREN) { printf("srand expects one argument and ')'\n"); exit(1);} 
+            srand((unsigned int)seed);
+            return 0;
+        } else if (mod_strcmp(name, "rand") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after rand\n"); exit(1);} 
+            // Check if we have arguments (for range) or no arguments
+            if (peek_token()->type == TOKEN_RPAREN) {
+                next_token(); // consume ')'
+                return rand();
+            } else {
+                int min = expression();
+                if (next_token()->type != TOKEN_COMMA) { printf("rand with args expects 2 arguments\n"); exit(1);} 
+                int max = expression();
+                if (next_token()->type != TOKEN_RPAREN) { printf("rand expects ')'\n"); exit(1);} 
+                if (max <= min) return min;
+                return min + (rand() % (max - min + 1));
+            }
+        } else if (mod_strcmp(name, "startswith") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after startswith\n"); exit(1);} 
+            char *str = evaluate_string_expr();
+            if (next_token()->type != TOKEN_COMMA) { printf("startswith expects 2 arguments\n"); exit(1);} 
+            char *prefix = evaluate_string_expr();
+            if (next_token()->type != TOKEN_RPAREN) { printf("startswith expects ')'\n"); exit(1);} 
+            if (!str || !prefix) { mod_free(str); mod_free(prefix); return 0; }
+            int result = (mod_strncmp(str, prefix, mod_strlen(prefix)) == 0) ? 1 : 0;
+            mod_free(str); mod_free(prefix);
+            return result;
+        } else if (mod_strcmp(name, "endswith") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after endswith\n"); exit(1);} 
+            char *str = evaluate_string_expr();
+            if (next_token()->type != TOKEN_COMMA) { printf("endswith expects 2 arguments\n"); exit(1);} 
+            char *suffix = evaluate_string_expr();
+            if (next_token()->type != TOKEN_RPAREN) { printf("endswith expects ')'\n"); exit(1);} 
+            if (!str || !suffix) { mod_free(str); mod_free(suffix); return 0; }
+            int slen = strlen(str), suflen = strlen(suffix);
+            int result = (slen >= suflen && mod_strcmp(str + slen - suflen, suffix) == 0) ? 1 : 0;
+            mod_free(str); mod_free(suffix);
+            return result;
+        } else if (mod_strcmp(name, "contains") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after contains\n"); exit(1);} 
+            char *str = evaluate_string_expr();
+            if (next_token()->type != TOKEN_COMMA) { printf("contains expects 2 arguments\n"); exit(1);} 
+            char *substr = evaluate_string_expr();
+            if (next_token()->type != TOKEN_RPAREN) { printf("contains expects ')'\n"); exit(1);} 
+            if (!str || !substr) { mod_free(str); mod_free(substr); return 0; }
+            int result = (strstr(str, substr) != NULL) ? 1 : 0;
+            mod_free(str); mod_free(substr);
+            return result;
+        } else if (mod_strcmp(name, "parseint") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after parseint\n"); exit(1);} 
+            char *str = evaluate_string_expr();
+            if (next_token()->type != TOKEN_RPAREN) { printf("parseint expects one argument and ')'\n"); exit(1);} 
+            if (!str) return 0;
+            int result = atoi(str);
+            mod_free(str);
+            return result;
+        } else if (mod_strcmp(name, "fromhex") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after fromhex\n"); exit(1);} 
+            char *str = evaluate_string_expr();
+            if (next_token()->type != TOKEN_RPAREN) { printf("fromhex expects one argument and ')'\n"); exit(1);} 
+            if (!str) return 0;
+            int result = (int)strtol(str, NULL, 16);
+            mod_free(str);
+            return result;
+        } else if (mod_strcmp(name, "writefile") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after writefile\n"); exit(1);} 
+            char *filename = evaluate_string_expr();
+            if (next_token()->type != TOKEN_COMMA) { printf("writefile expects 2 arguments\n"); exit(1);} 
+            char *content = evaluate_string_expr();
+            if (next_token()->type != TOKEN_RPAREN) { printf("writefile expects ')'\n"); exit(1);} 
+            if (!filename || !content) { mod_free(filename); mod_free(content); return 0; }
+            FILE *f = fopen(filename, "w");
+            int result = 0;
+            if (f) {
+                fputs(content, f);
+                fclose(f);
+                result = 1;
+            }
+            mod_free(filename); mod_free(content);
+            return result;
+        } else if (mod_strcmp(name, "appendfile") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after appendfile\n"); exit(1);} 
+            char *filename = evaluate_string_expr();
+            if (next_token()->type != TOKEN_COMMA) { printf("appendfile expects 2 arguments\n"); exit(1);} 
+            char *content = evaluate_string_expr();
+            if (next_token()->type != TOKEN_RPAREN) { printf("appendfile expects ')'\n"); exit(1);} 
+            if (!filename || !content) { mod_free(filename); mod_free(content); return 0; }
+            FILE *f = fopen(filename, "a");
+            int result = 0;
+            if (f) {
+                fputs(content, f);
+                fclose(f);
+                result = 1;
+            }
+            mod_free(filename); mod_free(content);
+            return result;
+        } else if (mod_strcmp(name, "exists") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after exists\n"); exit(1);} 
+            char *filename = evaluate_string_expr();
+            if (next_token()->type != TOKEN_RPAREN) { printf("exists expects one argument and ')'\n"); exit(1);} 
+            if (!filename) return 0;
+            FILE *f = fopen(filename, "r");
+            int result = (f != NULL) ? 1 : 0;
+            if (f) fclose(f);
+            mod_free(filename);
+            return result;
+        } else if (mod_strcmp(name, "block") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after block\n"); exit(1);} 
+            int size = expression();
+            if (next_token()->type != TOKEN_COMMA) { printf("block expects 2 arguments (size, element_size)\n"); exit(1);} 
+            int element_size = expression();
+            if (next_token()->type != TOKEN_RPAREN) { printf("block expects ')'\n"); exit(1);} 
+            // This needs to be used in assignment context, return total size
+            return size * element_size;  // Use both parameters
+        } else if (mod_strcmp(name, "array") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after array\n"); exit(1);} 
+            int capacity = expression();
+            if (next_token()->type != TOKEN_RPAREN) { printf("array expects one argument (capacity) and ')'\n"); exit(1);} 
+            // This needs to be used in assignment context, just return capacity for now
+            return capacity;
+        } else if (mod_strcmp(name, "bytes") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after bytes\n"); exit(1);} 
+            int capacity = expression();
+            if (next_token()->type != TOKEN_RPAREN) { printf("bytes expects one argument (capacity) and ')'\n"); exit(1);} 
+            // This needs to be used in assignment context, just return capacity for now
+            return capacity;
+        } else if (mod_strcmp(name, "reference") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after reference\n"); exit(1);} 
+            char *ref_name = evaluate_string_expr();
+            if (next_token()->type != TOKEN_RPAREN) { printf("reference expects one argument (variable name) and ')'\n"); exit(1);} 
+            if (!ref_name) return 0;
+            // This needs to be used in assignment context, just return 0 for now
+            mod_free(ref_name);
+            return 0;
+        } else if (mod_strcmp(name, "array_set") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after array_set\n"); exit(1);} 
+            // Get array variable name (not a string expression)
+            if (peek_token()->type != TOKEN_IDENT) { printf("array_set expects variable name as first argument\n"); exit(1);}
+            char *array_name = mod_strdup(next_token()->lexeme);
+            if (next_token()->type != TOKEN_COMMA) { printf("array_set expects 3 arguments (array, index, value)\n"); exit(1);} 
+            int index = expression();
+            if (next_token()->type != TOKEN_COMMA) { printf("array_set expects 3 arguments (array, index, value)\n"); exit(1);} 
+            int value = expression();
+            if (next_token()->type != TOKEN_RPAREN) { printf("array_set expects ')'\n"); exit(1);} 
+            if (array_name) {
+                set_array_element(array_name, index, value);
+                mod_free(array_name);
+            } else {
+                printf("array_set: invalid array name\n");
+            }
+            return 0;
+        } else if (mod_strcmp(name, "array_get") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after array_get\n"); exit(1);} 
+            // Get array variable name (not a string expression)
+            if (peek_token()->type != TOKEN_IDENT) { printf("array_get expects variable name as first argument\n"); exit(1);}
+            char *array_name = mod_strdup(next_token()->lexeme);
+            if (next_token()->type != TOKEN_COMMA) { printf("array_get expects 2 arguments (array, index)\n"); exit(1);} 
+            int index = expression();
+            if (next_token()->type != TOKEN_RPAREN) { printf("array_get expects ')'\n"); exit(1);} 
+            int result = 0;
+            if (array_name) {
+                result = get_array_element(array_name, index);
+                mod_free(array_name);
+            } else {
+                printf("array_get: invalid array name\n");
+            }
+            return result;
+        } else if (mod_strcmp(name, "create_buffer") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after create_buffer\n"); exit(1);} 
+            char *buffer_name = evaluate_string_expr();
+            if (next_token()->type != TOKEN_COMMA) { printf("create_buffer expects 2 arguments (name, size)\n"); exit(1);} 
+            int size = expression();
+            if (next_token()->type != TOKEN_RPAREN) { printf("create_buffer expects ')'\n"); exit(1);} 
+            if (buffer_name) {
+                create_buffer_variable(buffer_name, size);
+                mod_free(buffer_name);
+            } else {
+                printf("create_buffer: invalid buffer name\n");
+            }
+            return 0;
+        } else if (mod_strcmp(name, "update_buffer") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after update_buffer\n"); exit(1);} 
+            char *buffer_name = evaluate_string_expr();
+            if (next_token()->type != TOKEN_COMMA) { printf("update_buffer expects 2 arguments (name, content)\n"); exit(1);} 
+            char *content = evaluate_string_expr();
+            if (next_token()->type != TOKEN_RPAREN) { printf("update_buffer expects ')'\n"); exit(1);} 
+            if (buffer_name && content) {
+                update_buffer_variable(buffer_name, content);
+                mod_free(buffer_name);
+                mod_free(content);
+            } else {
+                printf("update_buffer: invalid arguments\n");
+            }
+            return 0;
+        } else if (mod_strcmp(name, "array") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after array\n"); exit(1);} 
+            int size = expression();
+            if (next_token()->type != TOKEN_RPAREN) { printf("array expects ')'\n"); exit(1);} 
+            // Return a dummy value - the actual array creation happens in assignment
+            return size;
+        } else if (mod_strcmp(name, "time") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after time\n"); exit(1);} 
+            if (next_token()->type != TOKEN_RPAREN) { printf("time expects no arguments and ')'\n"); exit(1);} 
+            return (int)time(NULL);
+        } else if (mod_strcmp(name, "power") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after power\n"); exit(1);} 
+            int base = expression();
+            if (next_token()->type != TOKEN_COMMA) { printf("power expects 2 arguments\n"); exit(1);} 
+            int exp = expression();
+            if (next_token()->type != TOKEN_RPAREN) { printf("power expects ')'\n"); exit(1);} 
+            int result = 1;
+            for (int i = 0; i < exp; i++) result *= base;
+            return result;
+        } else if (mod_strcmp(name, "sqrt") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after sqrt\n"); exit(1);} 
+            int n = expression();
+            if (next_token()->type != TOKEN_RPAREN) { printf("sqrt expects one argument and ')'\n"); exit(1);} 
+            if (n < 0) return 0;
+            int x = n;
+            int y = (x + 1) / 2;
+            while (y < x) { x = y; y = (x + n / x) / 2; }
+            return x;
+        } else if (mod_strcmp(name, "seed_random") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after seed_random\n"); exit(1);} 
+            int seed = expression();
+            if (next_token()->type != TOKEN_RPAREN) { printf("seed_random expects one argument and ')'\n"); exit(1);} 
+            srand((unsigned int)seed);
+            return 0;
+        } else if (mod_strcmp(name, "random") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after random\n"); exit(1);} 
+            int min = expression();
+            if (next_token()->type != TOKEN_COMMA) { printf("random expects 2 arguments\n"); exit(1);} 
+            int max = expression();
+            if (next_token()->type != TOKEN_RPAREN) { printf("random expects ')'\n"); exit(1);} 
+            if (max <= min) return min;
+            return min + (rand() % (max - min + 1));
+        } else if (mod_strcmp(name, "print_variable_info") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after print_variable_info\n"); exit(1);} 
+            char *var_name = evaluate_string_expr();
+            if (next_token()->type != TOKEN_RPAREN) { printf("print_variable_info expects one argument and ')'\n"); exit(1);} 
+            if (!var_name) return 0;
+            
+            // Call the existing print_variable_info function from variables module
+            print_variable_info(var_name);
+            
+            mod_free(var_name);
+            return 0; // Procedure, doesn't return a meaningful value
+        } else if (mod_strcmp(name, "file_exists") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after file_exists\n"); exit(1);} 
+            char *filename = evaluate_string_expr();
+            if (next_token()->type != TOKEN_RPAREN) { printf("file_exists expects one string argument and ')'\n"); exit(1);} 
+            
+            if (!filename) return 0;
+            
+            FILE* file = fopen(filename, "r");
+            int exists = (file != NULL);
+            if (file) fclose(file);
+            mod_free(filename);
+            return exists ? 1 : 0;
+        } else if (mod_strcmp(name, "write_file") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after write_file\n"); exit(1);} 
+            char *filename = evaluate_string_expr();
+            if (next_token()->type != TOKEN_COMMA) { printf("write_file expects filename and content arguments\n"); exit(1);} 
+            char *content = evaluate_string_expr();
+            if (next_token()->type != TOKEN_RPAREN) { printf("write_file expects ')'\n"); exit(1);} 
+            
+            if (!filename || !content) {
+                if (filename) mod_free(filename);
+                if (content) mod_free(content);
+                return 0; // Failed
+            }
+            
+            FILE* file = fopen(filename, "w");
+            if (!file) {
+                mod_free(filename);
+                mod_free(content);
+                return 0; // Failed to open file
+            }
+            
+            int success = (fputs(content, file) != EOF);
+            fclose(file);
+            mod_free(filename);
+            mod_free(content);
+            return success ? 1 : 0;
+        }
+        printf("Undefined function: %s\n", name);
+        exit(1);
+    }
+    
+    Function *func = &functions[func_index];
+    
+    next_token(); // Consume '('
+    
+    // Save current variables
+    Variable saved_vars[MAX_VARS];
+    int saved_var_count = var_count;
+    memcpy(saved_vars, variables, sizeof(variables));
+    
+    // Set up parameters - DON'T reset var_count, just add parameters to current scope
+    for (int i = 0; i < func->param_count; i++) {
+        int arg_value = expression();
+        set_variable_value(func->param_names[i], VAR_INT, &arg_value);
+        
+        if (i < func->param_count - 1) {
+            if (next_token()->type != TOKEN_COMMA) {
+                printf("Expected ',' between function arguments\n");
+                exit(1);
+            }
+        }
+    }
+    
+    if (next_token()->type != TOKEN_RPAREN) {
+        printf("Expected ')' after function arguments\n");
+        exit(1);
+    }
+    
+    // Execute function body
+    int saved_current_token = current_token;
+    bool saved_is_executing = is_executing_function;
+    bool saved_return_flag = function_return_flag;
+    int saved_return_value = function_return_value;
+
+    is_executing_function = true;
+    function_return_flag = false;
+    function_return_value = 0;
+
+    current_token = func->body_start;
+    while (current_token < func->body_end && !function_return_flag) {
+        statement();
+    }
+    int return_value = function_return_flag ? function_return_value : 0;
+
+    // Restore previous state
+    current_token = saved_current_token;
+    is_executing_function = saved_is_executing;
+    function_return_flag = saved_return_flag;
+    function_return_value = saved_return_value;
+    var_count = saved_var_count;
+    memcpy(variables, saved_vars, sizeof(variables));
+    
+    return return_value;
+}
+
+int exec_external(void) {
+    char command[MAX_COMMAND_LENGTH] = "";
+    char arg_buffer[MAX_ARG_LENGTH];
+    
+    next_token(); // Consume '('
+    
+    while (peek_token()->type != TOKEN_RPAREN) {
+        Token *arg = next_token();
+        if (arg->type == TOKEN_IDENT) {
+            VarType type;
+            void* value = get_variable_value(arg->lexeme, &type);
+            if (type == VAR_INT) {
+                snprintf(arg_buffer, MAX_ARG_LENGTH, "%d", *(int*)value);
+            } else if (type == VAR_FLOAT) {
+                snprintf(arg_buffer, MAX_ARG_LENGTH, "%g", *(float*)value);
+            } else if (type == VAR_BOOL) {
+                snprintf(arg_buffer, MAX_ARG_LENGTH, "%s", *(bool*)value ? "true" : "false");
+            } else if (type == VAR_TIME) {
+                snprintf(arg_buffer, MAX_ARG_LENGTH, "%u", (unsigned int)(*(time_t*)value));
+            } else if (type == VAR_STRING) {
+                snprintf(arg_buffer, MAX_ARG_LENGTH, "%s", (char*)value);
+            } else {
+                snprintf(arg_buffer, MAX_ARG_LENGTH, "(unprintable)");
+            }
+            strcat(command, arg_buffer);
+        } else if (arg->type == TOKEN_INT) {
+            snprintf(arg_buffer, MAX_ARG_LENGTH, "%d", arg->value);
+            strcat(command, arg_buffer);
+        } else if (arg->type == TOKEN_FLOAT) {
+            snprintf(arg_buffer, MAX_ARG_LENGTH, "%g", arg->float_value);
+            strcat(command, arg_buffer);
+        } else if (arg->type == TOKEN_STRING) {
+            strcat(command, arg->lexeme);
+        } else {
+            printf("Unexpected argument type in exec\n");
+            exit(1);
+        }
+        
+        if (peek_token()->type == TOKEN_COMMA) {
+            next_token(); // Consume comma
+            strcat(command, " ");
+        } else if (peek_token()->type != TOKEN_RPAREN) {
+            printf("Expected ',' or ')' in exec\n");
+            exit(1);
+        }
+    }
+    
+    next_token(); // Consume ')'
+    
+    int result = system(command);
+    last_exec_status = result;
+    return result;
+}
+
+void statement(void) {
+    Token *token = peek_token();
+    switch (token->type) {
+        case TOKEN_IDENT: {
+            char name[MAX_VAR_NAME];
+            mod_strcpy(name, next_token()->lexeme);
+            if (peek_token()->type == TOKEN_LPAREN) {
+                // Function call
+                function_call(name);
+            } else if (peek_token()->type == TOKEN_INCREMENT) {
+                // Post-increment: variable++
+                // Check if variable is a constant
+                int var_index = find_variable(name);
+                if (var_index != -1 && variables[var_index].is_const) {
+                    printf("Cannot modify constant variable '%s'\n", name);
+                    exit(1);
+                }
+                next_token(); // Consume '++'
+                VarType type;
+                void* value = get_variable_value(name, &type);
+                if (type == VAR_INT) {
+                    int new_value = (*(int*)value) + 1;
+                    set_variable_value(name, VAR_INT, &new_value);
+                } else if (type == VAR_FLOAT) {
+                    float new_value = (*(float*)value) + 1.0f;
+                    set_variable_value(name, VAR_FLOAT, &new_value);
+                } else {
+                    printf("Cannot increment non-numeric variable '%s'\n", name);
+                    exit(1);
+                }
+            } else if (peek_token()->type == TOKEN_DECREMENT) {
+                // Post-decrement: variable--
+                // Check if variable is a constant
+                int var_index = find_variable(name);
+                if (var_index != -1 && variables[var_index].is_const) {
+                    printf("Cannot modify constant variable '%s'\n", name);
+                    exit(1);
+                }
+                next_token(); // Consume '--'
+                VarType type;
+                void* value = get_variable_value(name, &type);
+                if (type == VAR_INT) {
+                    int new_value = (*(int*)value) - 1;
+                    set_variable_value(name, VAR_INT, &new_value);
+                } else if (type == VAR_FLOAT) {
+                    float new_value = (*(float*)value) - 1.0f;
+                    set_variable_value(name, VAR_FLOAT, &new_value);
+                } else {
+                    printf("Cannot decrement non-numeric variable '%s'\n", name);
+                    exit(1);
+                }
+            } else if (peek_token()->type == TOKEN_PLUS_ASSIGN) {
+                // Compound assignment: variable += expression
+                // Check if variable is a constant
+                int var_index = find_variable(name);
+                if (var_index != -1 && variables[var_index].is_const) {
+                    printf("Cannot modify constant variable '%s'\n", name);
+                    exit(1);
+                }
+                next_token(); // Consume '+='
+                VarType type;
+                void* current_value = get_variable_value(name, &type);
+                if (type == VAR_INT) {
+                    int expr_value = expression();
+                    int new_value = (*(int*)current_value) + expr_value;
+                    set_variable_value(name, VAR_INT, &new_value);
+                } else if (type == VAR_FLOAT) {
+                    float expr_value = float_expression();
+                    float new_value = (*(float*)current_value) + expr_value;
+                    set_variable_value(name, VAR_FLOAT, &new_value);
+                } else if (type == VAR_STRING) {
+                    // String concatenation
+                    char *expr_value = evaluate_string_expr();
+                    // Check for errors after string evaluation
+                    if (is_in_try_block && error_occurred) {
+                        if (expr_value) mod_free(expr_value);
+                        return; // Exit statement on error
+                    }
+                    char *current_str = (char*)current_value;
+                    char *new_str = mod_malloc(mod_strlen(current_str) + mod_strlen(expr_value) + 1);
+                    mod_strcpy(new_str, current_str);
+                    mod_strcpy(new_str + mod_strlen(current_str), expr_value);
+                    set_variable_value(name, VAR_STRING, new_str);
+                    mod_free(new_str);
+                    mod_free(expr_value);
+                } else {
+                    printf("Cannot perform += on variable '%s' of this type\n", name);
+                    exit(1);
+                }
+            } else if (peek_token()->type == TOKEN_MINUS_ASSIGN) {
+                // Compound assignment: variable -= expression
+                // Check if variable is a constant
+                int var_index = find_variable(name);
+                if (var_index != -1 && variables[var_index].is_const) {
+                    printf("Cannot modify constant variable '%s'\n", name);
+                    exit(1);
+                }
+                next_token(); // Consume '-='
+                VarType type;
+                void* current_value = get_variable_value(name, &type);
+                if (type == VAR_INT) {
+                    int expr_value = expression();
+                    int new_value = (*(int*)current_value) - expr_value;
+                    set_variable_value(name, VAR_INT, &new_value);
+                } else if (type == VAR_FLOAT) {
+                    float expr_value = float_expression();
+                    float new_value = (*(float*)current_value) - expr_value;
+                    set_variable_value(name, VAR_FLOAT, &new_value);
+                } else {
+                    printf("Cannot perform -= on variable '%s' of this type\n", name);
+                    exit(1);
+                }
+            } else if (peek_token()->type == TOKEN_MULTIPLY_ASSIGN) {
+                // Compound assignment: variable *= expression
+                // Check if variable is a constant
+                int var_index = find_variable(name);
+                if (var_index != -1 && variables[var_index].is_const) {
+                    printf("Cannot modify constant variable '%s'\n", name);
+                    exit(1);
+                }
+                next_token(); // Consume '*='
+                VarType type;
+                void* current_value = get_variable_value(name, &type);
+                if (type == VAR_INT) {
+                    int expr_value = expression();
+                    int new_value = (*(int*)current_value) * expr_value;
+                    set_variable_value(name, VAR_INT, &new_value);
+                } else if (type == VAR_FLOAT) {
+                    float expr_value = float_expression();
+                    float new_value = (*(float*)current_value) * expr_value;
+                    set_variable_value(name, VAR_FLOAT, &new_value);
+                } else {
+                    printf("Cannot perform *= on variable '%s' of this type\n", name);
+                    exit(1);
+                }
+            } else if (peek_token()->type == TOKEN_DIVIDE_ASSIGN) {
+                // Compound assignment: variable /= expression
+                // Check if variable is a constant
+                int var_index = find_variable(name);
+                if (var_index != -1 && variables[var_index].is_const) {
+                    printf("Cannot modify constant variable '%s'\n", name);
+                    exit(1);
+                }
+                next_token(); // Consume '/='
+                VarType type;
+                void* current_value = get_variable_value(name, &type);
+                if (type == VAR_INT) {
+                    int expr_value = expression();
+                    if (expr_value == 0) {
+                        printf("Division by zero in /= operation\n");
+                        exit(1);
+                    }
+                    int new_value = (*(int*)current_value) / expr_value;
+                    set_variable_value(name, VAR_INT, &new_value);
+                } else if (type == VAR_FLOAT) {
+                    float expr_value = float_expression();
+                    if (expr_value == 0.0f) {
+                        printf("Division by zero in /= operation\n");
+                        exit(1);
+                    }
+                    float new_value = (*(float*)current_value) / expr_value;
+                    set_variable_value(name, VAR_FLOAT, &new_value);
+                } else {
+                    printf("Cannot perform /= on variable '%s' of this type\n", name);
+                    exit(1);
+                }
+            } else if (peek_token()->type == TOKEN_ASSIGN) {
+                // Variable assignment
+                // Check if variable is a constant
+                int var_index = find_variable(name);
+                if (var_index != -1 && variables[var_index].is_const) {
+                    printf("Cannot modify constant variable '%s'\n", name);
+                    exit(1);
+                }
+                next_token(); // Consume '='
+                Token *value_token = peek_token();
+                if (value_token->type == TOKEN_LBRACKET) {
+                    // Array literal assignment: var = [1, 2, 3]
+                    next_token(); // Consume '['
+                    
+                    // Count elements first
+                    int element_count = 0;
+                    int saved_token = current_token;
+                    
+                    while (peek_token()->type != TOKEN_RBRACKET && peek_token()->type != TOKEN_EOF) {
+                        expression(); // Parse but don't use the value
+                        element_count++;
+                        if (peek_token()->type == TOKEN_COMMA) {
+                            next_token(); // Consume comma
+                        } else if (peek_token()->type != TOKEN_RBRACKET) {
+                            printf("Expected ',' or ']' in array literal\n");
+                            exit(1);
+                        }
+                    }
+                    
+                    // Reset to parse again and store values
+                    current_token = saved_token;
+                    
+                    // Create the array variable
+                    create_array_variable(name, element_count);
+                    
+                    // Parse and store elements
+                    int index = 0;
+                    while (peek_token()->type != TOKEN_RBRACKET && peek_token()->type != TOKEN_EOF) {
+                        int value = expression();
+                        set_array_element(name, index, value);
+                        index++;
+                        
+                        if (peek_token()->type == TOKEN_COMMA) {
+                            next_token(); // Consume comma
+                        } else if (peek_token()->type != TOKEN_RBRACKET) {
+                            printf("Expected ',' or ']' in array literal\n");
+                            exit(1);
+                        }
+                    }
+                    
+                    if (peek_token()->type != TOKEN_RBRACKET) {
+                        printf("Expected ']' to close array literal\n");
+                        exit(1);
+                    }
+                    next_token(); // Consume ']'
+                } else if (value_token->type == TOKEN_STRING && 
+                    peek_ahead(1)->type != TOKEN_PLUS) {
+                    // Simple string literal assignment
+                    Token *string_token = next_token();
+                    set_variable_value(name, VAR_STRING, string_token->lexeme);
+                } else if (value_token->type == TOKEN_STRING ||
+                           (value_token->type == TOKEN_IDENT && find_variable(value_token->lexeme) != -1 && 
+                            variables[find_variable(value_token->lexeme)].type == VAR_STRING) ||
+                           (value_token->type == TOKEN_IDENT && 
+                            (mod_strcmp(value_token->lexeme, "upper") == 0 ||
+                             mod_strcmp(value_token->lexeme, "lower") == 0 ||
+                             mod_strcmp(value_token->lexeme, "trim") == 0 ||
+                             mod_strcmp(value_token->lexeme, "substr") == 0 ||
+                             mod_strcmp(value_token->lexeme, "replace") == 0 ||
+                             mod_strcmp(value_token->lexeme, "format") == 0 ||
+                             mod_strcmp(value_token->lexeme, "read_file") == 0))) {
+                    // String expression (concatenation, variable reference, or string function)
+                    char *str_value = evaluate_string_expr();
+                    // Check for errors after string evaluation
+                    if (is_in_try_block && error_occurred) {
+                        if (str_value) mod_free(str_value);
+                        return; // Exit statement on error
+                    }
+                    if (str_value) {
+                        set_variable_value(name, VAR_STRING, str_value);
+                        mod_free(str_value); // Free the temporary result
+                    }
+                } else if (value_token->type == TOKEN_FLOAT) {
+                    // Check if this is a simple float literal or a float expression
+                    Token *next = peek_ahead(1);
+                    if (next && (next->type == TOKEN_PLUS || next->type == TOKEN_MINUS || 
+                                next->type == TOKEN_MULTIPLY || next->type == TOKEN_DIVIDE)) {
+                        // This is a float expression, use float_expression()
+                        float value = float_expression();
+                        set_variable_value(name, VAR_FLOAT, &value);
+                    } else {
+                        // Simple float literal assignment
+                        Token *float_token = next_token();
+                        set_variable_value(name, VAR_FLOAT, &float_token->float_value);
+                    }
+                } else if (value_token->type == TOKEN_TRUE) {
+                    next_token();
+                    int v = 1;
+                    set_variable_value(name, VAR_BOOL, &v);
+                } else if (value_token->type == TOKEN_FALSE) {
+                    next_token();
+                    int v = 0;
+                    set_variable_value(name, VAR_BOOL, &v);
+                } else {
+                    // Check if this is an array() function call
+                    if (value_token->type == TOKEN_IDENT && mod_strcmp(value_token->lexeme, "array") == 0) {
+                        next_token(); // Consume 'array'
+                        if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after array\n"); exit(1);}
+                        int size = expression();
+                        if (next_token()->type != TOKEN_RPAREN) { printf("array expects ')'\n"); exit(1);}
+                        create_array_variable(name, size);
+                    } else if (value_token->type == TOKEN_IDENT && mod_strcmp(value_token->lexeme, "swi") == 0) {
+                        // SWI assignment - create array with register values
+                        next_token(); // Consume 'swi'
+                        if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after swi\n"); exit(1);}
+                        
+                        // Parse SWI name using the same logic as swi_builtin
+                        Token *swi_name_tok = next_token();
+                        char swi_name[64];
+                        if (swi_name_tok->type == TOKEN_STRING) {
+                            strncpy(swi_name, swi_name_tok->lexeme, sizeof(swi_name));
+                            swi_name[sizeof(swi_name)-1] = 0;
+                        } else {
+                            printf("SWI name must be a string\n");
+                            exit(1);
+                        }
+                        
+                        // Parse parameters into register array; collect out-strings for string variables
+                        int input_regs[10] = {0};
+                        int param_count = 0;
+                        char *string_params[10] = {0}; // for string literals only
+                        SwiOutString outs[10];
+                        int outs_count = 0;
+                        
+                        while (peek_token()->type == TOKEN_COMMA && param_count < 10) {
+                            next_token(); // skip comma
+                            Token *arg_tok = next_token();
+                            
+                            if (arg_tok->type == TOKEN_INT) {
+                                input_regs[param_count] = arg_tok->value;
+                            } else if (arg_tok->type == TOKEN_FLOAT) {
+                                input_regs[param_count] = (int)(arg_tok->float_value);
+                            } else if (arg_tok->type == TOKEN_STRING) {
+                                string_params[param_count] = mod_strdup(arg_tok->lexeme);
+                                input_regs[param_count] = (int)(uintptr_t)string_params[param_count];
+                            } else if (arg_tok->type == TOKEN_IDENT) {
+                                VarType t; void *val = get_variable_value(arg_tok->lexeme, &t);
+                                if (!val) { print_error_context("Undefined variable in swi param"); exit(1); }
+                                if (t == VAR_INT) input_regs[param_count] = *(int*)val;
+                                else if (t == VAR_FLOAT) input_regs[param_count] = (int)(*(float*)val);
+                                else if (t == VAR_BOOL) input_regs[param_count] = *(int*)val ? 1 : 0;
+                                else if (t == VAR_TIME) input_regs[param_count] = (int)(*(unsigned int*)val);
+                                else if (t == VAR_STRING) {
+                                    // Automatic out-string buffer in Rn, write back to this variable
+                                    outs[outs_count].reg_index = param_count;
+                                    outs[outs_count].var_name = arg_tok->lexeme;
+                                    outs[outs_count].initial = (const char*)val;
+                                    outs[outs_count].capacity = 1024; // default capacity
+                                    outs_count++;
+                                    input_regs[param_count] = 0; // will be replaced by swi layer
+                                } else {
+                                    input_regs[param_count] = (int)(uintptr_t)val;
+                                }
+                            }
+                            param_count++;
+                        }
+                        if (next_token()->type != TOKEN_RPAREN) { printf("swi expects ')'\n"); exit(1);} 
+                        
+                        // Centralized call with out-string descriptors (if any)
+                        int success = swi_execute_with_out_strings(swi_name, input_regs, param_count, outs, outs_count);
+                        
+                        for (int i = 0; i < param_count; i++) if (string_params[i]) mod_free(string_params[i]);
+                        
+                        create_array_variable(name, 10);
+                        if (success) {
+                            int reg_results[10];
+                            get_last_swi_registers(reg_results);
+                            for (int i = 0; i < 10; i++) set_array_element(name, i, reg_results[i]);
+                        } else {
+                            for (int i = 0; i < 10; i++) set_array_element(name, i, 0);
+                        }
+                    } else {
+                        // Check if this might be a boolean expression by looking for boolean variables or operators
+                        bool might_be_boolean = false;
+                        bool might_be_float = false;
+                        
+                        if (value_token->type == TOKEN_IDENT) {
+                            int var_idx = find_variable(value_token->lexeme);
+                            if (var_idx != -1) {
+                                if (variables[var_idx].type == VAR_BOOL) {
+                                    might_be_boolean = true;
+                                } else if (variables[var_idx].type == VAR_FLOAT) {
+                                    might_be_float = true;
+                                }
+                            }
+                        }
+                        
+                        // Check for float literal
+                        if (value_token->type == TOKEN_FLOAT) {
+                            might_be_float = true;
+                        }
+                        
+                        // Check for boolean operators
+                        if (value_token->type == TOKEN_NOT) {
+                            might_be_boolean = true;
+                        }
+                        
+                        // Look ahead for boolean operators or float variables in the expression
+                        int lookahead = 1;
+                        Token *ahead_token;
+                        while ((ahead_token = peek_ahead(lookahead)) != NULL && 
+                               ahead_token->type != TOKEN_SEMICOLON && 
+                               ahead_token->type != TOKEN_EOF) {
+                            if (ahead_token->type == TOKEN_AND || 
+                                ahead_token->type == TOKEN_OR || 
+                                ahead_token->type == TOKEN_NOT) {
+                                might_be_boolean = true;
+                                break;
+                            }
+                            if (ahead_token->type == TOKEN_FLOAT) {
+                                might_be_float = true;
+                            }
+                            if (ahead_token->type == TOKEN_IDENT) {
+                                int var_idx = find_variable(ahead_token->lexeme);
+                                if (var_idx != -1 && variables[var_idx].type == VAR_FLOAT) {
+                                    might_be_float = true;
+                                }
+                            }
+                            lookahead++;
+                            if (lookahead > 10) break; // Don't look too far ahead
+                        }
+                        
+                        if (might_be_float && !might_be_boolean) {
+                            // Use floating-point expression parsing
+                            float value = float_expression();
+                            set_variable_value(name, VAR_FLOAT, &value);
+                        } else if (might_be_boolean) {
+                            // Use integer expression parsing for boolean
+                            int value = expression();
+                            set_variable_value(name, VAR_BOOL, &value);
+                        } else {
+                            // Use integer expression parsing
+                            int value = expression();
+                            set_variable_value(name, VAR_INT, &value);
+                        }
+                    }
+                }
+            } else {
+                // Variable reference (for printing or other operations)
+                VarType type;
+                void* value = get_variable_value(name, &type);
+                if (!value) {
+                    // Error already set by get_variable_value, just return
+                    return;
+                }
+                if (type == VAR_INT) {
+                    printf("%d\n", *(int*)value);
+                } else if (type == VAR_FLOAT) {
+                    printf("%g\n", *(float*)value);
+                } else if (type == VAR_BOOL) {
+                    printf("%s\n", *(int*)value ? "true" : "false");
+                } else if (type == VAR_TIME) {
+                    printf("%u\n", *(unsigned int*)value);
+                } else if (type == VAR_STRING) {
+                    printf("%s\n", (char*)value);
+                } else {
+                    printf("(unprintable type)\n");
+                }
+            }
+            break;
+        }
+        case TOKEN_PRINT: {
+            next_token(); // Consume 'print'
+            // Prefer numeric expressions unless clearly string-first
+            TokenType t = peek_token()->type;
+            bool is_stringy = (t == TOKEN_STRING) || (t == TOKEN_EXEC);
+            if (!is_stringy && t == TOKEN_IDENT) {
+                // If known string var or builtin upper/lower/len call, treat as string expr
+                char identName[MAX_VAR_NAME];
+                strcpy(identName, peek_token()->lexeme);
+                int idx = find_variable(identName);
+                if (idx != -1 && variables[idx].type == VAR_STRING) {
+                    is_stringy = true;
+                } else if (idx == -1 && (
+                    mod_strcmp(identName, "upper") == 0 ||
+                    mod_strcmp(identName, "lower") == 0 ||
+                    mod_strcmp(identName, "len") == 0   ||
+                    mod_strcmp(identName, "substr") == 0 ||
+                    mod_strcmp(identName, "find") == 0   ||
+                    mod_strcmp(identName, "replace") == 0||
+                    mod_strcmp(identName, "trim") == 0 ||
+                    mod_strcmp(identName, "format") == 0 ||
+                    mod_strcmp(identName, "read_file") == 0)) {
+                    is_stringy = true;
+                }
+            }
+            if (is_stringy) {
+                char *s = evaluate_string_expr();
+                // Check for errors after string evaluation
+                if (is_in_try_block && error_occurred) {
+                    if (s) mod_free(s);
+                    return; // Exit statement on error
+                }
+                printf("%s\n", s ? s : "");
+                if (s) mod_free(s);
+            } else {
+                printf("%d\n", expression());
+            }
+            break; }
+        case TOKEN_IF:
+            if_statement();
+            break;
+        case TOKEN_WHILE:
+            while_statement();
+            break;
+        case TOKEN_FOR:
+            for_statement();
+            break;
+        case TOKEN_SWITCH:
+            switch_statement();
+            break;
+        case TOKEN_TRY:
+            try_statement();
+            break;
+        case TOKEN_BREAK:
+            next_token();
+            if (loop_depth <= 0) { printf("'break' used outside of loop\n"); exit(1);} 
+            loop_break_flag = true;
+            break;
+        case TOKEN_CONTINUE:
+            next_token();
+            if (loop_depth <= 0) { printf("'continue' used outside of loop\n"); exit(1);} 
+            loop_continue_flag = true;
+            break;
+        case TOKEN_FUNCTION:
+            function_declaration();
+            break;
+        case TOKEN_END:
+            // Tolerate stray 'end' at top level (e.g., if encountered due to skipped blocks)
+            next_token();
+            break;
+        case TOKEN_RETURN:
+            if (!is_executing_function) {
+                printf("Unexpected return statement outside of function\n");
+                exit(1);
+            }
+            next_token(); // Consume 'return'
+            function_return_value = expression();
+            function_return_flag = true;
+            break;
+        case TOKEN_INCLUDE:
+            next_token(); // Consume INCLUDE token
+            // Actual inclusion is handled by tokenize_with_includes
+            break;
+        case TOKEN_EXEC: {
+            next_token(); // Consume 'exec'
+            char *out = exec_capture_string();
+            if (out) mod_free(out); // discard in statement context
+            break; }
+        case TOKEN_CONST: {
+            next_token(); // Consume 'const'
+            
+            if (peek_token()->type != TOKEN_IDENT) {
+                printf("Expected variable name after 'const'\n");
+                exit(1);
+            }
+            
+            char name[MAX_VAR_NAME];
+            mod_strcpy(name, next_token()->lexeme);
+            
+            if (peek_token()->type != TOKEN_ASSIGN) {
+                printf("Constants must be initialized with a value\n");
+                exit(1);
+            }
+            next_token(); // Consume '='
+            
+            // Check if variable already exists
+            int existing_index = find_variable(name);
+            if (existing_index != -1) {
+                printf("Variable '%s' already exists, cannot redeclare as constant\n", name);
+                exit(1);
+            }
+            
+            Token *value_token = peek_token();
+            if (value_token->type == TOKEN_STRING && 
+                peek_ahead(1)->type != TOKEN_PLUS) {
+                // Simple string literal assignment
+                Token *string_token = next_token();
+                set_variable_value(name, VAR_STRING, string_token->lexeme);
+                // Mark as constant
+                int var_index = find_variable(name);
+                if (var_index != -1) {
+                    variables[var_index].is_const = true;
+                }
+            } else if (value_token->type == TOKEN_STRING ||
+                       (value_token->type == TOKEN_IDENT && find_variable(value_token->lexeme) != -1 && 
+                        variables[find_variable(value_token->lexeme)].type == VAR_STRING) ||
+                       (value_token->type == TOKEN_IDENT && 
+                        (mod_strcmp(value_token->lexeme, "upper") == 0 ||
+                         mod_strcmp(value_token->lexeme, "lower") == 0 ||
+                         mod_strcmp(value_token->lexeme, "trim") == 0 ||
+                         mod_strcmp(value_token->lexeme, "substr") == 0 ||
+                         mod_strcmp(value_token->lexeme, "replace") == 0 ||
+                         mod_strcmp(value_token->lexeme, "format") == 0 ||
+                         mod_strcmp(value_token->lexeme, "read_file") == 0))) {
+                // String expression (concatenation, variable reference, or string function)
+                char *str_value = evaluate_string_expr();
+                // Check for errors after string evaluation
+                if (is_in_try_block && error_occurred) {
+                    if (str_value) mod_free(str_value);
+                    return; // Exit statement on error
+                }
+                if (str_value) {
+                    set_variable_value(name, VAR_STRING, str_value);
+                    // Mark as constant
+                    int var_index = find_variable(name);
+                    if (var_index != -1) {
+                        variables[var_index].is_const = true;
+                    }
+                    mod_free(str_value); // Free the temporary result
+                }
+            } else {
+                // Numeric expression
+                int value = expression();
+                set_variable_value(name, VAR_INT, &value);
+                // Mark as constant
+                int var_index = find_variable(name);
+                if (var_index != -1) {
+                    variables[var_index].is_const = true;
+                }
+            }
+            break; }
+        default:
+            print_error_context("Unexpected token in statement");
+            exit(1);
+    }
+    if (peek_token()->type == TOKEN_SEMICOLON) {
+        next_token(); // Consume optional semicolon
+    }
+}
+
+ProcessedSource process_includes(const char* source) {
+    char* result = mod_malloc(strlen(source) + 1);  // Start with enough space for the original source
+    strcpy(result, source);
+    bool has_includes = false;
+
+    // Make a copy for strtok since source is const
+    char* source_copy = mod_malloc(strlen(source) + 1);
+    strcpy(source_copy, source);
+    
+    char* line = strtok(source_copy, "\n");
+    while (line != NULL) {
+        if (mod_strncmp(line, "#include", 8) == 0) {
+            has_includes = true;
+        }
+        line = strtok(NULL, "\n");
+    }
+    
+    mod_free(source_copy);
+    return (ProcessedSource){result, has_includes};
+}
+
+void switch_statement(void) {
+    next_token(); // Consume 'switch'
+    int switch_value = expression();
+    
+    if (next_token()->type != TOKEN_DO) {
+        set_error("Expected 'do' after switch expression");
+        return;
+    }
+    
+    bool case_matched = false;
+    bool executing = false;
+    int nesting = 1;
+    
+    while (nesting > 0 && peek_token()->type != TOKEN_EOF) {
+        Token *token = peek_token();
+        
+        if (token->type == TOKEN_CASE) {
+            next_token(); // Consume 'case'
+            int case_value = expression();
+            
+            if (peek_token()->type == TOKEN_SEMICOLON) {
+                next_token(); // Consume ':' (using semicolon for now)
+            }
+            
+            if (!case_matched && case_value == switch_value) {
+                case_matched = true;
+                executing = true;
+            } else if (!case_matched) {
+                executing = false;
+            }
+            // Continue executing if already matched (fall-through behavior)
+            
+        } else if (token->type == TOKEN_DEFAULT) {
+            next_token(); // Consume 'default'
+            if (peek_token()->type == TOKEN_SEMICOLON) {
+                next_token(); // Consume ':' (using semicolon for now)
+            }
+            
+            if (!case_matched) {
+                executing = true;
+            }
+            
+        } else if (token->type == TOKEN_BREAK) {
+            if (executing) {
+                next_token(); // Consume 'break'
+                break; // Exit the switch
+            } else {
+                next_token(); // Skip break in non-executing case
+            }
+            
+        } else if (token->type == TOKEN_END) {
+            nesting--;
+            next_token(); // Consume 'end'
+            
+        } else if (token->type == TOKEN_SWITCH) {
+            // Nested switch
+            nesting++;
+            if (executing) {
+                switch_statement();
+            } else {
+                next_token(); // Skip nested switch
+            }
+            
+        } else {
+            if (executing) {
+                statement();
+                if (function_return_flag || loop_break_flag || loop_continue_flag) {
+                    return; // Propagate control flow
+                }
+            } else {
+                next_token(); // Skip statement
+            }
+        }
+    }
+    
+    if (nesting > 0) {
+        set_error("Expected 'end' after switch block");
+        return;
+    }
+}
+
+void try_statement(void) {
+    next_token(); // Consume 'try'
+    
+    // Save previous error state
+    bool prev_in_try = is_in_try_block;
+    bool prev_error = error_occurred;
+    char prev_message[256];
+    mod_strcpy(prev_message, error_message);
+    
+    // Set up try block state
+    is_in_try_block = true;
+    error_occurred = false;
+    error_message[0] = '\0';
+    
+    // Execute try block
+    int nesting = 1;
+    while (nesting > 0 && peek_token()->type != TOKEN_EOF && !error_occurred) {
+        Token *token = peek_token();
+        
+        if (token->type == TOKEN_CATCH) {
+            nesting--;
+            break; // Exit try block to handle catch
+        } else if (token->type == TOKEN_END) {
+            nesting--;
+            if (nesting == 0) {
+                next_token(); // Consume 'end'
+                break;
+            }
+        } else if (token->type == TOKEN_TRY) {
+            // Nested try
+            nesting++;
+            try_statement();
+        } else {
+            statement();
+            if (function_return_flag || loop_break_flag || loop_continue_flag) {
+                break; // Propagate control flow
+            }
+            // Check for errors after each statement in try block
+            if (error_occurred) {
+                break; // Exit try block on error
+            }
+        }
+    }
+    
+    // Handle catch block
+    if (peek_token()->type == TOKEN_CATCH) {
+        next_token(); // Consume 'catch'
+        
+        if (error_occurred) {
+            // Optional error message variable
+            if (peek_token()->type == TOKEN_IDENT) {
+                char error_var_name[MAX_VAR_NAME];
+                mod_strcpy(error_var_name, next_token()->lexeme);
+                set_variable_value(error_var_name, VAR_STRING, error_message);
+            }
+            
+            // Execute catch block
+            nesting = 1;
+            while (nesting > 0 && peek_token()->type != TOKEN_EOF) {
+                Token *token = peek_token();
+                
+                if (token->type == TOKEN_END) {
+                    nesting--;
+                    next_token(); // Consume 'end'
+                    if (nesting == 0) {
+                        break;
+                    }
+                } else if (token->type == TOKEN_TRY) {
+                    // Nested try
+                    nesting++;
+                    try_statement();
+                } else {
+                    statement();
+                    if (function_return_flag || loop_break_flag || loop_continue_flag) {
+                        break; // Propagate control flow
+                    }
+                }
+            }
+        } else {
+            // Skip catch block if no error occurred
+            if (peek_token()->type == TOKEN_IDENT) {
+                next_token(); // Skip error variable name
+            }
+            
+            nesting = 1;
+            while (nesting > 0 && peek_token()->type != TOKEN_EOF) {
+                Token *token = peek_token();
+                
+                if (token->type == TOKEN_END) {
+                    nesting--;
+                    next_token(); // Consume 'end'
+                    if (nesting == 0) {
+                        break;
+                    }
+                } else if (token->type == TOKEN_TRY) {
+                    // Nested try
+                    nesting++;
+                    next_token(); // Skip nested try
+                } else {
+                    next_token(); // Skip statement
+                }
+            }
+        }
+    } else if (peek_token()->type == TOKEN_END) {
+        next_token(); // Consume 'end' if no catch block
+    }
+    
+    // Restore previous error state
+    is_in_try_block = prev_in_try;
+    error_occurred = prev_error;
+    mod_strcpy(error_message, prev_message);
+}
+
+void interpret(void) {
+    current_token = 0;
+    while (peek_token()->type != TOKEN_EOF) {
+        statement();
+    }
+}
+
+// ----- Exec with quoting and output capture -----
+static void append_quoted(char *dst, size_t dst_size, const char *arg) {
+    // Always quote arguments for RISC OS shell consistency
+    safe_strcat(dst, dst_size, "\"");
+    for (size_t i = 0; arg[i] != '\0'; i++) {
+        char tmp[2]; tmp[1] = '\0';
+        if (arg[i] == '"') { safe_strcat(dst, dst_size, "\\\""); }
+        else { tmp[0] = arg[i]; safe_strcat(dst, dst_size, tmp); }
+    }
+    safe_strcat(dst, dst_size, "\"");
+}
+
+static char *read_entire_file(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return duplicate_cstring("");
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz < 0) { fclose(f); return duplicate_cstring(""); }
+    char *buf = (char*)mod_malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); return duplicate_cstring(""); }
+    size_t rd = fread(buf, 1, (size_t)sz, f);
+    buf[rd] = '\0';
+    fclose(f);
+    return buf;
+}
+
+static char *token_to_string(Token *arg) {
+    if (arg->type == TOKEN_STRING) {
+        return duplicate_cstring(arg->lexeme);
+    } else if (arg->type == TOKEN_INT) {
+        return int_to_string(arg->value);
+    } else if (arg->type == TOKEN_FLOAT) {
+        char *result = mod_malloc(32);
+        sprintf(result, "%g", arg->float_value);
+        return result;
+    } else if (arg->type == TOKEN_IDENT) {
+        VarType type; void *value = get_variable_value(arg->lexeme, &type);
+        if (type == VAR_INT) {
+            return int_to_string(*(int*)value);
+        } else if (type == VAR_FLOAT) {
+            char *result = mod_malloc(32);
+            sprintf(result, "%g", *(float*)value);
+            return result;
+        } else if (type == VAR_BOOL) {
+            return duplicate_cstring(*(bool*)value ? "true" : "false");
+        } else if (type == VAR_TIME) {
+            char *result = mod_malloc(32);
+            sprintf(result, "%u", (unsigned int)(*(time_t*)value));
+            return result;
+        } else if (type == VAR_STRING) {
+            return duplicate_cstring((char*)value);
+        } else {
+            return duplicate_cstring(""); // Return empty string for file handles, etc.
+        }
+    } else {
+        printf("Unexpected argument type in exec\n");
+        exit(1);
+    }
+}
+
+static void build_exec_command_from_tokens(char *command, size_t command_size) {
+    // Build: <cmd> "joined args"  (single quoted payload)
+    command[0] = '\0';
+    next_token(); // Consume '('
+
+    if (peek_token()->type == TOKEN_RPAREN) { printf("exec requires at least a command name\n"); exit(1);} 
+    Token *cmdtok = next_token();
+    char *cmdname = token_to_string(cmdtok);
+    // On RISC OS, star commands require a leading '*'
+    if (cmdname[0] != '*') {
+        safe_strcat(command, command_size, "*");
+    }
+    safe_strcat(command, command_size, cmdname);
+
+    // Collect remaining args as a single payload string
+    char payload[MAX_COMMAND_LENGTH] = "";
+    bool have_payload = false;
+    while (peek_token()->type == TOKEN_COMMA) {
+        next_token(); // comma
+        Token *arg = next_token();
+        char *val = token_to_string(arg);
+        if (have_payload) safe_strcat(payload, sizeof(payload), " ");
+        safe_strcat(payload, sizeof(payload), val);
+        mod_free(val);
+        have_payload = true;
+    }
+    if (peek_token()->type != TOKEN_RPAREN) { printf("Expected ')' in exec\n"); exit(1);} 
+    next_token(); // Consume ')'
+
+    if (have_payload) {
+        safe_strcat(command, command_size, " ");
+        append_quoted(command, command_size, payload);
+    }
+    mod_free(cmdname);
+}
+
+static char *exec_capture_string(void) {
+    char command[MAX_COMMAND_LENGTH] = "";
+    build_exec_command_from_tokens(command, sizeof(command));
+
+    // Build RISC OS style output path: <OakScrpt$Dir>.Logs.XXXX (XXXX up to 6 chars)
+    char randpart[7];
+    const char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    size_t alpha_len = sizeof(alphabet) - 1;
+    unsigned int seed = (unsigned int)time(NULL) ^ (unsigned int)clock();
+    for (int i = 0; i < 6; i++) {
+        seed = seed * 1103515245u + 12345u;
+        randpart[i] = alphabet[(seed >> 16) % alpha_len];
+    }
+    randpart[6] = '\0';
+
+    // Paths for: (1) command line (use <OakScrpt$Dir> form), (2) C file I/O (resolve env)
+    const char *arse_dir = getenv("OakScrpt$Dir");
+    char cmd_outfile[256];          // <OakScrpt$Dir>.Logs.XXXX or Logs.XXXX
+    char fs_outfile[640];           // resolved path for fopen/remove
+    char createdir_cmd[512];
+    if (arse_dir && arse_dir[0] != '\0') {
+        snprintf(cmd_outfile, sizeof(cmd_outfile), "<OakScrpt$Dir>.Logs.%s", randpart);
+        snprintf(fs_outfile, sizeof(fs_outfile), "%s.Logs.%s", arse_dir, randpart);
+        snprintf(createdir_cmd, sizeof(createdir_cmd), "*CreateDir <OakScrpt$Dir>.Logs");
+    } else {
+        snprintf(cmd_outfile, sizeof(cmd_outfile), "Logs.%s", randpart);
+        snprintf(fs_outfile, sizeof(fs_outfile), "Logs.%s", randpart);
+        snprintf(createdir_cmd, sizeof(createdir_cmd), "*CreateDir Logs");
+    }
+
+    // Ensure Logs directory exists (RISC OS star command); ignore failures on non-RISC OS
+    (void)system(createdir_cmd);
+
+    // Build full system command with RISC OS redirection block: { > outfile }
+    char fullcmd[MAX_COMMAND_LENGTH + 768];
+    fullcmd[0] = '\0';
+    safe_strcat(fullcmd, sizeof(fullcmd), command);
+    safe_strcat(fullcmd, sizeof(fullcmd), " { > ");
+    safe_strcat(fullcmd, sizeof(fullcmd), cmd_outfile);
+    safe_strcat(fullcmd, sizeof(fullcmd), " }");
+
+    last_exec_status = system(fullcmd);
+    char *out = read_entire_file(fs_outfile);
+    // Keep the output file for inspection; caller may clean up later
+    return out;
+}
+
+// ----- String expression parser: supports +, vars, ints, functions (len/upper/lower), exec(...) -----
+static char *int_to_string(int v) {
+    char buf[64]; snprintf(buf, sizeof(buf), "%d", v); return duplicate_cstring(buf);
+}
+
+static char *evaluate_string_element(void) {
+    Token *t = peek_token();
+    if (t->type == TOKEN_STRING) {
+        next_token();
+        return duplicate_cstring(t->lexeme);
+    } else if (t->type == TOKEN_INT) {
+        next_token();
+        return int_to_string(t->value);
+    } else if (t->type == TOKEN_FLOAT) {
+        next_token();
+        char *result = mod_malloc(32);
+        sprintf(result, "%g", t->float_value);
+        return result;
+    } else if (t->type == TOKEN_IDENT) {
+        char name[MAX_VAR_NAME];
+        strcpy(name, next_token()->lexeme);
+        if (peek_token()->type == TOKEN_LPAREN) {
+            // Built-in string functions or user function returning int
+            if (mod_strcmp(name, "upper") == 0 || mod_strcmp(name, "lower") == 0) {
+                next_token(); // '('
+                char *arg = evaluate_string_expr();
+                if (peek_token()->type != TOKEN_RPAREN) { printf("Expected ')'\n"); exit(1); }
+                next_token();
+                if (!arg) return duplicate_cstring("");
+                char *result;
+                if (mod_strcmp(name, "upper") == 0) {
+                    result = create_upper_string(arg);
+                } else {
+                    result = create_lower_string(arg);
+                }
+                mod_free(arg);
+                return result;
+            } else if (mod_strcmp(name, "len") == 0) {
+                next_token(); // '('
+                char *arg = evaluate_string_expr();
+                if (peek_token()->type != TOKEN_RPAREN) { printf("Expected ')'\n"); exit(1); }
+                next_token();
+                int n = 0; if (arg) { while (arg[n] != '\0') n++; }
+                if (arg) mod_free(arg);
+                return int_to_string(n);
+            } else if (mod_strcmp(name, "substr") == 0) {
+                next_token(); // '('
+                char *s = evaluate_string_expr();
+                if (next_token()->type != TOKEN_COMMA) { printf("Expected ','\n"); exit(1);} 
+                int start = expression();
+                int length = 0;
+                if (peek_token()->type == TOKEN_COMMA) { next_token(); length = expression(); }
+                if (peek_token()->type != TOKEN_RPAREN) { printf("Expected ')'\n"); exit(1); }
+                next_token();
+                if (!s) return duplicate_cstring("");
+                int slen = 0; while (s[slen] != '\0') slen++;
+                if (start < 0) start = 0; if (start > slen) start = slen;
+                int maxlen = slen - start; if (length <= 0 || length > maxlen) length = maxlen;
+                char *out = (char*)mod_malloc((size_t)length + 1);
+                if (!out) { mod_free(s); printf("Out of memory\n"); exit(1);} 
+                for (int i = 0; i < length; i++) out[i] = s[start + i];
+                out[length] = '\0';
+                mod_free(s);
+                return out;
+            } else if (mod_strcmp(name, "find") == 0) {
+                next_token(); // '('
+                char *s = evaluate_string_expr();
+                if (next_token()->type != TOKEN_COMMA) { printf("Expected ','\n"); exit(1);} 
+                char *sub = evaluate_string_expr();
+                if (peek_token()->type != TOKEN_RPAREN) { printf("Expected ')'\n"); exit(1);} 
+                next_token();
+                int pos = -1;
+                if (s && sub) {
+                    for (int i = 0; s[i] != '\0'; i++) {
+                        int k = 0; while (sub[k] != '\0' && s[i + k] == sub[k]) k++;
+                        if (sub[k] == '\0') { pos = i; break; }
+                    }
+                }
+                if (s) mod_free(s); if (sub) mod_free(sub);
+                return int_to_string(pos);
+            } else if (mod_strcmp(name, "replace") == 0) {
+                next_token(); // '('
+                char *s = evaluate_string_expr();
+                if (next_token()->type != TOKEN_COMMA) { printf("Expected ','\n"); exit(1);} 
+                char *from = evaluate_string_expr();
+                if (next_token()->type != TOKEN_COMMA) { printf("Expected ','\n"); exit(1);} 
+                char *to = evaluate_string_expr();
+                if (peek_token()->type != TOKEN_RPAREN) { printf("Expected ')'\n"); exit(1);} 
+                next_token();
+                if (!s || !from || !to) { if (s) mod_free(s); if (from) mod_free(from); if (to) mod_free(to); return duplicate_cstring(""); }
+                // Simple replace all occurrences
+                // Estimate result size
+                int sl = 0, fl = 0, tl = 0; while (s[sl] != '\0') sl++; while (from[fl] != '\0') fl++; while (to[tl] != '\0') tl++;
+                if (fl == 0) { char *ret = duplicate_cstring(s); mod_free(s); mod_free(from); mod_free(to); return ret; }
+                int count = 0;
+                for (int i = 0; s[i] != '\0'; i++) { int k = 0; while (from[k] && s[i + k] == from[k]) k++; if (!from[k]) { count++; i += fl - 1; } }
+                size_t outsz = (size_t)sl + (size_t)count * (size_t)(tl - fl) + 1;
+                char *out = (char*)mod_malloc(outsz);
+                if (!out) { mod_free(s); mod_free(from); mod_free(to); printf("Out of memory\n"); exit(1);} 
+                int oi = 0;
+                for (int i = 0; s[i] != '\0'; ) {
+                    int k = 0; while (from[k] && s[i + k] == from[k]) k++;
+                    if (from[k] == '\0') { for (int j = 0; j < tl; j++) out[oi++] = to[j]; i += fl; }
+                    else { out[oi++] = s[i++]; }
+                }
+                out[oi] = '\0';
+                mod_free(s); mod_free(from); mod_free(to);
+                return out;
+            } else if (mod_strcmp(name, "trim") == 0) {
+                next_token(); // '('
+                char *s = evaluate_string_expr();
+                if (peek_token()->type != TOKEN_RPAREN) { printf("Expected ')'\n"); exit(1);} 
+                next_token();
+                if (!s) return duplicate_cstring("");
+                char *result = create_trimmed_string(s);
+                mod_free(s);
+                return result;
+            } else if (mod_strcmp(name, "format") == 0) {
+                next_token(); // '('
+                char *format_str = evaluate_string_expr();
+                if (!format_str) return duplicate_cstring("");
+                
+                // Parse format arguments
+                char *args[10]; // Support up to 10 format arguments
+                int arg_count = 0;
+                
+                while (peek_token()->type == TOKEN_COMMA && arg_count < 10) {
+                    next_token(); // Consume comma
+                    args[arg_count] = evaluate_string_expr();
+                    arg_count++;
+                }
+                
+                if (peek_token()->type != TOKEN_RPAREN) { 
+                    printf("Expected ')' in format function\n"); 
+                    exit(1);
+                }
+                next_token();
+                
+                // Simple format string implementation
+                // Replace %s with string arguments, %d with integer arguments
+                int result_size = mod_strlen(format_str) * 2 + 256; // Estimate size
+                char *result = mod_malloc(result_size);
+                if (!result) {
+                    printf("Out of memory in format\n");
+                    exit(1);
+                }
+                
+                int out_pos = 0;
+                int arg_index = 0;
+                
+                for (int i = 0; format_str[i] != '\0' && out_pos < result_size - 1; i++) {
+                    if (format_str[i] == '%' && format_str[i + 1] != '\0') {
+                        if (format_str[i + 1] == 's') {
+                            // String argument
+                            if (arg_index < arg_count && args[arg_index]) {
+                                int arg_len = mod_strlen(args[arg_index]);
+                                if (out_pos + arg_len < result_size - 1) {
+                                    mod_strcpy(result + out_pos, args[arg_index]);
+                                    out_pos += arg_len;
+                                }
+                            }
+                            arg_index++;
+                            i++; // Skip the 's'
+                        } else if (format_str[i + 1] == 'd') {
+                            // Try to convert string argument to integer and format
+                            if (arg_index < arg_count && args[arg_index]) {
+                                int val = atoi(args[arg_index]);
+                                char num_str[32];
+                                sprintf(num_str, "%d", val);
+                                int num_len = mod_strlen(num_str);
+                                if (out_pos + num_len < result_size - 1) {
+                                    mod_strcpy(result + out_pos, num_str);
+                                    out_pos += num_len;
+                                }
+                            }
+                            arg_index++;
+                            i++; // Skip the 'd'
+                        } else if (format_str[i + 1] == '%') {
+                            // Escaped %
+                            result[out_pos++] = '%';
+                            i++; // Skip the second %
+                        } else {
+                            // Unknown format, just copy the %
+                            result[out_pos++] = format_str[i];
+                        }
+                    } else {
+                        result[out_pos++] = format_str[i];
+                    }
+                }
+                result[out_pos] = '\0';
+                
+                // Free arguments
+                for (int i = 0; i < arg_count; i++) {
+                    if (args[i]) mod_free(args[i]);
+                }
+                mod_free(format_str);
+                
+                return result;
+            } else if (mod_strcmp(name, "read_file") == 0) {
+                next_token(); // '('
+                char *filename = evaluate_string_expr();
+                if (peek_token()->type != TOKEN_RPAREN) { 
+                    printf("Expected ')' in read_file function\n"); 
+                    exit(1);
+                }
+                next_token();
+                
+                if (!filename) return duplicate_cstring("");
+                
+                // Use the existing read_file function which handles errors
+                char* content = read_file(filename);
+                mod_free(filename);
+                
+                if (!content) {
+                    // Error was already set by read_file function
+                    return duplicate_cstring(""); // Return empty string
+                }
+                
+                return content;
+            } else {
+                // User function: evaluate numerically then stringify
+                int v = function_call(name);
+                return int_to_string(v);
+            }
+        } else if (peek_token()->type == TOKEN_DOT) {
+            // String method call: variable.method()
+            next_token(); // Consume '.'
+            
+            if (peek_token()->type != TOKEN_IDENT) {
+                printf("Expected method name after '.'\n");
+                exit(1);
+            }
+            
+            char method_name[MAX_VAR_NAME];
+            strcpy(method_name, next_token()->lexeme);
+            
+            // Get the string variable value
+            VarType type;
+            void* value = get_variable_value(name, &type);
+            char *str_value = NULL;
+            
+            if (type == VAR_STRING) {
+                str_value = duplicate_cstring((char*)value);
+            } else if (type == VAR_INT) {
+                str_value = int_to_string(*(int*)value);
+            } else if (type == VAR_FLOAT) {
+                str_value = mod_malloc(32);
+                sprintf(str_value, "%g", *(float*)value);
+            } else {
+                str_value = duplicate_cstring("");
+            }
+            
+            if (peek_token()->type == TOKEN_LPAREN) {
+                next_token(); // Consume '('
+                
+                // Handle different string methods
+                if (mod_strcmp(method_name, "length") == 0) {
+                    if (peek_token()->type != TOKEN_RPAREN) {
+                        printf("length() method takes no arguments\n");
+                        exit(1);
+                    }
+                    next_token(); // Consume ')'
+                    int len = str_value ? mod_strlen(str_value) : 0;
+                    if (str_value) mod_free(str_value);
+                    return int_to_string(len);
+                    
+                } else if (mod_strcmp(method_name, "upper") == 0) {
+                    if (peek_token()->type != TOKEN_RPAREN) {
+                        printf("upper() method takes no arguments\n");
+                        exit(1);
+                    }
+                    next_token(); // Consume ')'
+                    if (!str_value) return duplicate_cstring("");
+                    char *result = create_upper_string(str_value);
+                    mod_free(str_value);
+                    return result;
+                    
+                } else if (mod_strcmp(method_name, "lower") == 0) {
+                    if (peek_token()->type != TOKEN_RPAREN) {
+                        printf("lower() method takes no arguments\n");
+                        exit(1);
+                    }
+                    next_token(); // Consume ')'
+                    if (!str_value) return duplicate_cstring("");
+                    char *result = create_lower_string(str_value);
+                    mod_free(str_value);
+                    return result;
+                    
+                } else if (mod_strcmp(method_name, "trim") == 0) {
+                    if (peek_token()->type != TOKEN_RPAREN) {
+                        printf("trim() method takes no arguments\n");
+                        exit(1);
+                    }
+                    next_token(); // Consume ')'
+                    if (!str_value) return duplicate_cstring("");
+                    char *result = create_trimmed_string(str_value);
+                    mod_free(str_value);
+                    return result;
+                    
+                } else if (mod_strcmp(method_name, "substr") == 0) {
+                    int start = expression();
+                    int length = 0;
+                    if (peek_token()->type == TOKEN_COMMA) {
+                        next_token(); // Consume comma
+                        length = expression();
+                    }
+                    if (peek_token()->type != TOKEN_RPAREN) {
+                        printf("Expected ')' after substr arguments\n");
+                        exit(1);
+                    }
+                    next_token(); // Consume ')'
+                    
+                    if (!str_value) return duplicate_cstring("");
+                    int slen = mod_strlen(str_value);
+                    if (start < 0) start = 0;
+                    if (start > slen) start = slen;
+                    int maxlen = slen - start;
+                    if (length <= 0 || length > maxlen) length = maxlen;
+                    
+                    char *result = mod_malloc(length + 1);
+                    for (int i = 0; i < length; i++) {
+                        result[i] = str_value[start + i];
+                    }
+                    result[length] = '\0';
+                    mod_free(str_value);
+                    return result;
+                    
+                } else {
+                    printf("Unknown string method: %s\n", method_name);
+                    if (str_value) mod_free(str_value);
+                    exit(1);
+                }
+            } else {
+                printf("Expected '(' after method name %s\n", method_name);
+                if (str_value) mod_free(str_value);
+                exit(1);
+            }
+        } else {
+            VarType type;
+            void* value = get_variable_value(name, &type);
+            if (!value) {
+                // Error already set by get_variable_value
+                return duplicate_cstring(""); // Return empty string on error
+            }
+            if (type == VAR_INT) {
+                return int_to_string(*(int*)value);
+            } else if (type == VAR_FLOAT) {
+                char *result = mod_malloc(32);
+                sprintf(result, "%g", *(float*)value);
+                return result;
+            } else if (type == VAR_BOOL) {
+                return duplicate_cstring(*(bool*)value ? "true" : "false");
+            } else if (type == VAR_TIME) {
+                char *result = mod_malloc(32);
+                sprintf(result, "%u", (unsigned int)(*(time_t*)value));
+                return result;
+            } else if (type == VAR_STRING) {
+                return duplicate_cstring((char*)value);
+            } else {
+                return duplicate_cstring(""); // Return empty string for unprintable types
+            }
+        }
+    } else if (t->type == TOKEN_EXEC) {
+        next_token(); // consume 'exec'
+        return exec_capture_string();
+    } else {
+        print_error_context("Unexpected token in string expression");
+        exit(1);
+    }
+}
+
+char *evaluate_string_expr(void) {
+    // element {'+' element}
+    char *acc = evaluate_string_element();
+    while (peek_token()->type == TOKEN_PLUS) {
+        next_token(); // '+'
+        char *rhs = evaluate_string_element();
+        // concatenate
+        size_t len_a = acc ? strlen(acc) : 0;
+        size_t len_b = rhs ? strlen(rhs) : 0;
+        char *joined = (char*)mod_malloc(len_a + len_b + 1);
+        if (!joined) { if (acc) mod_free(acc); if (rhs) mod_free(rhs); printf("Out of memory\n"); exit(1);} 
+        size_t i = 0; for (; i < len_a; i++) joined[i] = acc[i];
+        for (size_t j = 0; j < len_b; j++) joined[i + j] = rhs[j];
+        joined[len_a + len_b] = '\0';
+        if (acc) mod_free(acc);
+        if (rhs) mod_free(rhs);
+        acc = joined;
+    }
+    return acc;
+}
+
+// ----- For loop: for i = a to b step n ... end -----
+static void for_statement(void) {
+    next_token(); // consume 'for'
+    if (peek_token()->type != TOKEN_IDENT) { printf("Expected loop variable name after 'for'\n"); exit(1);} 
+    char varname[MAX_VAR_NAME]; strcpy(varname, next_token()->lexeme);
+    if (next_token()->type != TOKEN_ASSIGN) { printf("Expected '=' after loop var\n"); exit(1);} 
+    int start = expression();
+    if (next_token()->type != TOKEN_TO) { printf("Expected 'to' in for loop\n"); exit(1);} 
+    int endv = expression();
+    int step = 1;
+    if (peek_token()->type == TOKEN_STEP) { next_token(); step = expression(); if (step == 0) { printf("step cannot be 0\n"); exit(1);} }
+    if (next_token()->type != TOKEN_DO) { printf("Expected 'do' after for range\n"); exit(1);} 
+
+    // Setup var and loop
+    int body_start = current_token;
+    loop_depth++;
+    bool executed = false;
+    int i = start;
+    while ((step > 0) ? (i <= endv) : (i >= endv)) {
+        set_variable_value(varname, VAR_INT, &i);
+        executed = true;
+        while (peek_token()->type != TOKEN_END && peek_token()->type != TOKEN_EOF) {
+            statement();
+            if (function_return_flag) { loop_depth--; return; }
+            if (loop_break_flag || loop_continue_flag) {
+                while (peek_token()->type != TOKEN_END && peek_token()->type != TOKEN_EOF) next_token();
+                break;
+            }
+        }
+        if (peek_token()->type == TOKEN_EOF) { printf("Expected 'end' after for loop body\n"); exit(1);} 
+        next_token(); // consume 'end'
+        if (loop_break_flag) { loop_break_flag = false; break; }
+        if (loop_continue_flag) { loop_continue_flag = false; }
+        i += step;
+        if ((step > 0) ? (i <= endv) : (i >= endv)) {
+            current_token = body_start; // loop again
+        }
+    }
+    if (!executed) {
+        // Skip body once to reach matching 'end'
+        while (peek_token()->type != TOKEN_END && peek_token()->type != TOKEN_EOF) next_token();
+        if (peek_token()->type == TOKEN_EOF) { printf("Expected 'end' after for loop body\n"); exit(1);} 
+        next_token();
+    }
+    loop_depth--;
+}
+
+
+// --- SWI helpers
+int swi_builtin(void) {
+    Token *name_tok = next_token();
+
+    char swi_name[64];
+    if (name_tok->type == TOKEN_STRING) {
+        strncpy(swi_name, name_tok->lexeme, sizeof(swi_name));
+        swi_name[sizeof(swi_name)-1] = 0;
+    } else {
+        print_error_context("SWI name must be a string");
+        exit(1);
+    }
+    
+    // Parse parameters into register array; string variables become out-buffers
+    int input_regs[10] = {0};
+    int param_count = 0;
+    char *string_params[10] = {0}; // for literals
+    SwiOutString outs[10];
+    int outs_count = 0;
+    
+    while (peek_token()->type == TOKEN_COMMA && param_count < 10) {
+        next_token(); // skip comma
+        Token *arg_tok = next_token();
+        
+        if (arg_tok->type == TOKEN_INT) {
+            input_regs[param_count] = arg_tok->value;
+        } else if (arg_tok->type == TOKEN_FLOAT) {
+            input_regs[param_count] = (int)(arg_tok->float_value);
+        } else if (arg_tok->type == TOKEN_STRING) {
+            string_params[param_count] = mod_strdup(arg_tok->lexeme);
+            input_regs[param_count] = (int)(uintptr_t)string_params[param_count];
+        } else if (arg_tok->type == TOKEN_IDENT) {
+            VarType type; void *value = get_variable_value(arg_tok->lexeme, &type);
+            if (value) {
+                if (type == VAR_INT) input_regs[param_count] = *(int*)value;
+                else if (type == VAR_FLOAT) input_regs[param_count] = (int)(*(float*)value);
+                else if (type == VAR_BOOL) input_regs[param_count] = *(int*)value ? 1 : 0;
+                else if (type == VAR_TIME) input_regs[param_count] = (int)(*(unsigned int*)value);
+                else if (type == VAR_STRING) {
+                    // out-string for this variable
+                    outs[outs_count].reg_index = param_count;
+                    outs[outs_count].var_name = arg_tok->lexeme;
+                    outs[outs_count].initial = (const char*)value;
+                    outs[outs_count].capacity = 1024;
+                    outs_count++;
+                    input_regs[param_count] = 0;
+                } else {
+                    input_regs[param_count] = (int)(uintptr_t)value;
+                }
+            } else { print_error_context("swi arg must be int or string"); exit(1); }
+        } else { print_error_context("swi arg must be int or string"); exit(1); }
+        param_count++;
+    }
+    
+    // Debug trace before call - now handled in swi_handler
+    int success = swi_execute_with_out_strings(swi_name, input_regs, param_count, outs, outs_count);
+    for (int i = 0; i < param_count; i++) if (string_params[i]) mod_free(string_params[i]);
+    
+    if (success) {
+        int reg_results[10]; get_last_swi_registers(reg_results);
+        for (int i = 0; i < 10; i++) global_swi_regs[i] = reg_results[i];
+        return reg_results[0];
+    } else {
+        for (int i = 0; i < 10; i++) global_swi_regs[i] = 0;
+        return -1;
+    }
+}
+
+// Simple SWI error access function
+int swi_error_builtin(void) {
+    return get_last_swi_status();
+}
+        
+// Function to reset global state (for module interface)
+void reset_script_globals(void) {
+    // Clean up existing variables
+    for (int i = 0; i < var_count; i++) {
+        if (variables[i].type == VAR_STRING && variables[i].value.string_value) {
+            mod_free(variables[i].value.string_value);
+        }
+    }
+    
+    // Reset counters
+    token_count = 0;
+    current_token = 0;
+    var_count = 0;
+    function_count = 0;
+}
+
+// Function to run script from source (extracted from main)
+int run_script_from_source(const char *source, const char *filename) {
+    ProcessedSource processed = process_includes(source);
+
+    // Reset global variables
+    reset_script_globals();
+
+    tokenize_with_includes(processed.source, filename);
+    interpret();
+
+    // Clean up
+    for (int i = 0; i < var_count; i++) {
+        if (variables[i].type == VAR_STRING && variables[i].value.string_value) {
+            mod_free(variables[i].value.string_value);
+        }
+    }
+
+    mod_free(processed.source);
+    return 0;
+}
+
+// Original main function (kept for standalone app use)
+int main(int argc, char *argv[]) {
+    if (argc != 2) {
+        printf("Usage: %s <script_file>\n", argv[0]);
+        return 1;
+    }
+
+    char* source = read_file(argv[1]);
+    if (!source) {
+        printf("Error reading file: %s\n", argv[1]);
+        return 1;
+    }
+
+    int result = run_script_from_source(source, argv[1]);
+    
+    mod_free(source);
+    return result;
+}

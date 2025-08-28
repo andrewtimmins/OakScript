@@ -1,0 +1,222 @@
+// Dynamic area-backed heap
+#include <stddef.h>
+#include <string.h>
+#include "kernel.h"
+#include "swis.h"
+#include "h.memory"
+
+static int da_number = -1;
+static char *da_base = 0;
+static size_t da_size = 0;   // committed size
+static size_t da_max = 0;    // max size
+static size_t heap_off = 0;  // bump pointer offset
+
+// Create our private dynamic area
+int mod_init(size_t initial_size, size_t max_size) {
+    int area = -1;
+    void *base = 0;
+    unsigned flags = 0; // user DA, not sparse, not doubly-mapped
+    // Clamp sizes to multiples of 4KB
+    const size_t page = 4096;
+    initial_size = (initial_size + page - 1) & ~(page - 1);
+    max_size = (max_size + page - 1) & ~(page - 1);
+
+    _swix(OS_DynamicArea, _INR(0,9)|_OUT(1)|_OUT(3),
+          0,              // reason 0: create
+          -1,             // let OS allocate number
+          initial_size,   // initial size
+          -1,             // base (internal use)
+          flags,
+          max_size,       // max logical size
+          0,              // handler
+          0,              // handler PW
+          "Oak Script workspace",    // name
+          0,              // R9 unused for non-PMP
+          &area,
+          &base);
+
+    if ((int)base == 0 || area < 0) return 0;
+    da_number = area;
+    da_base = (char*)base;
+    da_size = initial_size;
+    da_max = max_size;
+    heap_off = 0;
+    return 1;
+}
+
+void mod_shutdown(void) {
+    if (da_number >= 0) {
+        _swix(OS_DynamicArea, _IN(0)|_IN(1), 1, da_number);
+    }
+    da_number = -1; da_base = 0; da_size = da_max = heap_off = 0;
+}
+
+static int ensure_capacity(size_t need_off) {
+    if (need_off <= da_size) return 1;
+    if (need_off > da_max) return 0;
+    // grow by delta bytes
+    int delta = (int)(need_off - da_size);
+    int grown = 0;
+    if (_swix(OS_ChangeDynamicArea, _INR(0,1)|_OUT(1), da_number, delta, &grown) == NULL) {
+        da_size += (size_t)grown;
+        return grown >= delta;
+    }
+    return 0;
+}
+
+void *mod_malloc(size_t size) {
+    if (da_number < 0) return 0;
+    // simple 8-byte alignment
+    size = (size + 7u) & ~7u;
+    size_t off = heap_off;
+    size_t need = off + size + sizeof(size_t);
+    if (!ensure_capacity(need)) return 0;
+    char *p = da_base + off;
+    // store size header
+    *(size_t*)p = size;
+    p += sizeof(size_t);
+    heap_off = need;
+    return p;
+}
+
+void mod_free(void *ptr) {
+    if (!ptr) return;
+    // LIFO free if freeing the last block
+    char *p = (char*)ptr - sizeof(size_t);
+    size_t sz = *(size_t*)p;
+    size_t blk_start = (size_t)(p - (char*)da_base);
+    size_t blk_end = blk_start + sizeof(size_t) + sz;
+    if (blk_end == heap_off) {
+        heap_off = blk_start; // pop
+    }
+    // note: not shrinking DA immediately to avoid churn; mod_free_all shrinks
+}
+
+void *mod_realloc(void *ptr, size_t newsize) {
+    if (!ptr) return mod_malloc(newsize);
+    char *p = (char*)ptr - sizeof(size_t);
+    size_t old = *(size_t*)p;
+    // if last block, try in-place grow
+    size_t blk_start = (size_t)(p - (char*)da_base);
+    size_t blk_end = blk_start + sizeof(size_t) + old;
+    size_t aligned = (newsize + 7u) & ~7u;
+    if (blk_end == heap_off) {
+        size_t need = blk_start + sizeof(size_t) + aligned;
+        if (ensure_capacity(need)) {
+            *(size_t*)p = aligned;
+            heap_off = need;
+            return p + sizeof(size_t);
+        }
+    }
+    // else allocate new and copy
+    void *n = mod_malloc(newsize);
+    if (!n) return 0;
+    mod_memcpy(n, ptr, newsize < old ? newsize : old);
+    mod_free(ptr);
+    return n;
+}
+
+void *mod_calloc(size_t n, size_t size) {
+    size_t total = n * size;
+    void *p = mod_malloc(total);
+    if (p) mod_memset(p, 0, total);
+    return p;
+}
+
+char *mod_strdup(const char *s) {
+    if (!s) return NULL;
+    size_t len = mod_strlen(s) + 1;
+    char *p = (char*)mod_malloc(len);
+    if (p) {
+        mod_memcpy(p, s, len);
+    }
+    return p;
+}
+
+void mod_free_all(void) {
+    // shrink DA back to initial 0 (or page) and reset bump pointer
+    if (da_number >= 0) {
+        int shrunk = 0;
+        int delta = -(int)da_size;
+        (void)_swix(OS_ChangeDynamicArea, _INR(0,1)|_OUT(1), da_number, delta, &shrunk);
+        da_size -= (size_t)shrunk;
+        heap_off = 0;
+    }
+}
+
+/* Safe memory manipulation functions for relocatable modules */
+void *mod_memcpy(void *dest, const void *src, size_t n) {
+    unsigned char *d = (unsigned char *)dest;
+    const unsigned char *s = (const unsigned char *)src;
+    while (n--) {
+        *d++ = *s++;
+    }
+    return dest;
+}
+
+void *mod_memset(void *s, int c, size_t n) {
+    unsigned char *p = (unsigned char *)s;
+    unsigned char val = (unsigned char)c;
+    while (n--) {
+        *p++ = val;
+    }
+    return s;
+}
+
+size_t mod_strlen(const char *s) {
+    size_t len = 0;
+    while (*s++) {
+        len++;
+    }
+    return len;
+}
+
+int mod_strcmp(const char *s1, const char *s2) {
+    while (*s1 && (*s1 == *s2)) {
+        s1++;
+        s2++;
+    }
+    return *(unsigned char*)s1 - *(unsigned char*)s2;
+}
+
+int mod_strncmp(const char *s1, const char *s2, size_t n) {
+    while (n && *s1 && (*s1 == *s2)) {
+        s1++;
+        s2++;
+        n--;
+    }
+    if (n == 0) return 0;
+    return *(unsigned char*)s1 - *(unsigned char*)s2;
+}
+
+char *mod_strcpy(char *dest, const char *src) {
+    char *d = dest;
+    while ((*d++ = *src++));
+    return dest;
+}
+
+char *mod_strncpy(char *dest, const char *src, size_t n) {
+    char *d = dest;
+    while (n && (*d++ = *src++)) {
+        n--;
+    }
+    while (n--) {
+        *d++ = '\0';
+    }
+    return dest;
+}
+
+size_t mod_strcspn(const char *s, const char *reject) {
+    size_t count = 0;
+    const char *p1, *p2;
+    
+    for (p1 = s; *p1; p1++) {
+        for (p2 = reject; *p2; p2++) {
+            if (*p1 == *p2) {
+                return count;
+            }
+        }
+        count++;
+    }
+    return count;
+}

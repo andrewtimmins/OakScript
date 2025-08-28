@@ -1,0 +1,47 @@
+#ifndef SWI_H
+#define SWI_H
+
+#include <kernel.h>
+#include "h.engine"
+
+/* SWI call interface */
+int swi_call(const char *swi_name, int param_count, void **params, VarType *param_types);
+
+/* SWI name to number conversion */
+int swi_name_to_number(const char *name);
+
+/* SWI parameter handling */
+int prepare_swi_parameters(_kernel_swi_regs *regs, int param_count, void **params, VarType *param_types);
+void handle_swi_output_parameters(int param_count, void **params, VarType *param_types, _kernel_swi_regs *regs);
+
+/* SWI execution status */
+int get_last_swi_status(void);
+void set_last_swi_status(int status);
+
+/* Get all register results from last SWI call */
+void get_last_swi_registers(int *regs_out);
+
+/* Simple SWI execution with register values */
+int swi_execute_with_registers(const char *swi_name, int *input_regs, int reg_count);
+
+/* Safe out-string support for SWIs */
+typedef struct {
+	int reg_index;           /* which Rn to point at the buffer */
+	const char *var_name;    /* target variable to write back, NULL for temp */
+	const char *initial;     /* initial contents (may be NULL) */
+	size_t capacity;         /* bytes to allocate; 0 => default (1024) */
+} SwiOutString;
+
+/* Execute SWI with optional out-strings that are DA-backed and safely written back */
+int swi_execute_with_out_strings(const char *swi_name,
+								 int *input_regs,
+								 int reg_count,
+								 const SwiOutString *outs,
+								 int outs_count);
+
+/* Builtin function wrappers for OakScript */
+int swi_builtin_call(void);
+int swi_builtin_error(void);
+
+#endif /* SWI_H */
+

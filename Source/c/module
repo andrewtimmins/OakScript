@@ -1,0 +1,211 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "kernel.h"
+#include "swis.h"
+#include "h.header"
+// Module-safe heap allocs free-all
+#include "h.memory"
+#include "h.compile"
+#include "h.runtime"
+
+// Forward declarations of our script engine functions
+extern int run_script_file(const char *filename);
+extern int init_script_engine(void);
+extern void cleanup_script_engine(void);
+
+// Module workspace structure
+typedef struct {
+    int workspace_size;
+    int initialized;
+} module_workspace;
+
+// Use a small static workspace for module control data
+// The script engine itself will use dynamic memory
+static module_workspace workspace_store;
+static module_workspace *workspace = &workspace_store;
+
+/*
+ * Module initialisation
+ */
+_kernel_oserror *module_init(const char *cmd_tail, int podule_base, void *pw)
+{
+    (void)cmd_tail; (void)podule_base; (void)pw; // Suppress unused parameter warnings
+    
+    // Initialize workspace structure
+    workspace->workspace_size = sizeof(module_workspace);
+    workspace->initialized = 0;
+    
+    // Create our private dynamic area heap (start small, allow to grow)
+    if (!mod_init(64 * 1024, 8 * 1024 * 1024)) {
+        return (_kernel_oserror *)_swix(OS_GenerateError, _INR(0,2),
+               0, "Failed to create dynamic area", 0);
+    }
+
+    // Initialize the script engine (this will use dynamic memory)
+    if (init_script_engine() == 0) {
+        workspace->initialized = 1;
+        return NULL;  // Success
+    } else {
+        mod_shutdown();
+        return (_kernel_oserror *)_swix(OS_GenerateError, _INR(0,2),
+               0, "Failed to initialize OakScript script engine", 0);
+    }
+}
+
+/*
+ * Module finalisation
+ */
+_kernel_oserror *module_final(int fatal, int podule, void *pw)
+{
+    (void)fatal; (void)podule; (void)pw; // Suppress unused parameter warnings
+    if (workspace->initialized) {
+        cleanup_script_engine();
+        workspace->initialized = 0;
+    }
+    
+    // Ensure all module allocations are freed
+    mod_free_all();
+    mod_shutdown();
+    return NULL;
+}
+
+/*
+ * *OakScrpt command handler
+ */
+_kernel_oserror *module_command(const char *arg_string, int argc, int cmd_no, void *pw)
+{
+    (void)pw; // Suppress unused parameter warning
+    switch (cmd_no) {
+    case 0: // *OakScrpt command
+            if (argc == 0) {
+                return NULL;
+            } else {
+                // Extract filename from arg_string
+                const char *filename = arg_string;
+                // Skip any leading spaces
+                while (*filename == ' ') filename++;
+                
+                if (!workspace || !workspace->initialized) {
+                    return (_kernel_oserror *)_swix(OS_GenerateError, _INR(0,2),
+                           0, "OakScript module not properly initialized", 0);
+                }
+                
+                // Run the script
+                int result = run_script_file(filename);
+                if (result != 0) {
+                    return (_kernel_oserror *)_swix(OS_GenerateError, _INR(0,2),
+                           result, "Script execution failed", 0);
+                }
+                return NULL;
+            }
+        case 1: // *OakScriptCompile command
+            if (argc != 2) {
+                return (_kernel_oserror *)_swix(OS_GenerateError, _INR(0,2),
+                       0, "OakScriptCompile requires source and output filenames", 0);
+            } else {
+                // Parse the two arguments from arg_string
+                const char *args = arg_string;
+                while (*args == ' ') args++; // Skip leading spaces
+                
+                // Find first argument (source file)
+                const char *source_start = args;
+                while (*args && *args != ' ') args++; // Find end of first arg
+                int source_len = args - source_start;
+                
+                // Skip spaces between arguments
+                while (*args == ' ') args++;
+                
+                // Second argument (output file)
+                const char *output_start = args;
+                while (*args && *args != ' ' && *args != '\r' && *args != '\n') args++;
+                int output_len = args - output_start;
+                
+                if (source_len == 0 || output_len == 0) {
+                    return (_kernel_oserror *)_swix(OS_GenerateError, _INR(0,2),
+                           0, "Both source and output filenames required", 0);
+                }
+                
+                // Create null-terminated strings
+                char source_file[256], output_file[256];
+                if (source_len >= 256 || output_len >= 256) {
+                    return (_kernel_oserror *)_swix(OS_GenerateError, _INR(0,2),
+                           0, "Filename too long", 0);
+                }
+                
+                strncpy(source_file, source_start, source_len);
+                source_file[source_len] = '\0';
+                strncpy(output_file, output_start, output_len);
+                output_file[output_len] = '\0';
+                
+                if (!workspace || !workspace->initialized) {
+                    return (_kernel_oserror *)_swix(OS_GenerateError, _INR(0,2),
+                           0, "OakScript module not properly initialized", 0);
+                }
+                
+                // Compile the script to bytecode
+                int result = compile_script_to_bytecode(source_file, output_file);
+                if (result != 0) {
+                    return (_kernel_oserror *)_swix(OS_GenerateError, _INR(0,2),
+                           result, "Script compilation failed", 0);
+                }
+                return NULL;
+            }
+        case 2: // *OakScriptRun command
+            if (argc != 1) {
+                return (_kernel_oserror *)_swix(OS_GenerateError, _INR(0,2),
+                       0, "OakScriptRun requires bytecode filename", 0);
+            } else {
+                // Extract filename from arg_string
+                const char *filename = arg_string;
+                while (*filename == ' ') filename++; // Skip leading spaces
+                
+                // Find end of filename (space, newline, or null)
+                const char *end = filename;
+                while (*end && *end != ' ' && *end != '\r' && *end != '\n') end++;
+                
+                // Create null-terminated filename
+                char bytecode_file[256];
+                int len = end - filename;
+                if (len >= 256) {
+                    return (_kernel_oserror *)_swix(OS_GenerateError, _INR(0,2),
+                           0, "Filename too long", 0);
+                }
+                
+                strncpy(bytecode_file, filename, len);
+                bytecode_file[len] = '\0';
+                
+                if (!workspace || !workspace->initialized) {
+                    return (_kernel_oserror *)_swix(OS_GenerateError, _INR(0,2),
+                           0, "OakScript module not properly initialized", 0);
+                }
+                
+                // Run the bytecode
+                int result = run_bytecode_file(bytecode_file);
+                if (result != 0) {
+                    return (_kernel_oserror *)_swix(OS_GenerateError, _INR(0,2),
+                           result, "Bytecode execution failed", 0);
+                }
+                return NULL;
+            }
+        default:
+            return (_kernel_oserror *)_swix(OS_GenerateError, _INR(0,2),
+                   0, "Unknown command", 0);
+    }
+}
+
+
+/*
+ * Callback and tick handlers (required by CMHG but not used)
+ */
+_kernel_oserror *callback_handler(_kernel_swi_regs *r, void *pw)
+{
+    (void)r; (void)pw; // Suppress unused parameter warnings
+    return NULL; // No error
+}
+
+_kernel_oserror *tick_handler(_kernel_swi_regs *r, void *pw)
+{
+    (void)r; (void)pw; // Suppress unused parameter warnings
+    return NULL; // No error
+}

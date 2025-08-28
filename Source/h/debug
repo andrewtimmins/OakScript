@@ -1,0 +1,20 @@
+#ifndef OAKSCRIPT_DEBUG_H
+#define OAKSCRIPT_DEBUG_H
+
+#include <stdbool.h>
+
+void debug_on(void);
+void debug_off(void);
+bool debug_is_enabled(void);
+void debug_logpath(const char *path);
+
+// Internal helpers
+void debug_printf(const char *fmt, ...);
+
+// Builtin function wrappers for OakScript functions
+int debug_builtin_on(void);
+int debug_builtin_off(void);
+int debug_builtin_print(void);
+int debug_builtin_logpath(void);
+
+#endif // OAKSCRIPT_DEBUG_H

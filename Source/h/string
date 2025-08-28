@@ -1,0 +1,36 @@
+#ifndef STRING_H
+#define STRING_H
+
+#include <stddef.h>
+
+/* ASCII character classification and conversion functions */
+int ascii_isspace(char c);
+int ascii_isdigit(char c);
+int ascii_isalpha(char c);
+int ascii_isalnum(char c);
+char ascii_toupper(char c);
+char ascii_tolower(char c);
+
+/* String manipulation functions */
+void to_upper_inplace(char *s);
+void to_lower_inplace(char *s);
+char* create_upper_string(const char *s);
+char* create_lower_string(const char *s);
+char* create_trimmed_string(const char *s);
+
+/* String utility functions */
+int string_starts_with(const char *str, const char *prefix);
+int string_ends_with(const char *str, const char *suffix);
+int string_contains(const char *str, const char *substr);
+
+/* String parsing functions */
+int string_parse_int(const char *str);
+int string_from_hex(const char *str);
+
+/* File I/O string functions */
+int string_write_file(const char *filename, const char *content);
+int string_append_file(const char *filename, const char *content);
+int string_file_exists(const char *filename);
+
+#endif /* STRING_H */
+

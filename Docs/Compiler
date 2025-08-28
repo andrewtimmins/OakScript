@@ -1,0 +1,477 @@
+OakScript Compiler Design Documentation
+======================================
+
+Version: 1.0
+Date: 2024
+
+OVERVIEW
+--------
+
+The OakScript compiler transforms human-readable OakScript source code into
+efficient bytecode for execution by the OakScript virtual machine. The compiler
+uses a multi-pass approach with tokenization, parsing, and code generation phases.
+
+ARCHITECTURE
+-----------
+
+The compiler consists of several key components:
+
+1. TOKENIZER: Converts source text into tokens
+2. PARSER: Builds abstract syntax from tokens  
+3. CODE GENERATOR: Emits bytecode from parsed structures
+4. BUFFER MANAGEMENT: Handles dynamic bytecode buffer growth
+5. SYMBOL TABLE: Manages string constants and references
+
+COMPILATION FLOW
+---------------
+
+Source Code → Tokenizer → Parser → Code Generator → Bytecode File
+
+1. Source code is read from input file
+2. Tokenizer breaks text into meaningful tokens
+3. Parser analyzes tokens and generates bytecode
+4. Buffer management handles memory allocation
+5. Final bytecode is written to output file with proper header
+
+TOKENIZER DESIGN
+---------------
+
+The tokenizer (simple_tokenizer_t) performs lexical analysis:
+
+Structure:
+    typedef struct {
+        char* source;        // Source code text
+        int length;          // Total source length
+        int pos;             // Current position
+    } simple_tokenizer_t;
+
+Key Functions:
+- skip_whitespace(): Advances past spaces, tabs, newlines
+- is_digit(): Checks if character is numeric
+- is_alpha(): Checks if character is alphabetic
+- parse_integer(): Extracts integer literals
+- parse_identifier(): Extracts variable/function names
+
+Token Recognition:
+- INTEGERS: Sequences of digits (0-9)
+- IDENTIFIERS: Alphanumeric sequences starting with letter
+- OPERATORS: =, +, -, *, /, ==, !=, <, <=, >, >=
+- KEYWORDS: if, while, print
+- DELIMITERS: (, ), {, }, ;
+- STRINGS: Quoted text (future enhancement)
+
+PARSER ARCHITECTURE
+------------------
+
+The parser uses recursive descent parsing with the following grammar:
+
+Program:
+    Statement*
+
+Statement:
+    Assignment | IfStatement | WhileStatement | PrintStatement | Expression
+
+Assignment:
+    IDENTIFIER = Expression
+
+IfStatement:
+    if ( Expression ) { Statement* }
+
+WhileStatement:  
+    while ( Expression ) { Statement* }
+
+PrintStatement:
+    print Expression
+
+Expression:
+    ComparisonExpression
+
+ComparisonExpression:
+    ArithmeticExpression (ComparisonOp ArithmeticExpression)?
+
+ArithmeticExpression:
+    Term ((+|-) Term)*
+
+Term:
+    Factor ((*|/) Factor)*
+
+Factor:
+    INTEGER | IDENTIFIER | FunctionCall
+
+FunctionCall:
+    IDENTIFIER ( ArgumentList? )
+
+ArgumentList:
+    Expression (, Expression)*
+
+PARSING FUNCTIONS
+----------------
+
+parse_statement():
+- Determines statement type from first token
+- Dispatches to appropriate parsing function
+- Handles statement termination
+
+parse_assignment():
+- Parses variable = expression pattern
+- Generates OP_STORE_VAR after expression code
+- Validates identifier syntax
+
+parse_if_statement():
+- Parses if (condition) { statements }
+- Implements jump patching for conditional execution
+- Generates OP_JUMP_IF_FALSE and OP_JUMP
+
+parse_while_statement():
+- Parses while (condition) { statements }
+- Implements loop jump patching
+- Generates loop start/end markers
+
+parse_expression():
+- Entry point for expression parsing
+- Handles operator precedence
+- Manages left-to-right evaluation
+
+parse_comparison():
+- Handles ==, !=, <, <=, >, >= operators
+- Generates appropriate OP_CMP_* opcodes
+- Maintains proper stack order
+
+parse_arithmetic():
+- Handles +, -, *, / operators with left-to-right precedence
+- Generates OP_ADD, OP_SUB, OP_MUL, OP_DIV
+- Ensures proper operand order on stack
+
+parse_factor():
+- Handles atomic expressions (numbers, variables, function calls)
+- Generates OP_LOAD_INT, OP_LOAD_VAR, OP_CALL_BUILTIN
+- Detects function call syntax with parentheses
+
+parse_function_call():
+- Handles function(arg1, arg2, ...) syntax
+- Parses argument list with comma separation
+- Generates argument loading code before function call
+- Supports zero-argument functions
+
+CODE GENERATION
+--------------
+
+The code generator emits bytecode opcodes and manages the bytecode buffer:
+
+Structure:
+    typedef struct {
+        unsigned char* code;    // Bytecode buffer
+        int size;              // Current size
+        int capacity;          // Maximum capacity
+        char** strings;        // String constant table
+        int string_count;      // Number of strings
+        int string_capacity;   // String table capacity
+    } bytecode_buffer_t;
+
+Key Functions:
+
+emit_opcode(buffer, opcode):
+- Writes single-byte opcode to buffer
+- Handles buffer resizing if needed
+- Returns error code on failure
+
+emit_int(buffer, value):
+- Writes 4-byte integer in little-endian format
+- Used for numeric constants and offsets
+- Handles negative values correctly
+
+emit_string_ref(buffer, string):
+- Adds string to constant table if not present
+- Emits 4-byte offset into string data section
+- Manages string deduplication
+
+Buffer Management:
+- Dynamic resizing when capacity exceeded
+- Automatic cleanup on compilation failure
+- Module-safe memory allocation (mod_malloc/mod_free)
+
+JUMP PATCHING
+------------
+
+Control flow statements require jump patching for forward references:
+
+If Statement Pattern:
+    [condition code]
+    OP_JUMP_IF_FALSE → patch_location
+    [then block code]
+    patch_location: [next instruction]
+
+While Loop Pattern:
+    loop_start: [condition code]
+    OP_JUMP_IF_FALSE → loop_end
+    [body code]
+    OP_JUMP → loop_start
+    loop_end: [next instruction]
+
+Patching Process:
+1. Emit OP_JUMP_IF_FALSE with placeholder offset
+2. Record current buffer position as patch location
+3. Compile body statements
+4. Calculate actual jump distance
+5. Overwrite placeholder with correct offset
+
+EXPRESSION EVALUATION
+--------------------
+
+Expressions are compiled to stack-based bytecode:
+
+Source: a + b * c
+Bytecode:
+    OP_LOAD_VAR "a"    // Push a
+    OP_LOAD_VAR "b"    // Push b  
+    OP_LOAD_VAR "c"    // Push c
+    OP_MUL             // Pop c,b; push b*c
+    OP_ADD             // Pop b*c,a; push a+b*c
+
+Left-to-Right Evaluation:
+- Operators are left-associative
+- No operator precedence (multiplication = addition)
+- Parentheses not yet supported
+
+Function Call Evaluation:
+Source: min(a, b)
+Bytecode:
+    OP_LOAD_VAR "a"    // Push argument 1
+    OP_LOAD_VAR "b"    // Push argument 2
+    OP_CALL_BUILTIN "min"  // Call with 2 args on stack
+
+STRING CONSTANT MANAGEMENT
+-------------------------
+
+String constants are managed separately from code:
+
+Storage:
+- Strings stored in separate data section
+- Null-terminated format
+- Sequential storage with no padding
+- Deduplication to save space
+
+Reference System:
+- String opcodes use 4-byte offsets
+- Offsets are relative to start of data section
+- Runtime resolves offsets to actual string pointers
+
+Example:
+    Source strings: "hello", "world", "hello"
+    Data section: "hello\0world\0"
+    References: 0, 6, 0 (deduplication of "hello")
+
+MEMORY MANAGEMENT
+----------------
+
+All compiler memory allocation uses RISC OS module-safe functions:
+
+Safe Functions Used:
+- mod_malloc(): Module-safe allocation
+- mod_free(): Module-safe deallocation  
+- mod_strlen(): Module-safe string length
+- mod_strcpy(): Module-safe string copy
+- mod_strncmp(): Module-safe string comparison
+
+Buffer Allocation:
+- Initial buffer size: 1024 bytes
+- Growth factor: 2x when capacity exceeded
+- Automatic cleanup on compilation errors
+- Memory leak prevention
+
+String Table:
+- Dynamic string array allocation
+- Grows as needed during compilation
+- Proper cleanup of all string memory
+- Reference counting not needed (simple ownership)
+
+ERROR HANDLING
+-------------
+
+The compiler implements comprehensive error reporting:
+
+Error Types:
+- Syntax errors (unexpected tokens)
+- Memory allocation failures
+- File I/O errors
+- Buffer overflow protection
+- Invalid jump targets
+
+Error Reporting:
+- Descriptive error messages
+- Location information when possible
+- Graceful compilation termination
+- Memory cleanup on errors
+
+Error Examples:
+- "Error: Expected number or variable in expression"
+- "Error: Expected ')' to close function call"
+- "Error: Memory allocation failed"
+- "Error: Cannot create output file"
+
+FILE I/O OPERATIONS
+------------------
+
+The compiler handles input/output file operations:
+
+Input Processing:
+1. Open source file for reading
+2. Determine file size using fseek/ftell
+3. Allocate buffer for entire file content
+4. Read complete file into memory buffer
+5. Close input file and process in memory
+
+Output Generation:
+1. Create output file with .eef extension
+2. Write 20-byte header with magic/version/sizes
+3. Write code section (opcodes and operands)
+4. Write data section (string constants)
+5. Set RISC OS file type to &EEF using OS_File
+6. Close output file
+
+File Type Setting:
+    _swix(OS_File, _INR(0,2), 18, output_file, 0xEEF);
+
+OPTIMIZATION OPPORTUNITIES
+-------------------------
+
+Current compiler limitations and future improvements:
+
+String Handling:
+- Current: Linear search for string deduplication
+- Future: Hash table for O(1) string lookup
+
+Expression Parsing:
+- Current: Left-to-right evaluation only
+- Future: Proper operator precedence
+- Future: Parenthesized sub-expressions
+
+Control Flow:
+- Current: Basic if/while support
+- Future: else/elif statements
+- Future: for loops with iterators
+- Future: break/continue statements
+
+Function Support:
+- Current: Built-in functions only
+- Future: User-defined functions
+- Future: Local variable scoping
+- Future: Parameter passing
+
+Type System:
+- Current: Dynamic typing only
+- Future: Optional static type checking
+- Future: Type inference
+
+DEBUGGING SUPPORT
+----------------
+
+The compiler includes debugging features:
+
+Verbose Output:
+- Optional compilation progress messages
+- Bytecode disassembly capability
+- String table dumping
+- Buffer size monitoring
+
+Error Diagnostics:
+- Detailed error messages with context
+- Memory usage tracking
+- Compilation statistics
+
+Future Debug Features:
+- Source line number tracking
+- Symbol table export
+- Debug symbol generation
+- Profiling hooks
+
+INTEGRATION WITH RISC OS
+------------------------
+
+The compiler is designed specifically for RISC OS:
+
+Module Integration:
+- Compiler callable as *OakScriptCompile command
+- Module-safe memory management throughout
+- Proper error handling for RISC OS environment
+- SWI usage for file operations
+
+Command Interface:
+    *OakScriptCompile input_file output_file
+
+File Handling:
+- Automatic .eef file type setting
+- RISC OS path conventions supported
+- Error reporting via standard channels
+
+Memory Safety:
+- No use of standard malloc/free
+- All allocations through mod_malloc family
+- Proper cleanup on module unloading
+
+TESTING AND VALIDATION
+---------------------
+
+Compiler testing includes:
+
+Unit Tests:
+- Individual function testing
+- Tokenizer validation
+- Parser grammar checking
+- Code generation verification
+
+Integration Tests:
+- Complete compilation pipeline
+- File I/O operations
+- Memory management validation
+- Error condition handling
+
+Bytecode Validation:
+- Header format verification
+- Opcode sequence checking
+- String offset validation
+- Jump target verification
+
+Performance Tests:
+- Large source file handling
+- Memory usage profiling
+- Compilation speed measurement
+- Buffer growth behavior
+
+FUTURE ENHANCEMENTS
+------------------
+
+Planned compiler improvements:
+
+Language Features:
+- String literal support in source
+- Array literal syntax
+- Object/structure definitions
+- Exception handling constructs
+
+Optimization:
+- Dead code elimination
+- Constant folding
+- Common subexpression elimination
+- Register allocation simulation
+
+Tooling:
+- Bytecode disassembler
+- Dependency tracking
+- Incremental compilation
+- Cross-reference generation
+
+Standards Compliance:
+- ANSI C compatibility
+- RISC OS style guide adherence
+- Memory safety verification
+- Thread safety (future)
+
+CONCLUSION
+----------
+
+The OakScript compiler provides a solid foundation for compiling OakScript
+source code to efficient bytecode. The modular design allows for incremental
+improvements while maintaining compatibility with existing bytecode. The
+focus on RISC OS integration and memory safety makes it suitable for
+production use in the RISC OS environment.

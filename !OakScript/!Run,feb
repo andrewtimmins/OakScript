@@ -1,0 +1,17 @@
+|
+| >!Run
+|
+
+IconSprites <Obey$Dir>.!Sprites
+Set OakScript$Dir <Obey$Dir>
+Set OakScript$Path <OakScript$Dir>.
+
+Set File$Type_EEE OSC
+Set File$Type_EEF OXF
+
+Set Alias$@RunType_EEE "OakScript %%*0"
+Set Alias$@RunType_EEF "OakScriptRun %%*0"
+
+RMEnsure OakScript 0.0 RMLoad <OakScript$Dir>.OakScript
+
+Filer_OpenDir OakScript:Logs

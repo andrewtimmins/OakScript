@@ -1,0 +1,42 @@
+#ifndef MATH_H
+#define MATH_H
+
+/* Basic arithmetic functions */
+int math_add(int a, int b);
+int math_subtract(int a, int b);
+int math_multiply(int a, int b);
+int math_divide(int a, int b);
+int math_modulo(int a, int b);
+
+/* Advanced math functions */
+int math_min(int a, int b);
+int math_max(int a, int b);
+int math_abs(int a);
+int math_square(int a);
+int math_power(int base, int exponent);
+int math_isqrt(int n);
+int math_clamp(int value, int min_val, int max_val);
+
+/* Random number functions */
+void math_srand(unsigned int seed);
+int math_rand(void);
+int math_rand_range(int min_val, int max_val);
+
+/* Utility functions for builtin function calls */
+int math_builtin_add(void);
+int math_builtin_subtract(void);
+int math_builtin_multiply(void);
+int math_builtin_divide(void);
+int math_builtin_mod(void);
+int math_builtin_min(void);
+int math_builtin_max(void);
+int math_builtin_abs(void);
+int math_builtin_square(void);
+int math_builtin_clamp(void);
+int math_builtin_pow(void);
+int math_builtin_isqrt(void);
+int math_builtin_srand(void);
+int math_builtin_rand(void);
+
+#endif /* MATH_H */
+

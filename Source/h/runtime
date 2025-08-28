@@ -1,0 +1,11 @@
+// Header file for OakScript Bytecode Runtime
+#ifndef OAKSCRIPT_RUNTIME_H
+#define OAKSCRIPT_RUNTIME_H
+
+#include "h.compile"  // For oakscode_header_t and opcode_t definitions
+
+// Function prototype for bytecode execution
+extern int run_bytecode_file(const char *bytecode_file);
+
+#endif // OAKSCRIPT_RUNTIME_H
+

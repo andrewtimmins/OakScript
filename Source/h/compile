@@ -1,0 +1,50 @@
+// Header file for OakScript Compiler and Bytecode Runtime
+#ifndef OAKSCRIPT_COMPILE_H
+#define OAKSCRIPT_COMPILE_H
+
+/* OakScript Bytecode Format */
+
+// Bytecode file header
+typedef struct {
+    char magic[8];          // "OAKSCODE"
+    unsigned int version;   // Bytecode format version
+    unsigned int code_size; // Size of bytecode section
+    unsigned int data_size; // Size of string/constant data section
+} oakscode_header_t;
+
+// Bytecode instruction opcodes
+typedef enum {
+    OP_NOP = 0,
+    OP_LOAD_INT,        // Load integer constant
+    OP_LOAD_FLOAT,      // Load float constant  
+    OP_LOAD_STRING,     // Load string constant
+    OP_LOAD_VAR,        // Load variable value by name
+    OP_STORE_VAR,       // Store top of stack to variable by name
+    OP_PRINT_INT,       // Print integer value
+    OP_PRINT_STRING,    // Print string value
+    OP_ADD,             // Add two values
+    OP_SUB,             // Subtract
+    OP_MUL,             // Multiply
+    OP_DIV,             // Divide
+    OP_CMP_EQ,          // Compare equal (==)
+    OP_CMP_NE,          // Compare not equal (!=)
+    OP_CMP_LT,          // Compare less than (<)
+    OP_CMP_LE,          // Compare less than or equal (<=)
+    OP_CMP_GT,          // Compare greater than (>)
+    OP_CMP_GE,          // Compare greater than or equal (>=)
+    OP_PRINT,           // Print statement (deprecated - use PRINT_INT/PRINT_STRING)
+    OP_CALL,            // Generic function call (deprecated)
+    OP_CALL_BUILTIN,    // Call built-in function
+    OP_CALL_USER,       // Call user-defined function
+    OP_RETURN,          // Return from function
+    OP_JUMP,            // Unconditional jump to address
+    OP_JUMP_IF_FALSE,   // Conditional jump if top of stack is false/zero
+    OP_LOOP_START,      // Mark loop start for while/for
+    OP_LOOP_END,        // Mark loop end and jump back to start
+    OP_EXIT             // End program
+} opcode_t;
+
+// Function prototypes
+extern int compile_script_to_bytecode(const char *source_file, const char *output_file);
+
+#endif // OAKSCRIPT_COMPILE_H
