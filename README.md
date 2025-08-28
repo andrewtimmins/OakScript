@@ -7,9 +7,9 @@ OakScript is a simple, intuitive scripting language designed for rapid prototypi
 ## Features
 
 - **Simple Syntax**: Clear, readable code that's accessible to both beginners and experienced programmers
-- **Core Data Types**: Support for integers, strings, booleans, and floating-point numbers
-- **Variables & Expressions**: Dynamic variable assignment with arithmetic and comparison operations
-- **Control Flow**: If statements and while loops for program logic
+- **Rich Type System**: 12 variable types including integers, strings, booleans, floats, arrays, buffers, blocks, references, pointers, files, and time values
+- **Advanced Variable Operations**: Compound assignment operators (+=, -=, *=, /=), increment/decrement, automatic type conversion, and variable introspection
+- **Advanced Control Flow**: If-else, switch-case, while loops, for loops with ranges/steps, break/continue, user-defined functions, try-catch exception handling, and file inclusion
 - **Extensive Built-in Library**: 50+ built-in functions covering mathematics, strings, files, arrays, debugging, and RISC OS system integration
 - **Bytecode Compilation**: Efficient compilation to portable bytecode format
 - **RISC OS Integration**: Native module with proper memory management and system integration
@@ -79,11 +79,89 @@ end
 
 ## Language Features
 
-### Variables
+### Variable Types and Manipulation
+
+OakScript supports a rich type system with automatic type conversion and comprehensive manipulation capabilities:
+
+#### Basic Variable Types
 ```oakscript
+// Integer variables
+count = 42
+negative = -100
+
+// String variables  
 name = "OakScript"
-version = 4
+message = "Hello, RISC OS!"
+
+// Boolean variables
+flag = true
+enabled = false
+
+// Floating-point variables
 pi = 3.14159
+temperature = -2.5
+```
+
+#### Advanced Variable Types
+```oakscript
+// Array variables (integer arrays)
+numbers = array(10)              // Create array with 10 elements
+array_set(numbers, 0, 42)        // Set numbers[0] = 42
+value = array_get(numbers, 0)    // Get numbers[0] → 42
+
+// Buffer variables (mutable byte buffers)
+buffer = bytes(1024)             // Create 1KB buffer
+updated = update_buffer(buffer, "New content")
+
+// Block variables (structured data for RISC OS)
+icon_block = block(36, 1)        // 36-byte icon block
+window_block = block(88, 1)      // 88-byte window block
+
+// Reference variables (pointers to other variables)
+ref = reference("original_var")  // Create reference
+
+// Time variables  
+current = time()                 // Current timestamp
+```
+
+#### Automatic Type Conversion
+```oakscript
+// OakScript automatically converts between compatible types
+number = 42          // Integer
+text = "Value: " + number    // Auto-converts to "Value: 42"
+flag = (number > 0)  // Auto-converts to boolean (true)
+```
+
+#### Variable Operators and Assignment
+```oakscript
+// Standard assignment
+x = 10
+
+// Compound assignment operators
+x += 5    // x = x + 5  (now 15)
+x -= 3    // x = x - 3  (now 12)  
+x *= 2    // x = x * 2  (now 24)
+x /= 4    // x = x / 4  (now 6)
+
+// Increment/decrement
+x++       // x = x + 1  (now 7)
+x--       // x = x - 1  (now 6)
+++x       // Pre-increment
+--x       // Pre-decrement
+```
+
+#### Variable Introspection
+```oakscript
+// Get information about variables
+info = variable_print_info()     // Print all variable info
+count = get_variable_count()     // Number of active variables
+
+// Type checking (via built-in functions)
+type_name = get_variable_type_name("varname")
+
+// Constant variables
+const PI = 3.14159
+const MAX_SIZE = 1024
 ```
 
 ### Arithmetic Operations
@@ -94,23 +172,114 @@ product = a * b
 quotient = a / b
 ```
 
-### Comparisons
+### Comparisons and Logical Operations
 ```oakscript
+// Comparison operators
 equal = (a == b)
 not_equal = (a != b)
 less_than = (a < b)
+less_equal = (a <= b)
+greater_than = (a > b)
 greater_equal = (a >= b)
+
+// Logical operators
+result = (x > 0) and (y < 10)    // Logical AND
+result = (x == 0) or (y == 0)    // Logical OR
+result = not (x > 0)             // Logical NOT
+
+// Boolean literals
+flag1 = true
+flag2 = false
 ```
 
 ### Control Flow
+
+OakScript supports comprehensive control flow statements for complex program logic:
+
+#### Conditional Statements
 ```oakscript
+// Basic if statement
 if x > 0 then
     print "Positive"
 end
 
-while count < 10
-    count = count + 1
+// If-else statement
+if temperature > 25 then
+    print "Hot day"
+else
+    print "Cool day"
 end
+
+// Switch statement for multiple conditions
+switch value
+    case 1
+        print "One"
+    case 2
+        print "Two"
+    default
+        print "Other"
+end
+```
+
+#### Loops
+```oakscript
+// While loop
+counter = 0
+while counter < 10
+    print counter
+    counter = counter + 1
+end
+
+// For loop with range
+for i = 1 to 10
+    print i
+end
+
+// For loop with step
+for i = 0 to 100 step 5
+    print i    // Prints 0, 5, 10, 15, etc.
+end
+
+// Loop control
+for i = 1 to 100
+    if i == 50 then
+        break      // Exit loop
+    end
+    if i % 2 == 0 then
+        continue   // Skip to next iteration
+    end
+    print i
+end
+```
+
+#### User-Defined Functions
+```oakscript
+// Function definition
+function calculate_area(width, height)
+    result = width * height
+    return result
+end
+
+// Function call
+area = calculate_area(10, 5)
+print area    // Prints 50
+```
+
+#### Exception Handling
+```oakscript
+// Try-catch for error handling
+try
+    result = divide(10, 0)
+catch
+    print "Division by zero error!"
+end
+```
+
+#### File Inclusion
+```oakscript
+// Include other script files
+include "utilities.oak"
+include "constants.oak"
 ```
 
 ### Built-in Functions
