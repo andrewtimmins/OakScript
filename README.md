@@ -10,7 +10,7 @@ OakScript is a simple, intuitive scripting language designed for rapid prototypi
 - **Core Data Types**: Support for integers, strings, booleans, and floating-point numbers
 - **Variables & Expressions**: Dynamic variable assignment with arithmetic and comparison operations
 - **Control Flow**: If statements and while loops for program logic
-- **Built-in Functions**: Mathematical functions (`abs`, `min`, `max`) and utility functions
+- **Extensive Built-in Library**: 50+ built-in functions covering mathematics, strings, files, arrays, debugging, and RISC OS system integration
 - **Bytecode Compilation**: Efficient compilation to portable bytecode format
 - **RISC OS Integration**: Native module with proper memory management and system integration
 
@@ -114,11 +114,100 @@ end
 ```
 
 ### Built-in Functions
+
+OakScript provides an extensive library of built-in functions across multiple categories:
+
+#### Mathematical Functions
 ```oakscript
-absolute = abs(-42)        // Returns 42
-minimum = min(10, 20)      // Returns 10
-maximum = max(10, 20)      // Returns 20
-exists = file_exists()     // Placeholder function
+// Basic arithmetic
+result = add(5, 3)         // Addition: 8
+result = subtract(10, 4)   // Subtraction: 6  
+result = multiply(6, 7)    // Multiplication: 42
+result = divide(20, 4)     // Division: 5
+result = mod(10, 3)        // Modulo: 1
+
+// Mathematical operations
+absolute = abs(-42)        // Absolute value: 42
+minimum = min(10, 20)      // Minimum: 10
+maximum = max(10, 20)      // Maximum: 20
+squared = square(5)        // Square: 25
+power = pow(2, 8)          // Power: 256
+sqrt = isqrt(16)           // Integer square root: 4
+clamped = clamp(15, 0, 10) // Clamp value: 10
+
+// Random numbers
+srand(42)                  // Seed random generator
+random1 = rand()           // Random number
+random2 = rand(1, 100)     // Random between 1-100
+```
+
+#### String Functions
+```oakscript
+// String operations
+length = len("Hello")           // String length: 5
+upper = upper("hello")          // Uppercase: "HELLO"
+lower = lower("WORLD")          // Lowercase: "world"
+trimmed = trim("  text  ")      // Remove whitespace: "text"
+
+// String testing
+starts = startswith("Hello", "He")    // Boolean: 1 (true)
+ends = endswith("World", "ld")        // Boolean: 1 (true)
+has = contains("Hello", "ell")        // Boolean: 1 (true)
+
+// String conversion
+number = parseint("123")        // Parse integer: 123
+hex_val = fromhex("FF")         // From hexadecimal: 255
+```
+
+#### File Operations
+```oakscript
+// File management
+exists = exists("filename")           // Check if file exists
+written = writefile("log.txt", "Hello") // Write to file
+appended = appendfile("log.txt", "World") // Append to file
+content = readfile("data.txt")        // Read file contents
+```
+
+#### System & SWI Functions
+```oakscript
+// RISC OS SWI calls
+result = swi("OS_CLI", "Echo Hello")   // Execute SWI
+error_code = swi_error()               // Get last SWI error
+status = status()                      // Get execution status
+```
+
+#### Variable & Array Functions
+```oakscript
+// Variable management
+ref = reference("varname")             // Create reference
+info = variable_print_info()           // Print variable info
+current_time = time()                  // Get current time
+
+// Array operations
+arr = array(10)                        // Create array with capacity 10
+array_set(arr, 0, 42)                 // Set element: arr[0] = 42
+value = array_get(arr, 0)              // Get element: 42
+
+// Buffer operations
+buffer = bytes(1024)                   // Create byte buffer
+block = block(10, 4)                   // Create structured block
+updated = update_buffer(buffer, data)  // Update buffer contents
+```
+
+#### Debug Functions
+```oakscript
+// Debugging support
+debug_on()                     // Enable debug mode
+debug_off()                    // Disable debug mode
+debug_print("Debug message")   // Debug output
+debug_logpath("<filepath$dir>.debug")    // Set debug log path
+```
+
+#### System Integration
+```oakscript
+// External command execution
+exec("*Cat filename")          // Execute system command
+result = exec_output("*Dir")   // Execute and capture output
 ```
 
 ## Bytecode Format
