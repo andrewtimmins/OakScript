@@ -30,7 +30,7 @@ int mod_init(size_t initial_size, size_t max_size) {
           max_size,       // max logical size
           0,              // handler
           0,              // handler PW
-          "Oak Script workspace",    // name
+          "OakScript workspace",    // name
           0,              // R9 unused for non-PMP
           &area,
           &base);
@@ -191,7 +191,7 @@ int mod_strncmp(const char *s1, const char *s2, size_t n) {
 
 char *mod_strcpy(char *dest, const char *src) {
     char *d = dest;
-    while ((*d++ = *src++));
+    while ((*d++ = *src++) != '\0');
     return dest;
 }
 

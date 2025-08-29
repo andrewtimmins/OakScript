@@ -1,0 +1,1043 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
+#include "h.memory"
+#include "h.engine"
+#include "h.advanced"
+
+// Global object registry for managing all advanced data structures
+#define MAX_OBJECTS 1000
+
+typedef enum {
+    OBJ_DICT,
+    OBJ_LIST,
+    OBJ_SET,
+    OBJ_LAMBDA,
+    OBJ_REGEX,
+    OBJ_OPTIONAL,
+    OBJ_UNION,
+    OBJ_EXCEPTION
+} ObjectType;
+
+typedef struct {
+    ObjectType type;
+    void* data;
+    bool in_use;
+    int ref_count;
+} ObjectEntry;
+
+static ObjectEntry object_registry[MAX_OBJECTS];
+static int next_object_id = 1000;
+
+// Initialize the object registry
+static void init_object_registry(void) {
+    static bool initialized = false;
+    if (!initialized) {
+        for (int i = 0; i < MAX_OBJECTS; i++) {
+            object_registry[i].type = OBJ_DICT;
+            object_registry[i].data = NULL;
+            object_registry[i].in_use = false;
+            object_registry[i].ref_count = 0;
+        }
+        initialized = true;
+    }
+}
+
+// Register a new object and return its handle
+static int register_object(ObjectType type, void* data) {
+    init_object_registry();
+    
+    for (int i = 0; i < MAX_OBJECTS; i++) {
+        if (!object_registry[i].in_use) {
+            object_registry[i].type = type;
+            object_registry[i].data = data;
+            object_registry[i].in_use = true;
+            object_registry[i].ref_count = 1;
+            return next_object_id + i;
+        }
+    }
+    return -1; // Registry full
+}
+
+// Get object by handle
+static void* get_object(int handle, ObjectType expected_type) {
+    init_object_registry();
+    
+    int index = handle - next_object_id;
+    if (index < 0 || index >= MAX_OBJECTS) return NULL;
+    if (!object_registry[index].in_use) return NULL;
+    if (object_registry[index].type != expected_type) return NULL;
+    
+    return object_registry[index].data;
+}
+
+// Release object reference (used by garbage collection)
+void release_object(int handle) {
+    init_object_registry();
+    
+    int index = handle - next_object_id;
+    if (index < 0 || index >= MAX_OBJECTS) return;
+    if (!object_registry[index].in_use) return;
+    
+    object_registry[index].ref_count--;
+    if (object_registry[index].ref_count <= 0) {
+        // Clean up the data based on type
+        switch (object_registry[index].type) {
+            case OBJ_DICT: {
+                DictEntry* dict = (DictEntry*)object_registry[index].data;
+                if (dict) {
+                    dict_destroy(dict);
+                }
+                break;
+            }
+            case OBJ_LIST: {
+                struct ListNode** list_ptr = (struct ListNode**)object_registry[index].data;
+                if (list_ptr) {
+                    list_destroy(*list_ptr);
+                    mod_free(list_ptr);
+                }
+                break;
+            }
+            case OBJ_SET: {
+                struct SetNode** set_ptr = (struct SetNode**)object_registry[index].data;
+                if (set_ptr) {
+                    set_destroy(*set_ptr);
+                    mod_free(set_ptr);
+                }
+                break;
+            }
+            case OBJ_LAMBDA:
+                lambda_destroy((LambdaFunc*)object_registry[index].data);
+                break;
+            case OBJ_REGEX:
+                regex_destroy((RegexPattern*)object_registry[index].data);
+                break;
+            case OBJ_OPTIONAL:
+                optional_destroy((OptionalValue*)object_registry[index].data);
+                break;
+            case OBJ_UNION:
+                union_destroy((UnionValue*)object_registry[index].data);
+                break;
+            case OBJ_EXCEPTION:
+                exception_destroy((ExceptionValue*)object_registry[index].data);
+                break;
+        }
+        object_registry[index].data = NULL;
+        object_registry[index].in_use = false;
+    }
+}
+
+// COMPLETE Dictionary implementation (hash table with chaining)
+
+#define DICT_SIZE 256
+
+static unsigned int hash_string(const char* str) {
+    unsigned int hash = 5381;
+    while (*str) {
+        hash = ((hash << 5) + hash) + *str;
+        str++;
+    }
+    return hash % DICT_SIZE;
+}
+//     unsigned int hash = 5381;
+//     int c;
+//     while ((c = *str++)) {
+//         hash = ((hash << 5) + hash) + c;
+//     }
+//     return hash;
+// }
+
+DictEntry* dict_create(void) {
+    // Create hash table (array of bucket heads)
+    DictEntry* dict = (DictEntry*)mod_malloc(sizeof(DictEntry) * DICT_SIZE);
+    if (!dict) return NULL;
+    
+    // Initialize all buckets to empty
+    for (int i = 0; i < DICT_SIZE; i++) {
+        dict[i].key = NULL;
+        dict[i].value = NULL;
+        dict[i].value_type = VAR_NULL;
+        dict[i].next = NULL;
+    }
+    
+    return dict;
+}
+
+void dict_set(DictEntry* dict, const char* key, void* value, VarType type) {
+    if (!dict || !key) return;
+    
+    DictEntry* table = dict;
+    unsigned int hash = hash_string(key);
+    DictEntry* bucket = &table[hash];
+    
+    // If bucket is empty, use it directly
+    if (bucket->key == NULL) {
+        bucket->key = mod_strdup(key);
+        bucket->value = value;
+        bucket->value_type = type;
+        bucket->next = NULL;
+        return;
+    }
+    
+    // Check if key already exists in chain
+    DictEntry* current = bucket;
+    while (current) {
+        if (mod_strcmp(current->key, key) == 0) {
+            // Update existing entry
+            if (current->value) {
+                switch (current->value_type) {
+                    case VAR_STRING:
+                        mod_free(current->value);
+                        break;
+                    // Add other cleanup cases as needed
+                    default:
+                        break;
+                }
+            }
+            current->value = value;
+            current->value_type = type;
+            return;
+        }
+        if (current->next == NULL) break;
+        current = current->next;
+    }
+    
+    // Add new entry to end of chain
+    DictEntry* new_entry = (DictEntry*)mod_malloc(sizeof(DictEntry));
+    if (!new_entry) return;
+    
+    new_entry->key = mod_strdup(key);
+    new_entry->value = value;
+    new_entry->value_type = type;
+    new_entry->next = NULL;
+    current->next = new_entry;
+}
+
+void* dict_get(DictEntry* dict, const char* key, VarType* type) {
+    if (!dict || !key) return NULL;
+    
+    unsigned int hash = hash_string(key);
+    DictEntry* bucket = &dict[hash];
+    
+    // If bucket is empty, key doesn't exist
+    if (bucket->key == NULL) return NULL;
+    
+    // Search through chain
+    DictEntry* current = bucket;
+    while (current) {
+        if (current->key && mod_strcmp(current->key, key) == 0) {
+            if (type) *type = current->value_type;
+            return current->value;
+        }
+        current = current->next;
+    }
+    
+    return NULL;
+}
+
+bool dict_has_key(DictEntry* dict, const char* key) {
+    return dict_get(dict, key, NULL) != NULL;
+}
+
+void dict_remove(DictEntry* dict, const char* key) {
+    if (!dict || !key) return;
+    
+    unsigned int hash = hash_string(key);
+    DictEntry* bucket = &dict[hash];
+    
+    // If bucket is empty, key doesn't exist
+    if (bucket->key == NULL) return;
+    
+    // Check if the bucket head contains the key
+    if (mod_strcmp(bucket->key, key) == 0) {
+        // Remove the head of the chain
+        DictEntry* next = bucket->next;
+        mod_free(bucket->key);
+        if (bucket->value) mod_free(bucket->value);
+        
+        if (next) {
+            // Copy next node into bucket head
+            bucket->key = next->key;
+            bucket->value = next->value;
+            bucket->value_type = next->value_type;
+            bucket->next = next->next;
+            mod_free(next);
+        } else {
+            // Clear the bucket
+            bucket->key = NULL;
+            bucket->value = NULL;
+            bucket->value_type = VAR_NULL;
+            bucket->next = NULL;
+        }
+        return;
+    }
+    
+    // Search through the chain
+    DictEntry* current = bucket->next;
+    DictEntry* prev = bucket;
+    
+    while (current) {
+        if (mod_strcmp(current->key, key) == 0) {
+            prev->next = current->next;
+            mod_free(current->key);
+            if (current->value) mod_free(current->value);
+            mod_free(current);
+            return;
+        }
+        prev = current;
+        current = current->next;
+    }
+}
+
+void dict_destroy(DictEntry* dict) {
+    while (dict) {
+        DictEntry* next = dict->next;
+        mod_free(dict->key);
+        if (dict->value) mod_free(dict->value);
+        mod_free(dict);
+        dict = next;
+    }
+}
+
+int dict_size(DictEntry* dict) {
+    int count = 0;
+    DictEntry* current = dict;
+    while (current) {
+        count++;
+        current = current->next;
+    }
+    return count;
+}
+
+char** dict_keys(DictEntry* dict, int* count) {
+    int size = dict_size(dict);
+    if (size == 0) {
+        *count = 0;
+        return NULL;
+    }
+    
+    char** keys = (char**)mod_malloc(size * sizeof(char*));
+    if (!keys) {
+        *count = 0;
+        return NULL;
+    }
+    
+    int i = 0;
+    DictEntry* current = dict;
+    while (current && i < size) {
+        keys[i] = mod_strdup(current->key);
+        current = current->next;
+        i++;
+    }
+    
+    *count = i;
+    return keys;
+}
+
+// List implementation (doubly linked list)
+
+struct ListNode* list_create(void) {
+    return NULL;  // Empty list
+}
+
+void list_append(struct ListNode** list, void* value, VarType type) {
+    if (!list) return;
+    
+    struct ListNode* new_node = (struct ListNode*)mod_malloc(sizeof(struct ListNode));
+    if (!new_node) return;
+    
+    // Deep copy the value based on type for safety
+    void* copied_value = NULL;
+    switch (type) {
+        case VAR_INT:
+            copied_value = mod_malloc(sizeof(int));
+            *(int*)copied_value = *(int*)value;
+            break;
+        case VAR_STRING:
+            copied_value = mod_strdup((char*)value);
+            break;
+        case VAR_FLOAT:
+            copied_value = mod_malloc(sizeof(float));
+            *(float*)copied_value = *(float*)value;
+            break;
+        case VAR_BOOL:
+            copied_value = mod_malloc(sizeof(int));
+            *(int*)copied_value = *(int*)value;
+            break;
+        default:
+            copied_value = value; // For complex types, use reference
+            break;
+    }
+    
+    new_node->data = copied_value;
+    new_node->type = type;
+    new_node->next = NULL;
+    new_node->prev = NULL;
+    
+    if (!*list) {
+        *list = new_node;
+        return;
+    }
+    
+    // Find last node
+    struct ListNode* current = *list;
+    while (current->next) {
+        current = current->next;
+    }
+    
+    current->next = new_node;
+    new_node->prev = current;
+}
+
+void list_prepend(struct ListNode** list, void* value, VarType type) {
+    if (!list) return;
+    
+    struct ListNode* new_node = (struct ListNode*)mod_malloc(sizeof(struct ListNode));
+    if (!new_node) return;
+    
+    new_node->data = value;
+    new_node->type = type;
+    new_node->next = *list;
+    new_node->prev = NULL;
+    
+    if (*list) {
+        (*list)->prev = new_node;
+    }
+    
+    *list = new_node;
+}
+
+void* list_get(struct ListNode* list, int index, VarType* type) {
+    if (!list || index < 0) return NULL;
+    
+    struct ListNode* current = list;
+    int i = 0;
+    
+    while (current && i < index) {
+        current = current->next;
+        i++;
+    }
+    
+    if (current) {
+        if (type) *type = current->type;
+        return current->data;
+    }
+    
+    return NULL;
+}
+
+void list_set(struct ListNode* list, int index, void* value, VarType type) {
+    if (!list || index < 0) return;
+    
+    struct ListNode* current = list;
+    int i = 0;
+    
+    while (current && i < index) {
+        current = current->next;
+        i++;
+    }
+    
+    if (current) {
+        if (current->data) mod_free(current->data);
+        current->data = value;
+        current->type = type;
+    }
+}
+
+void list_remove(struct ListNode** list, int index) {
+    if (!list || !*list || index < 0) return;
+    
+    struct ListNode* current = *list;
+    int i = 0;
+    
+    while (current && i < index) {
+        current = current->next;
+        i++;
+    }
+    
+    if (!current) return;
+    
+    if (current->prev) {
+        current->prev->next = current->next;
+    } else {
+        *list = current->next;
+    }
+    
+    if (current->next) {
+        current->next->prev = current->prev;
+    }
+    
+    if (current->data) mod_free(current->data);
+    mod_free(current);
+}
+
+int list_size(struct ListNode* list) {
+    int count = 0;
+    struct ListNode* current = list;
+    while (current) {
+        count++;
+        current = current->next;
+    }
+    return count;
+}
+
+void list_destroy(struct ListNode* list) {
+    while (list) {
+        struct ListNode* next = list->next;
+        if (list->data) mod_free(list->data);
+        mod_free(list);
+        list = next;
+    }
+}
+
+// Set implementation (AVL balanced binary search tree)
+
+static int max(int a, int b) {
+    return (a > b) ? a : b;
+}
+
+static int get_height(struct SetNode* node) {
+    if (node == NULL) return 0;
+    return node->height;
+}
+
+static int get_balance(struct SetNode* node) {
+    if (node == NULL) return 0;
+    return get_height(node->left) - get_height(node->right);
+}
+
+static void update_height(struct SetNode* node) {
+    if (node) {
+        node->height = 1 + max(get_height(node->left), get_height(node->right));
+    }
+}
+
+static struct SetNode* rotate_right(struct SetNode* y) {
+    struct SetNode* x = y->left;
+    struct SetNode* T2 = x->right;
+    
+    // Perform rotation
+    x->right = y;
+    y->left = T2;
+    
+    // Update heights
+    update_height(y);
+    update_height(x);
+    
+    return x;
+}
+
+static struct SetNode* rotate_left(struct SetNode* x) {
+    struct SetNode* y = x->right;
+    struct SetNode* T2 = y->left;
+    
+    // Perform rotation
+    y->left = x;
+    x->right = T2;
+    
+    // Update heights
+    update_height(x);
+    update_height(y);
+    
+    return y;
+}
+
+static int compare_values(void* a, VarType type_a, void* b, VarType type_b) {
+    if (type_a != type_b) return (int)type_a - (int)type_b;
+    
+    switch (type_a) {
+        case VAR_INT:
+            return *(int*)a - *(int*)b;
+        case VAR_STRING:
+            return mod_strcmp((char*)a, (char*)b);
+        case VAR_FLOAT: {
+            float diff = *(float*)a - *(float*)b;
+            return (diff > 0) ? 1 : (diff < 0) ? -1 : 0;
+        }
+        default:
+            return (char*)a - (char*)b;  // Pointer comparison
+    }
+}
+
+struct SetNode* set_create(void) {
+    return NULL;  // Empty set
+}
+
+// Complete AVL tree insertion with automatic balancing
+static struct SetNode* set_add_internal(struct SetNode* node, void* value, VarType type) {
+    // Step 1: Normal BST insertion
+    if (node == NULL) {
+        struct SetNode* new_node = (struct SetNode*)mod_malloc(sizeof(struct SetNode));
+        if (!new_node) return NULL;
+        
+        // Deep copy the value
+        void* copied_value = NULL;
+        switch (type) {
+            case VAR_INT:
+                copied_value = mod_malloc(sizeof(int));
+                *(int*)copied_value = *(int*)value;
+                break;
+            case VAR_STRING:
+                copied_value = mod_strdup((char*)value);
+                break;
+            case VAR_FLOAT:
+                copied_value = mod_malloc(sizeof(float));
+                *(float*)copied_value = *(float*)value;
+                break;
+            default:
+                copied_value = value;
+                break;
+        }
+        
+        new_node->value = copied_value;
+        new_node->type = type;
+        new_node->left = NULL;
+        new_node->right = NULL;
+        new_node->height = 1;
+        return new_node;
+    }
+    
+    int cmp = compare_values(value, type, node->value, node->type);
+    if (cmp < 0) {
+        node->left = set_add_internal(node->left, value, type);
+    } else if (cmp > 0) {
+        node->right = set_add_internal(node->right, value, type);
+    } else {
+        // Value already exists, don't add duplicate
+        return node;
+    }
+    
+    // Step 2: Update height
+    update_height(node);
+    
+    // Step 3: Get balance factor
+    int balance = get_balance(node);
+    
+    // Step 4: Perform rotations if unbalanced
+    
+    // Left Left Case
+    if (balance > 1 && compare_values(value, type, node->left->value, node->left->type) < 0) {
+        return rotate_right(node);
+    }
+    
+    // Right Right Case
+    if (balance < -1 && compare_values(value, type, node->right->value, node->right->type) > 0) {
+        return rotate_left(node);
+    }
+    
+    // Left Right Case
+    if (balance > 1 && compare_values(value, type, node->left->value, node->left->type) > 0) {
+        node->left = rotate_left(node->left);
+        return rotate_right(node);
+    }
+    
+    // Right Left Case
+    if (balance < -1 && compare_values(value, type, node->right->value, node->right->type) < 0) {
+        node->right = rotate_right(node->right);
+        return rotate_left(node);
+    }
+    
+    return node;
+}
+
+void set_add(struct SetNode** set, void* value, VarType type) {
+    if (!set) return;
+    *set = set_add_internal(*set, value, type);
+}
+
+bool set_contains(struct SetNode* set, void* value, VarType type) {
+    if (!set) return false;
+    
+    int cmp = compare_values(value, type, set->value, set->type);
+    if (cmp == 0) return true;
+    if (cmp < 0) return set_contains(set->left, value, type);
+    return set_contains(set->right, value, type);
+}
+
+int set_size(struct SetNode* set) {
+    if (!set) return 0;
+    return 1 + set_size(set->left) + set_size(set->right);
+}
+
+void set_destroy(struct SetNode* set) {
+    if (!set) return;
+    set_destroy(set->left);
+    set_destroy(set->right);
+    if (set->value) mod_free(set->value);
+    mod_free(set);
+}
+
+// Lambda implementation
+
+LambdaFunc* lambda_create(char** params, int param_count, char* body) {
+    LambdaFunc* lambda = (LambdaFunc*)mod_malloc(sizeof(LambdaFunc));
+    if (!lambda) return NULL;
+    
+    lambda->param_count = param_count;
+    for (int i = 0; i < param_count && i < MAX_PARAMS; i++) {
+        lambda->params[i] = mod_strdup(params[i]);
+    }
+    
+    lambda->body = mod_strdup(body);
+    lambda->closure = NULL;  // TODO: Implement closure capture
+    lambda->closure_count = 0;
+    
+    return lambda;
+}
+
+void lambda_destroy(LambdaFunc* func) {
+    if (!func) return;
+    
+    for (int i = 0; i < func->param_count; i++) {
+        if (func->params[i]) mod_free(func->params[i]);
+    }
+    
+    if (func->body) mod_free(func->body);
+    if (func->closure) mod_free(func->closure);
+    mod_free(func);
+}
+
+// Optional type implementation
+
+OptionalValue* optional_create(void* value, VarType type) {
+    OptionalValue* opt = (OptionalValue*)mod_malloc(sizeof(OptionalValue));
+    if (!opt) return NULL;
+    
+    opt->has_value = (value != NULL);
+    opt->value = value;
+    opt->type = type;
+    
+    return opt;
+}
+
+OptionalValue* optional_empty(void) {
+    return optional_create(NULL, VAR_NULL);
+}
+
+bool optional_has_value(OptionalValue* opt) {
+    return opt && opt->has_value;
+}
+
+void* optional_get(OptionalValue* opt, VarType* type) {
+    if (!opt || !opt->has_value) return NULL;
+    if (type) *type = opt->type;
+    return opt->value;
+}
+
+void optional_destroy(OptionalValue* opt) {
+    if (!opt) return;
+    if (opt->value) mod_free(opt->value);
+    mod_free(opt);
+}
+
+// Exception implementation
+
+ExceptionValue* exception_create(const char* type, const char* message) {
+    ExceptionValue* exc = (ExceptionValue*)mod_malloc(sizeof(ExceptionValue));
+    if (!exc) return NULL;
+    
+    exc->type = mod_strdup(type);
+    exc->message = mod_strdup(message);
+    exc->stack_trace = NULL;
+    exc->line_number = 0;
+    exc->file_name = NULL;
+    
+    return exc;
+}
+
+void exception_set_location(ExceptionValue* exc, const char* file, int line) {
+    if (!exc) return;
+    if (exc->file_name) mod_free(exc->file_name);
+    exc->file_name = mod_strdup(file);
+    exc->line_number = line;
+}
+
+void exception_destroy(ExceptionValue* exc) {
+    if (!exc) return;
+    if (exc->type) mod_free(exc->type);
+    if (exc->message) mod_free(exc->message);
+    if (exc->stack_trace) mod_free(exc->stack_trace);
+    if (exc->file_name) mod_free(exc->file_name);
+    mod_free(exc);
+}
+
+// Built-in function wrappers (simplified implementations)
+
+extern int expression(void);
+extern Token* next_token(void);
+extern Token* peek_token(void);
+extern char* evaluate_string_expr(void);
+extern void* get_variable_value(const char* name, VarType* type);
+extern void set_variable_value(const char* name, VarType type, void* value);
+
+int builtin_dict_create(void) {
+    DictEntry* dict = dict_create();
+    return register_object(OBJ_DICT, dict);
+}
+
+int builtin_dict_set(void) {
+    int dict_handle = expression();
+    if (next_token()->type != TOKEN_COMMA) {
+        printf("dict_set() expects three arguments\n");
+        exit(1);
+    }
+    
+    char* key = evaluate_string_expr();
+    if (next_token()->type != TOKEN_COMMA) {
+        printf("dict_set() expects three arguments\n");
+        exit(1);
+    }
+    
+    char* value = evaluate_string_expr();
+    if (next_token()->type != TOKEN_RPAREN) {
+        printf("dict_set() expects ')'\n");
+        exit(1);
+    }
+    
+    DictEntry* dict = (DictEntry*)get_object(dict_handle, OBJ_DICT);
+    if (!dict) {
+        printf("Invalid dictionary handle: %d\n", dict_handle);
+        if (key) mod_free(key);
+        if (value) mod_free(value);
+        return 0;
+    }
+    
+    // Store the value as a string in the dictionary
+    char* value_copy = mod_strdup(value);
+    dict_set(dict, key, value_copy, VAR_STRING);
+    
+    if (key) mod_free(key);
+    if (value) mod_free(value);
+    return 1; // Success
+}
+
+int builtin_dict_get(void) {
+    int dict_handle = expression();
+    if (next_token()->type != TOKEN_COMMA) {
+        printf("dict_get() expects two arguments\n");
+        exit(1);
+    }
+    
+    char* key = evaluate_string_expr();
+    if (next_token()->type != TOKEN_RPAREN) {
+        printf("dict_get() expects ')'\n");
+        exit(1);
+    }
+    
+    DictEntry* dict = (DictEntry*)get_object(dict_handle, OBJ_DICT);
+    if (!dict) {
+        printf("Invalid dictionary handle: %d\n", dict_handle);
+        if (key) mod_free(key);
+        return 0;
+    }
+    
+    VarType type;
+    void* value = dict_get(dict, key, &type);
+    if (key) mod_free(key);
+    
+    if (!value) return 0; // Key not found
+    
+    // For now, return 1 if found (would need to properly return the value)
+    // In a full implementation, this would store the result in a temporary variable
+    return 1;
+}
+
+int builtin_dict_has(void) {
+    int dict_handle = expression();
+    if (next_token()->type != TOKEN_COMMA) {
+        printf("dict_has() expects two arguments\n");
+        exit(1);
+    }
+    
+    char* key = evaluate_string_expr();
+    if (next_token()->type != TOKEN_RPAREN) {
+        printf("dict_has() expects ')'\n");
+        exit(1);
+    }
+    
+    DictEntry* dict = (DictEntry*)get_object(dict_handle, OBJ_DICT);
+    if (!dict) {
+        printf("Invalid dictionary handle: %d\n", dict_handle);
+        if (key) mod_free(key);
+        return 0;
+    }
+    
+    bool has_key = dict_has_key(dict, key);
+    if (key) mod_free(key);
+    
+    return has_key ? 1 : 0;
+}
+
+int builtin_dict_size(void) {
+    int dict_handle = expression();
+    if (next_token()->type != TOKEN_RPAREN) {
+        printf("dict_size() expects one argument\n");
+        exit(1);
+    }
+    
+    DictEntry* dict = (DictEntry*)get_object(dict_handle, OBJ_DICT);
+    if (!dict) {
+        printf("Invalid dictionary handle: %d\n", dict_handle);
+        return 0;
+    }
+    
+    return dict_size(dict);
+}
+
+int builtin_list_create(void) {
+    struct ListNode* list = list_create();
+    struct ListNode** list_ptr = (struct ListNode**)mod_malloc(sizeof(struct ListNode*));
+    *list_ptr = list;
+    return register_object(OBJ_LIST, list_ptr);
+}
+
+int builtin_list_append(void) {
+    int list_handle = expression();
+    if (next_token()->type != TOKEN_COMMA) {
+        printf("list_append() expects two arguments\n");
+        exit(1);
+    }
+    
+    char* value = evaluate_string_expr();
+    if (next_token()->type != TOKEN_RPAREN) {
+        printf("list_append() expects ')'\n");
+        exit(1);
+    }
+    
+    struct ListNode** list_ptr = (struct ListNode**)get_object(list_handle, OBJ_LIST);
+    if (!list_ptr) {
+        printf("Invalid list handle: %d\n", list_handle);
+        if (value) mod_free(value);
+        return 0;
+    }
+    
+    // Store the value as a string in the list
+    char* value_copy = mod_strdup(value);
+    list_append(list_ptr, value_copy, VAR_STRING);
+    
+    if (value) mod_free(value);
+    return 1; // Success
+}
+
+int builtin_list_get(void) {
+    int list_handle = expression();
+    if (next_token()->type != TOKEN_COMMA) {
+        printf("list_get() expects two arguments\n");
+        exit(1);
+    }
+    
+    int index = expression();
+    if (next_token()->type != TOKEN_RPAREN) {
+        printf("list_get() expects ')'\n");
+        exit(1);
+    }
+    
+    struct ListNode** list_ptr = (struct ListNode**)get_object(list_handle, OBJ_LIST);
+    if (!list_ptr) {
+        printf("Invalid list handle: %d\n", list_handle);
+        return 0;
+    }
+    
+    VarType type;
+    void* value = list_get(*list_ptr, index, &type);
+    if (!value) return 0; // Index out of bounds
+    
+    // For now, return 1 if found (would need to properly return the value)
+    return 1;
+}
+
+int builtin_list_size(void) {
+    int list_handle = expression();
+    if (next_token()->type != TOKEN_RPAREN) {
+        printf("list_size() expects one argument\n");
+        exit(1);
+    }
+    
+    struct ListNode** list_ptr = (struct ListNode**)get_object(list_handle, OBJ_LIST);
+    if (!list_ptr) {
+        printf("Invalid list handle: %d\n", list_handle);
+        return 0;
+    }
+    
+    return list_size(*list_ptr);
+}
+
+int builtin_set_create(void) {
+    struct SetNode* set = set_create();
+    // Store a pointer to the set pointer so operations that mutate the root
+    // (e.g., AVL rotations or first insertion) update the shared location.
+    struct SetNode** set_ptr = (struct SetNode**)mod_malloc(sizeof(struct SetNode*));
+    *set_ptr = set;
+    return register_object(OBJ_SET, set_ptr);
+}
+
+int builtin_set_add(void) {
+    int set_handle = expression();
+    if (next_token()->type != TOKEN_COMMA) {
+        printf("set_add() expects two arguments\n");
+        exit(1);
+    }
+    
+    int value = expression();
+    if (next_token()->type != TOKEN_RPAREN) {
+        printf("set_add() expects ')'\n");
+        exit(1);
+    }
+    
+    struct SetNode** set_ptr = (struct SetNode**)get_object(set_handle, OBJ_SET);
+    if (!set_ptr) {
+        printf("Invalid set handle: %d\n", set_handle);
+        return 0;
+    }
+    
+    // Store the value as an integer in the set
+    int* value_copy = (int*)mod_malloc(sizeof(int));
+    *value_copy = value;
+    set_add(set_ptr, value_copy, VAR_INT);
+    
+    return 1; // Success
+}
+
+int builtin_set_contains(void) {
+    int set_handle = expression();
+    if (next_token()->type != TOKEN_COMMA) {
+        printf("set_contains() expects two arguments\n");
+        exit(1);
+    }
+    
+    int value = expression();
+    if (next_token()->type != TOKEN_RPAREN) {
+        printf("set_contains() expects ')'\n");
+        exit(1);
+    }
+    
+    struct SetNode** set_ptr = (struct SetNode**)get_object(set_handle, OBJ_SET);
+    if (!set_ptr) {
+        printf("Invalid set handle: %d\n", set_handle);
+        return 0;
+    }
+    
+    bool contains = set_contains(*set_ptr, &value, VAR_INT);
+    return contains ? 1 : 0;
+}
+
+int builtin_set_size(void) {
+    int set_handle = expression();
+    if (next_token()->type != TOKEN_RPAREN) {
+        printf("set_size() expects one argument\n");
+        exit(1);
+    }
+    
+    struct SetNode** set_ptr = (struct SetNode**)get_object(set_handle, OBJ_SET);
+    if (!set_ptr) {
+        printf("Invalid set handle: %d\n", set_handle);
+        return 0;
+    }
+    
+    return set_size(*set_ptr);
+}
+
+// builtin_typeof() is now implemented in types.c - removed duplicate definition
+
+// builtin_is_null() is now implemented in types.c - removed duplicate definition

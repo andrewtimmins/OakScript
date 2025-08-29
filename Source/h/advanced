@@ -1,0 +1,231 @@
+#ifndef ADVANCED_TYPES_H
+#define ADVANCED_TYPES_H
+
+#include "h.engine"
+#include "h.memory"
+
+// Advanced Data Structures
+
+// Dictionary/Map Entry
+struct DictEntry {
+    char* key;
+    void* value;
+    VarType value_type;
+    struct DictEntry* next;  // For collision chaining
+};
+
+// Dynamic List
+struct ListNode {
+    void* data;
+    VarType type;
+    struct ListNode* next;
+    struct ListNode* prev;
+};
+
+// Set Node (binary tree)
+struct SetNode {
+    void* value;
+    VarType type;
+    struct SetNode* left;
+    struct SetNode* right;
+    int height;  // For AVL balancing
+};
+
+// Lambda Function
+struct LambdaFunc {
+    char* params[MAX_PARAMS];
+    int param_count;
+    char* body;           // Source code of function body
+    Variable* closure;    // Captured variables
+    int closure_count;
+};
+
+// Regular Expression Pattern - struct definition is in c.strings
+typedef struct RegexPattern RegexPattern;
+
+// Optional Value
+struct OptionalValue {
+    bool has_value;
+    void* value;
+    VarType type;
+};
+
+// Union Value
+struct UnionValue {
+    VarType* allowed_types;
+    int type_count;
+    void* value;
+    VarType current_type;
+};
+
+// Exception Value
+struct ExceptionValue {
+    char* type;
+    char* message;
+    char* stack_trace;
+    int line_number;
+    char* file_name;
+};
+
+// String Interpolation Support - struct definition is in c.strings
+typedef struct InterpolatedString InterpolatedString;
+
+// Pattern Matching
+typedef enum {
+    PATTERN_LITERAL,
+    PATTERN_RANGE,
+    PATTERN_WILDCARD,
+    PATTERN_TYPE,
+    PATTERN_GUARD
+} PatternType;
+
+typedef struct {
+    PatternType type;
+    union {
+        struct {
+            void* value;
+            VarType value_type;
+        } literal;
+        struct {
+            int start;
+            int end;
+        } range;
+        struct {
+            VarType expected_type;
+        } type_pattern;
+        struct {
+            char* condition;
+        } guard;
+    } data;
+} Pattern;
+
+typedef struct {
+    Pattern pattern;
+    char* action;         // Code to execute when pattern matches
+} MatchCase;
+
+// Function prototypes for advanced features
+
+// Object management
+void release_object(int handle);
+
+// Dictionary operations
+DictEntry* dict_create(void);
+void dict_set(DictEntry* dict, const char* key, void* value, VarType type);
+void* dict_get(DictEntry* dict, const char* key, VarType* type);
+bool dict_has_key(DictEntry* dict, const char* key);
+void dict_remove(DictEntry* dict, const char* key);
+void dict_destroy(DictEntry* dict);
+int dict_size(DictEntry* dict);
+char** dict_keys(DictEntry* dict, int* count);
+
+// List operations
+struct ListNode* list_create(void);
+void list_append(struct ListNode** list, void* value, VarType type);
+void list_prepend(struct ListNode** list, void* value, VarType type);
+void* list_get(struct ListNode* list, int index, VarType* type);
+void list_set(struct ListNode* list, int index, void* value, VarType type);
+void list_remove(struct ListNode** list, int index);
+int list_size(struct ListNode* list);
+void list_destroy(struct ListNode* list);
+struct ListNode* list_map(struct ListNode* list, struct LambdaFunc* func);
+struct ListNode* list_filter(struct ListNode* list, struct LambdaFunc* func);
+void* list_reduce(struct ListNode* list, struct LambdaFunc* func, void* initial);
+
+// Set operations
+struct SetNode* set_create(void);
+void set_add(struct SetNode** set, void* value, VarType type);
+bool set_contains(struct SetNode* set, void* value, VarType type);
+void set_remove(struct SetNode** set, void* value, VarType type);
+int set_size(struct SetNode* set);
+void set_destroy(struct SetNode* set);
+struct SetNode* set_union(struct SetNode* set1, struct SetNode* set2);
+struct SetNode* set_intersection(struct SetNode* set1, struct SetNode* set2);
+
+// Lambda operations
+struct LambdaFunc* lambda_create(char** params, int param_count, char* body);
+void* lambda_call(struct LambdaFunc* func, void** args, VarType* arg_types, int arg_count);
+void lambda_destroy(struct LambdaFunc* func);
+
+// Regex operations
+RegexPattern* regex_compile(const char* pattern, int flags);
+bool regex_match(RegexPattern* regex, const char* text);
+char** regex_find_all(RegexPattern* regex, const char* text, int* count);
+char* regex_replace(RegexPattern* regex, const char* text, const char* replacement);
+void regex_destroy(RegexPattern* regex);
+
+// Optional type operations
+struct OptionalValue* optional_create(void* value, VarType type);
+struct OptionalValue* optional_empty(void);
+bool optional_has_value(struct OptionalValue* opt);
+void* optional_get(struct OptionalValue* opt, VarType* type);
+void optional_destroy(struct OptionalValue* opt);
+
+// Union type operations
+struct UnionValue* union_create(VarType* types, int type_count);
+bool union_set(struct UnionValue* union_val, void* value, VarType type);
+void* union_get(struct UnionValue* union_val, VarType* type);
+bool union_is_type(struct UnionValue* union_val, VarType type);
+void union_destroy(struct UnionValue* union_val);
+
+// Exception operations
+struct ExceptionValue* exception_create(const char* type, const char* message);
+void exception_set_location(struct ExceptionValue* exc, const char* file, int line);
+void exception_add_stack_trace(struct ExceptionValue* exc, const char* function);
+void exception_destroy(struct ExceptionValue* exc);
+
+// String interpolation  
+InterpolatedString* parse_interpolated_string(const char* str);
+char* evaluate_interpolated_string(InterpolatedString* istr);
+void interpolated_string_destroy(InterpolatedString* istr);
+
+// Pattern matching
+bool pattern_match(Pattern* pattern, void* value, VarType type);
+void* execute_match(void* value, VarType type, MatchCase* cases, int case_count);
+
+// Type checking and conversion
+bool is_compatible_type(VarType from, VarType to);
+void* convert_type(void* value, VarType from, VarType to);
+const char* type_name(VarType type);
+
+// Built-in function extensions for advanced features
+int builtin_dict_create(void);
+int builtin_dict_set(void);
+int builtin_dict_get(void);
+int builtin_dict_has(void);
+int builtin_dict_remove(void);
+int builtin_dict_size(void);
+int builtin_dict_keys(void);
+
+int builtin_list_create(void);
+int builtin_list_append(void);
+int builtin_list_get(void);
+int builtin_list_set(void);
+int builtin_list_remove(void);
+int builtin_list_size(void);
+int builtin_list_map(void);
+int builtin_list_filter(void);
+int builtin_list_reduce(void);
+
+int builtin_set_create(void);
+int builtin_set_add(void);
+int builtin_set_contains(void);
+int builtin_set_remove(void);
+int builtin_set_size(void);
+int builtin_set_union(void);
+int builtin_set_intersection(void);
+
+int builtin_regex_compile(void);
+int builtin_regex_match(void);
+int builtin_regex_find_all(void);
+int builtin_regex_replace(void);
+
+int builtin_optional_create(void);
+int builtin_optional_has_value(void);
+int builtin_optional_get(void);
+
+int builtin_typeof(void);
+int builtin_is_null(void);
+int builtin_match_pattern(void);
+
+#endif /* ADVANCED_TYPES_H */

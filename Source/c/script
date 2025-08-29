@@ -8,18 +8,59 @@
 #include "h.memory" // remap malloc/free to module-safe versions
 #include "h.engine"
 #include "h.variables"
-#include "h.string"
+#include "h.strings"
 #include "h.math"
 #include "h.swi"
 #include "h.debug"
+#include "h.advanced"
 #ifndef __uintptr_t_defined
 typedef unsigned int uintptr_t;
 #define __uintptr_t_defined
 #endif
 
+// External declarations for advanced built-in functions
+extern int builtin_dict_create(void);
+extern int builtin_dict_set(void);
+extern int builtin_dict_get(void);
+extern int builtin_dict_has(void);
+extern int builtin_dict_size(void);
+extern int builtin_list_create(void);
+extern int builtin_list_append(void);
+extern int builtin_list_get(void);
+extern int builtin_list_size(void);
+extern int builtin_set_create(void);
+extern int builtin_set_add(void);
+extern int builtin_set_contains(void);
+extern int builtin_set_size(void);
+extern int builtin_interpolate(void);
+extern int builtin_multiline(void);
+extern int builtin_regex_compile(void);
+extern int builtin_regex_match(void);
+extern int builtin_lambda(void);
+extern int builtin_map(void);
+extern int builtin_filter(void);
+extern int builtin_reduce(void);
+extern int builtin_compose(void);
+extern int builtin_curry(void);
+extern int builtin_typeof(void);
+extern int builtin_is_type(void);
+extern int builtin_is_null(void);
+extern int builtin_cast(void);
+extern int builtin_optional_create(void);
+extern int builtin_optional_has_value(void);
+extern int builtin_optional_get(void);
+extern int builtin_union_create(void);
+extern int builtin_union_set(void);
+extern int builtin_throw(void);
+extern int builtin_define_exception(void);
+extern int builtin_exception_type(void);
+extern int builtin_exception_message(void);
+extern int builtin_range(void);
+
 // Forward declarations
 int swi_builtin(void);
 int swi_error_builtin(void);
+void match_statement(void);
 
 Token tokens[MAX_TOKENS];
 int token_count = 0;
@@ -277,8 +318,8 @@ void tokenize_with_includes(char *source, const char *source_filename) {
                 }
             }
             
-            // Check for decimal point
-            if (!is_hex && *p == '.') {
+            // Check for decimal point, but avoid consuming the first '.' of a range '..'
+            if (!is_hex && *p == '.' && *(p + 1) != '.') {
                 is_float = true;
                 p++; // Skip the '.'
                 float_value = (float)value;
@@ -363,6 +404,10 @@ void tokenize_with_includes(char *source, const char *source_filename) {
                 tokens[token_count].type = TOKEN_CASE;
             } else if (mod_strcmp(ident, "default") == 0) {
                 tokens[token_count].type = TOKEN_DEFAULT;
+            } else if (mod_strcmp(ident, "match") == 0) {
+                tokens[token_count].type = TOKEN_MATCH;
+            } else if (mod_strcmp(ident, "in") == 0) {
+                tokens[token_count].type = TOKEN_IN;
             } else if (mod_strcmp(ident, "const") == 0) {
                 tokens[token_count].type = TOKEN_CONST;
             } else if (mod_strcmp(ident, "try") == 0) {
@@ -376,7 +421,13 @@ void tokenize_with_includes(char *source, const char *source_filename) {
             set_token_meta(&tokens[token_count], line_num, source_filename);
             token_count++;
         } else if (*p == '=') {
-            if (*(p + 1) == '=') {
+            // Prioritise '=>' over '==' and '='
+            if (*(p + 1) == '>') {
+                tokens[token_count].type = TOKEN_ARROW;
+                set_token_meta(&tokens[token_count], line_num, source_filename);
+                token_count++;
+                p += 2;
+            } else if (*(p + 1) == '=') {
                 tokens[token_count].type = TOKEN_EQ;
                 set_token_meta(&tokens[token_count], line_num, source_filename);
                 token_count++;
@@ -387,6 +438,12 @@ void tokenize_with_includes(char *source, const char *source_filename) {
                 token_count++;
                 p++;
             }
+        } else if (*p == '-' && *(p + 1) == '>') {
+            // Support '->' arrow as alias, if TOKEN_ARROW is used elsewhere
+            tokens[token_count].type = TOKEN_ARROW;
+            set_token_meta(&tokens[token_count], line_num, source_filename);
+            token_count++;
+            p += 2;
         } else if (*p == '!') {
             if (*(p + 1) == '=') {
                 tokens[token_count].type = TOKEN_NEQ;
@@ -400,6 +457,12 @@ void tokenize_with_includes(char *source, const char *source_filename) {
                 token_count++;
                 p++;
             }
+        } else if (*p == '.' && *(p + 1) == '.') {
+            // Range token '..'
+            tokens[token_count].type = TOKEN_RANGE;
+            set_token_meta(&tokens[token_count], line_num, source_filename);
+            token_count++;
+            p += 2;
         } else if (*p == '<') {
             if (*(p + 1) == '=') {
                 tokens[token_count].type = TOKEN_LTE;
@@ -1524,7 +1587,136 @@ int function_call(char *name) {
             mod_free(filename);
             mod_free(content);
             return success ? 1 : 0;
+        
+        // Advanced Data Structure Functions
+        } else if (mod_strcmp(name, "dict") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after dict\n"); exit(1); }
+            if (next_token()->type != TOKEN_RPAREN) { printf("dict() expects no arguments\n"); exit(1); }
+            return builtin_dict_create();
+        } else if (mod_strcmp(name, "dict_set") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after dict_set\n"); exit(1); }
+            return builtin_dict_set();
+        } else if (mod_strcmp(name, "dict_get") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after dict_get\n"); exit(1); }
+            return builtin_dict_get();
+        } else if (mod_strcmp(name, "dict_has") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after dict_has\n"); exit(1); }
+            return builtin_dict_has();
+        } else if (mod_strcmp(name, "dict_size") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after dict_size\n"); exit(1); }
+            return builtin_dict_size();
+            
+        } else if (mod_strcmp(name, "list") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after list\n"); exit(1); }
+            if (next_token()->type != TOKEN_RPAREN) { printf("list() expects no arguments\n"); exit(1); }
+            return builtin_list_create();
+        } else if (mod_strcmp(name, "list_append") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after list_append\n"); exit(1); }
+            return builtin_list_append();
+        } else if (mod_strcmp(name, "list_get") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after list_get\n"); exit(1); }
+            return builtin_list_get();
+        } else if (mod_strcmp(name, "list_size") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after list_size\n"); exit(1); }
+            return builtin_list_size();
+            
+        } else if (mod_strcmp(name, "set") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after set\n"); exit(1); }
+            if (next_token()->type != TOKEN_RPAREN) { printf("set() expects no arguments\n"); exit(1); }
+            return builtin_set_create();
+        } else if (mod_strcmp(name, "set_add") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after set_add\n"); exit(1); }
+            return builtin_set_add();
+        } else if (mod_strcmp(name, "set_contains") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after set_contains\n"); exit(1); }
+            return builtin_set_contains();
+        } else if (mod_strcmp(name, "set_size") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after set_size\n"); exit(1); }
+            return builtin_set_size();
+            
+        // String Processing Functions
+        } else if (mod_strcmp(name, "interpolate") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after interpolate\n"); exit(1); }
+            return builtin_interpolate();
+        } else if (mod_strcmp(name, "multiline") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after multiline\n"); exit(1); }
+            return builtin_multiline();
+        } else if (mod_strcmp(name, "regex") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after regex\n"); exit(1); }
+            return builtin_regex_compile();
+        } else if (mod_strcmp(name, "regex_match") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after regex_match\n"); exit(1); }
+            return builtin_regex_match();
+            
+        // Functional Programming Functions
+        } else if (mod_strcmp(name, "lambda") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after lambda\n"); exit(1); }
+            return builtin_lambda();
+        } else if (mod_strcmp(name, "map") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after map\n"); exit(1); }
+            return builtin_map();
+        } else if (mod_strcmp(name, "filter") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after filter\n"); exit(1); }
+            return builtin_filter();
+        } else if (mod_strcmp(name, "reduce") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after reduce\n"); exit(1); }
+            return builtin_reduce();
+        } else if (mod_strcmp(name, "compose") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after compose\n"); exit(1); }
+            return builtin_compose();
+        } else if (mod_strcmp(name, "curry") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after curry\n"); exit(1); }
+            return builtin_curry();
+            
+        // Type System Functions
+        } else if (mod_strcmp(name, "typeof") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after typeof\n"); exit(1); }
+            return builtin_typeof();
+        } else if (mod_strcmp(name, "is_type") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after is_type\n"); exit(1); }
+            return builtin_is_type();
+        } else if (mod_strcmp(name, "is_null") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after is_null\n"); exit(1); }
+            return builtin_is_null();
+        } else if (mod_strcmp(name, "cast") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after cast\n"); exit(1); }
+            return builtin_cast();
+        } else if (mod_strcmp(name, "optional_create") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after optional_create\n"); exit(1); }
+            return builtin_optional_create();
+        } else if (mod_strcmp(name, "optional_has_value") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after optional_has_value\n"); exit(1); }
+            return builtin_optional_has_value();
+        } else if (mod_strcmp(name, "optional_get") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after optional_get\n"); exit(1); }
+            return builtin_optional_get();
+        } else if (mod_strcmp(name, "union_create") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after union_create\n"); exit(1); }
+            return builtin_union_create();
+        } else if (mod_strcmp(name, "union_set") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after union_set\n"); exit(1); }
+            return builtin_union_set();
+            
+        // Exception Handling Functions
+        } else if (mod_strcmp(name, "throw") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after throw\n"); exit(1); }
+            return builtin_throw();
+        } else if (mod_strcmp(name, "define_exception") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after define_exception\n"); exit(1); }
+            return builtin_define_exception();
+        } else if (mod_strcmp(name, "exception_type") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after exception_type\n"); exit(1); }
+            return builtin_exception_type();
+        } else if (mod_strcmp(name, "exception_message") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after exception_message\n"); exit(1); }
+            return builtin_exception_message();
+            
+        // Control Flow Functions
+        } else if (mod_strcmp(name, "range") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after range\n"); exit(1); }
+            return builtin_range();
         }
+        
         printf("Undefined function: %s\n", name);
         exit(1);
     }
@@ -2124,6 +2316,9 @@ void statement(void) {
         case TOKEN_SWITCH:
             switch_statement();
             break;
+        case TOKEN_MATCH:
+            match_statement();
+            break;
         case TOKEN_TRY:
             try_statement();
             break;
@@ -2346,118 +2541,10 @@ void switch_statement(void) {
     }
 }
 
-void try_statement(void) {
-    next_token(); // Consume 'try'
-    
-    // Save previous error state
-    bool prev_in_try = is_in_try_block;
-    bool prev_error = error_occurred;
-    char prev_message[256];
-    mod_strcpy(prev_message, error_message);
-    
-    // Set up try block state
-    is_in_try_block = true;
-    error_occurred = false;
-    error_message[0] = '\0';
-    
-    // Execute try block
-    int nesting = 1;
-    while (nesting > 0 && peek_token()->type != TOKEN_EOF && !error_occurred) {
-        Token *token = peek_token();
-        
-        if (token->type == TOKEN_CATCH) {
-            nesting--;
-            break; // Exit try block to handle catch
-        } else if (token->type == TOKEN_END) {
-            nesting--;
-            if (nesting == 0) {
-                next_token(); // Consume 'end'
-                break;
-            }
-        } else if (token->type == TOKEN_TRY) {
-            // Nested try
-            nesting++;
-            try_statement();
-        } else {
-            statement();
-            if (function_return_flag || loop_break_flag || loop_continue_flag) {
-                break; // Propagate control flow
-            }
-            // Check for errors after each statement in try block
-            if (error_occurred) {
-                break; // Exit try block on error
-            }
-        }
-    }
-    
-    // Handle catch block
-    if (peek_token()->type == TOKEN_CATCH) {
-        next_token(); // Consume 'catch'
-        
-        if (error_occurred) {
-            // Optional error message variable
-            if (peek_token()->type == TOKEN_IDENT) {
-                char error_var_name[MAX_VAR_NAME];
-                mod_strcpy(error_var_name, next_token()->lexeme);
-                set_variable_value(error_var_name, VAR_STRING, error_message);
-            }
-            
-            // Execute catch block
-            nesting = 1;
-            while (nesting > 0 && peek_token()->type != TOKEN_EOF) {
-                Token *token = peek_token();
-                
-                if (token->type == TOKEN_END) {
-                    nesting--;
-                    next_token(); // Consume 'end'
-                    if (nesting == 0) {
-                        break;
-                    }
-                } else if (token->type == TOKEN_TRY) {
-                    // Nested try
-                    nesting++;
-                    try_statement();
-                } else {
-                    statement();
-                    if (function_return_flag || loop_break_flag || loop_continue_flag) {
-                        break; // Propagate control flow
-                    }
-                }
-            }
-        } else {
-            // Skip catch block if no error occurred
-            if (peek_token()->type == TOKEN_IDENT) {
-                next_token(); // Skip error variable name
-            }
-            
-            nesting = 1;
-            while (nesting > 0 && peek_token()->type != TOKEN_EOF) {
-                Token *token = peek_token();
-                
-                if (token->type == TOKEN_END) {
-                    nesting--;
-                    next_token(); // Consume 'end'
-                    if (nesting == 0) {
-                        break;
-                    }
-                } else if (token->type == TOKEN_TRY) {
-                    // Nested try
-                    nesting++;
-                    next_token(); // Skip nested try
-                } else {
-                    next_token(); // Skip statement
-                }
-            }
-        }
-    } else if (peek_token()->type == TOKEN_END) {
-        next_token(); // Consume 'end' if no catch block
-    }
-    
-    // Restore previous error state
-    is_in_try_block = prev_in_try;
-    error_occurred = prev_error;
-    mod_strcpy(error_message, prev_message);
-}
+// try_statement() is now implemented in exceptions.c - removed duplicate definition
+// Forward declaration for external function
+extern void try_statement(void);
+extern void match_statement(void);
 
 void interpret(void) {
     current_token = 0;
@@ -3007,13 +3094,33 @@ static void for_statement(void) {
     next_token(); // consume 'for'
     if (peek_token()->type != TOKEN_IDENT) { printf("Expected loop variable name after 'for'\n"); exit(1);} 
     char varname[MAX_VAR_NAME]; strcpy(varname, next_token()->lexeme);
-    if (next_token()->type != TOKEN_ASSIGN) { printf("Expected '=' after loop var\n"); exit(1);} 
-    int start = expression();
-    if (next_token()->type != TOKEN_TO) { printf("Expected 'to' in for loop\n"); exit(1);} 
-    int endv = expression();
+
+    int start = 0;
+    int endv = 0;
     int step = 1;
-    if (peek_token()->type == TOKEN_STEP) { next_token(); step = expression(); if (step == 0) { printf("step cannot be 0\n"); exit(1);} }
-    if (next_token()->type != TOKEN_DO) { printf("Expected 'do' after for range\n"); exit(1);} 
+
+    Token *after_var = peek_token();
+    if (after_var->type == TOKEN_ASSIGN) {
+        // Classic: for i = a to b [step n] do
+        next_token(); // consume '='
+        start = expression();
+        if (next_token()->type != TOKEN_TO) { printf("Expected 'to' in for loop\n"); exit(1);} 
+        endv = expression();
+        if (peek_token()->type == TOKEN_STEP) { next_token(); step = expression(); if (step == 0) { printf("step cannot be 0\n"); exit(1);} }
+        if (next_token()->type != TOKEN_DO) { printf("Expected 'do' after for range\n"); exit(1);} 
+    } else if (after_var->type == TOKEN_IN) {
+        // Enhanced: for i in a..b [step n] do
+        next_token(); // consume 'in'
+        start = expression();
+        if (peek_token()->type != TOKEN_RANGE) { printf("Expected '..' in for-in range\n"); exit(1);} 
+        next_token(); // consume '..'
+        endv = expression();
+        if (peek_token()->type == TOKEN_STEP) { next_token(); step = expression(); if (step == 0) { printf("step cannot be 0\n"); exit(1);} }
+        if (next_token()->type != TOKEN_DO) { printf("Expected 'do' after for-in range\n"); exit(1);} 
+    } else {
+        printf("Expected '=' or 'in' after loop var\n");
+        exit(1);
+    }
 
     // Setup var and loop
     int body_start = current_token;

@@ -28,11 +28,24 @@ typedef enum {
     TOKEN_BREAK, TOKEN_CONTINUE, TOKEN_TRUE, TOKEN_FALSE, TOKEN_AND,
     TOKEN_OR, TOKEN_NOT, TOKEN_FUNCTION, TOKEN_RETURN, TOKEN_COMMA,
     TOKEN_INCLUDE, TOKEN_STRING, TOKEN_EXEC, TOKEN_EOF,
-    // Quick wins: New token types
+    // Enhanced token types
     TOKEN_INCREMENT, TOKEN_DECREMENT, TOKEN_PLUS_ASSIGN, TOKEN_MINUS_ASSIGN,
     TOKEN_MULTIPLY_ASSIGN, TOKEN_DIVIDE_ASSIGN, TOKEN_SWITCH, TOKEN_CASE,
     TOKEN_DEFAULT, TOKEN_CONST, TOKEN_LBRACKET, TOKEN_RBRACKET, TOKEN_DOT,
-    TOKEN_TRY, TOKEN_CATCH
+    TOKEN_TRY, TOKEN_CATCH, TOKEN_FINALLY,
+    // Advanced data structure tokens
+    TOKEN_LBRACE, TOKEN_RBRACE, TOKEN_COLON, TOKEN_ARROW, TOKEN_PIPE,
+    TOKEN_QUESTION, TOKEN_NULL, TOKEN_NEW, TOKEN_CLASS, TOKEN_EXTENDS,
+    TOKEN_IMPORT, TOKEN_EXPORT, TOKEN_MODULE, TOKEN_AS, TOKEN_FROM,
+    // Pattern matching and advanced control flow
+    TOKEN_MATCH, TOKEN_IN, TOKEN_RANGE, TOKEN_WILDCARD, TOKEN_LAMBDA,
+    TOKEN_MAP, TOKEN_FILTER, TOKEN_REDUCE, TOKEN_FOREACH,
+    // String and regex tokens
+    TOKEN_MULTISTRING, TOKEN_INTERPOLATION, TOKEN_REGEX,
+    // Type system tokens
+    TOKEN_OPTIONAL, TOKEN_UNION, TOKEN_GENERIC, TOKEN_TYPEOF,
+    // Exception handling
+    TOKEN_THROW, TOKEN_ASYNC, TOKEN_AWAIT
 } TokenType;
 
 typedef struct {
@@ -56,8 +69,29 @@ typedef enum {
     VAR_FLOAT,     // Floating-point numbers
     VAR_FILE,      // File handles for I/O operations
     VAR_BOOL,      // Boolean true/false values
-    VAR_TIME       // Date/time values
+    VAR_TIME,      // Date/time values
+    // Advanced data structures
+    VAR_DICT,      // Dictionary/map (key-value pairs)
+    VAR_LIST,      // Dynamic list/array
+    VAR_SET,       // Set (unique values)
+    VAR_LAMBDA,    // Lambda function
+    VAR_REGEX,     // Regular expression
+    VAR_OPTIONAL,  // Optional type (can be null)
+    VAR_UNION,     // Union type (multiple possible types)
+    VAR_EXCEPTION, // Exception object
+    VAR_FUTURE,    // Async future/promise
+    VAR_NULL       // Null value
 } VarType;
+
+// Forward declarations for advanced data structures
+typedef struct DictEntry DictEntry;
+typedef struct ListNode ListNode;
+typedef struct SetNode SetNode;
+typedef struct LambdaFunc LambdaFunc;
+typedef struct RegexPattern RegexPattern;
+typedef struct OptionalValue OptionalValue;
+typedef struct UnionValue UnionValue;
+typedef struct ExceptionValue ExceptionValue;
 
 typedef struct {
     char name[MAX_VAR_NAME];
@@ -95,6 +129,28 @@ typedef struct {
         void* file_value;  // Use void* instead of FILE* to avoid issues
         int bool_value;    // Use int instead of bool to avoid issues
         unsigned int time_value;  // Use unsigned int instead of time_t
+        // Advanced data structures
+        struct {
+            DictEntry* entries;
+            int count;
+            int capacity;
+        } dict_value;
+        struct {
+            void** items;
+            VarType* types;
+            int count;
+            int capacity;
+        } list_value;
+        struct {
+            SetNode* root;
+            int count;
+        } set_value;
+        LambdaFunc* lambda_value;
+        RegexPattern* regex_value;
+        OptionalValue* optional_value;
+        UnionValue* union_value;
+        ExceptionValue* exception_value;
+        void* future_value;  // For async operations
     } value;
 } Variable;
 

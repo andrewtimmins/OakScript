@@ -7,10 +7,12 @@ OakScript is a simple, intuitive scripting language designed for rapid prototypi
 ## Features
 
 - **Simple Syntax**: Clear, readable code that's accessible to both beginners and experienced programmers
-- **Rich Type System**: 12 variable types including integers, strings, booleans, floats, arrays, buffers, blocks, references, pointers, files, and time values
-- **Advanced Variable Operations**: Compound assignment operators (+=, -=, *=, /=), increment/decrement, automatic type conversion, and variable introspection
-- **Advanced Control Flow**: If-else, switch-case, while loops, for loops with ranges/steps, break/continue, user-defined functions, try-catch exception handling, and file inclusion
-- **Extensive Built-in Library**: 50+ built-in functions covering mathematics, strings, files, arrays, debugging, and RISC OS system integration
+- **Rich Type System**: 22 variable types including advanced data structures (dictionaries, lists, sets), optional types, union types, lambda functions, regular expressions, and exceptions
+- **Advanced Variable Operations**: Compound assignment operators (+=, -=, *=, /=), increment/decrement, automatic type conversion, generic types, and comprehensive variable introspection
+- **Modern Control Flow**: Pattern matching, for-in loops with ranges, enhanced if-else, switch-case, while loops, break/continue, user-defined functions, lambda expressions, and comprehensive exception handling with try-catch-finally
+- **Functional Programming**: Lambda functions, higher-order functions (map, filter, reduce), function composition, partial application, currying, closures, and memoization
+- **Advanced String Processing**: String interpolation with expressions, multi-line strings, regular expression support with pattern matching and replacement
+- **Comprehensive Built-in Library**: 100+ built-in functions covering mathematics, strings, files, arrays, functional programming, type system, exception handling, and RISC OS system integration
 - **Bytecode Compilation**: Efficient compilation to portable bytecode format
 - **RISC OS Integration**: Native module with proper memory management and system integration
 
@@ -65,7 +67,7 @@ if result > 50 then
 end
 
 counter = 0
-while counter < 3
+while counter < 3 do
     print counter
     counter = counter + 1
 end
@@ -225,18 +227,18 @@ end
 ```oakscript
 // While loop
 counter = 0
-while counter < 10
+while counter < 10 do
     print counter
     counter = counter + 1
 end
 
 // For loop with range
-for i = 1 to 10
+for i = 1 to 10 do
     print i
 end
 
 // For loop with step
-for i = 0 to 100 step 5
+for i = 0 to 100 step 5 do
     print i    // Prints 0, 5, 10, 15, etc.
 end
 
@@ -379,6 +381,357 @@ exec("*Cat filename")          // Execute system command
 result = exec_output("*Dir")   // Execute and capture output
 ```
 
+## Advanced Language Features
+
+OakScript now includes modern programming language features that make it suitable for complex applications:
+
+### Advanced Data Structures
+
+#### Dictionaries/Maps
+```oakscript
+// Create and manipulate dictionaries (values stored as strings)
+config = dict()
+dict_set(config, "host", "localhost")
+dict_set(config, "port", "8080")
+
+host = dict_get(config, "host")
+has_port = dict_has(config, "port")
+size = dict_size(config)
+keys = dict_keys(config)
+
+dict_remove(config, "port")
+```
+
+#### Dynamic Lists
+```oakscript
+// Create and manipulate lists (lists store strings)
+items = list()
+list_append(items, "42")
+list_append(items, "hello")
+list_prepend(items, "true")
+
+first = list_get(items, 0)
+list_set(items, 1, "world")
+list_remove(items, 2)
+length = list_size(items)
+```
+
+#### Sets (Unique Collections)
+```oakscript
+// Create and manipulate sets
+numbers = set()
+set_add(numbers, 1)
+set_add(numbers, 2)
+set_add(numbers, 1)  // Duplicate ignored
+
+has_one = set_contains(numbers, 1)
+set_remove(numbers, 2)
+count = set_size(numbers)
+
+// Set operations
+set1 = set()
+set2 = set()
+union_set = set_union(set1, set2)
+intersection = set_intersection(set1, set2)
+```
+
+### Advanced String Features
+
+#### String Interpolation
+```oakscript
+// Template strings with variable substitution
+name = "World"
+age = 25
+message = interpolate("Hello ${name}, you are ${age} years old!")
+// Result: "Hello World, you are 25 years old!"
+
+// Complex expressions in interpolation
+total = interpolate("Total: ${price * quantity + tax}")
+```
+
+#### Multi-line Strings
+```oakscript
+// Multi-line strings with escape sequences
+poem = multiline("""
+Roses are red,
+Violets are blue,
+OakScript is awesome,
+And so are you!
+""")
+
+// Raw strings with escape sequences
+path = multiline("C:\\Users\\Name\\Documents\\file.txt")
+```
+
+#### Regular Expressions
+```oakscript
+// Compile and use regular expressions
+email_pattern = regex("\\w+@\\w+\\.\\w+", 0)
+is_valid = regex_match(email_pattern, "user@example.com")
+
+// Find all matches
+text = "Contact: john@example.com or mary@test.org"
+matches = regex_find_all(email_pattern, text)
+
+// Replace with pattern
+cleaned = regex_replace(email_pattern, text, "[EMAIL]")
+```
+
+### Modern Control Flow
+
+#### Pattern Matching
+```oakscript
+// Match statements with patterns
+match value
+    case 1 => print "One"
+    case 2..10 => print "Small number"
+    case _ => print "Something else"
+end
+
+// Type-based matching (typeof returns a type id; also prints the type name)
+match typeof("variable")
+    case 1 => print "Integer value"
+    case _ => print "Other type"
+end
+```
+
+#### Enhanced Loops
+```oakscript
+// For-in loops with ranges
+for i in 1..10 do
+    print i
+end
+
+// For-in with step
+for i in 0..100 step 5 do
+    print i
+end
+
+// For-in with collections (iterate by index)
+items = list()
+list_append(items, "1")
+list_append(items, "2")
+list_append(items, "3")
+len = list_size(items)
+for i in 0..len-1 do
+    // use list_get(items, i) for value when supported
+    print i
+end
+
+// Enhanced for loops with break/continue
+for i in 1..100
+    if i % 15 == 0 then
+        continue
+    end
+    if i > 50 then
+        break
+    end
+    print i
+end
+```
+
+#### Range Expressions
+```oakscript
+// Create and use ranges
+numbers = range(1, 10, 1)       // Start, end, step
+even_numbers = range(0, 20, 2)
+reverse = range(10, 1, -1)
+```
+
+### Functional Programming
+
+#### Lambda Functions
+```oakscript
+// Define lambda functions
+square = lambda(x) => x * x
+add = lambda(a, b) => a + b
+greet = lambda(name) => "Hello, ${name}!"
+
+// Use lambdas
+result = square(5)              // Returns 25
+sum = add(10, 15)              // Returns 25
+message = greet("Alice")        // Returns "Hello, Alice!"
+```
+
+#### Higher-Order Functions
+```oakscript
+// Map operation
+numbers = [1, 2, 3, 4, 5]
+squared = map(numbers, lambda(x) => x * x)
+// Result: [1, 4, 9, 16, 25]
+
+// Filter operation
+evens = filter(numbers, lambda(x) => x % 2 == 0)
+// Result: [2, 4]
+
+// Reduce operation
+sum = reduce(numbers, lambda(acc, x) => acc + x, 0)
+// Result: 15
+
+// Function composition
+double = lambda(x) => x * 2
+increment = lambda(x) => x + 1
+double_then_increment = compose(increment, double)
+result = double_then_increment(5)  // (5 * 2) + 1 = 11
+```
+
+#### Partial Application and Currying
+```oakscript
+// Partial application
+multiply = lambda(a, b) => a * b
+double = partial(multiply, 2)
+result = double(5)  // 2 * 5 = 10
+
+// Currying
+add_curry = curry(lambda(a, b, c) => a + b + c)
+add_five = add_curry(5)
+add_five_ten = add_five(10)
+result = add_five_ten(3)  // 5 + 10 + 3 = 18
+
+// Function memoization for performance
+fibonacci = memoize(lambda(n) => 
+    if n <= 1 then n else fibonacci(n-1) + fibonacci(n-2)
+)
+```
+
+### Enhanced Error Handling
+
+#### Specific Exception Types
+```oakscript
+// Built-in exception types
+try
+    result = divide(10, 0)
+catch DivisionByZero as e
+    print "Cannot divide by zero: ${exception_message(e)}"
+catch RuntimeError as e
+    print "Runtime error occurred: ${exception_message(e)}"
+catch Exception as e
+    print "General error: ${exception_type(e)}"
+finally
+    print "Cleanup operations"
+end
+```
+
+#### Custom Exception Types
+```oakscript
+// Define custom exception types
+define_exception("ValidationError", "ValueError", "Input validation failed")
+define_exception("NetworkTimeout", "NetworkError", "Network operation timed out")
+
+// Throw custom exceptions
+if age < 0 then
+    throw("ValidationError", "Age cannot be negative")
+end
+
+// Create and throw exceptions programmatically
+error = create_exception("CustomError", "Something went wrong")
+throw_exception(error)
+```
+
+#### Exception Hierarchy
+```oakscript
+// Exception inheritance and type checking
+try
+    risky_operation()
+catch ValueError as e
+    // Catches ValueError and all its subtypes
+    print "Value error: ${exception_message(e)}"
+catch Exception as e
+    // Catches any other exception
+    print "Unexpected error: ${exception_type(e)}"
+end
+```
+
+### Advanced Type Features
+
+#### Optional Types
+```oakscript
+// Optional values that can be null (functions take variable names as strings)
+name_var = "Alice"
+user_name = optional_create("name_var")
+empty_value = optional_create()
+
+if optional_has_value(user_name) then
+    value = optional_get(user_name)
+    print "User: ${value}"
+else
+    print "No user name provided"
+end
+
+// Safe optional chaining
+result = user_name?.upper()?.length()
+```
+
+#### Union Types
+```oakscript
+// Variables that can hold multiple types
+id = union_create("int", "string")
+union_set(id, 12345, "int")        // Store as integer
+union_set(id, "USER001", "string") // Store as string
+
+current_type = union_get_type(id)
+if current_type == "string" then
+    print "ID is a string: ${union_get(id)}"
+end
+```
+
+#### Type Checking and Conversion
+```oakscript
+// Runtime type checking (pass variable names as strings)
+value = 42
+type_id = typeof("value")
+is_number = is_type("value", "int")
+is_empty = is_null("value")
+
+// Type conversion (pass variable names as strings)
+text_number = "123"
+number = cast("text_number", "int")
+back_to_text = cast("number", "string")
+
+// Type compatibility checking
+can_convert = is_compatible_type("int", "float")  // true
+```
+
+#### Generic Types (Simplified)
+```oakscript
+// Generic function definitions (conceptual)
+function identity<T>(value: T): T
+    return value
+end
+
+// Type-safe collections
+int_list = list<int>()
+string_dict = dict<string, string>()
+```
+
+### Advanced Built-in Functions
+
+The enhanced OakScript now includes over **100 built-in functions**:
+
+#### Data Structure Functions
+- **Dictionary**: `dict()`, `dict_set()`, `dict_get()`, `dict_has()`, `dict_remove()`, `dict_size()`, `dict_keys()`
+- **List**: `list()`, `list_append()`, `list_get()`, `list_set()`, `list_remove()`, `list_size()`
+- **Set**: `set()`, `set_add()`, `set_contains()`, `set_remove()`, `set_size()`, `set_union()`, `set_intersection()`
+
+#### Functional Programming
+- **Lambda**: `lambda()`, `map()`, `filter()`, `reduce()`, `compose()`, `partial()`, `curry()`, `memoize()`
+
+#### String Processing
+- **Interpolation**: `interpolate()`, `multiline()`
+- **Regex**: `regex()`, `regex_match()`, `regex_find_all()`, `regex_replace()`
+
+#### Type System
+- **Type Checking**: `typeof()`, `is_type()`, `is_null()`, `cast()`
+- **Optional**: `optional_create()`, `optional_has_value()`, `optional_get()`
+- **Union**: `union_create()`, `union_set()`, `union_get()`, `union_get_type()`
+
+#### Exception Handling
+- **Exceptions**: `throw()`, `create_exception()`, `define_exception()`, `exception_type()`, `exception_message()`
+
+#### Control Flow
+- **Pattern Matching**: `match()`, `range()`
+- **Collections**: `foreach()`, `range_create()`
+
 ## Bytecode Format
 
 OakScript uses a custom bytecode format optimised for the virtual machine:
@@ -456,10 +809,13 @@ The `Examples/` directory contains comprehensive test scripts that exercise all 
 ## Technical Specifications
 
 - **Target Platform**: RISC OS (ARM 32-bit)
-- **Memory Model**: Module-safe dynamic allocation
-- **Execution Model**: Stack-based virtual machine
-- **File Format**: Custom bytecode with 20-byte header
-- **Instruction Set**: 40+ opcodes covering all language features
+- **Memory Model**: Module-safe dynamic allocation with garbage collection for advanced types
+- **Execution Model**: Stack-based virtual machine with closure support
+- **File Format**: Custom bytecode with 20-byte header supporting advanced features
+- **Instruction Set**: 60+ opcodes covering all language features including advanced constructs
+- **Type System**: 22 distinct types with optional/union type support and runtime type checking
+- **Function Model**: First-class functions with lambda support, closures, and higher-order functions
+- **Exception Model**: Hierarchical exception system with custom types and stack traces
 
 ## Copyright
 

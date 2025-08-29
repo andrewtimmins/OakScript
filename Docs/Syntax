@@ -1,0 +1,295 @@
+OakScript Language Syntax Reference
+===================================
+
+VARIABLE TYPES
+==============
+Basic Types:
+- VAR_INT       - Integer numbers (42, -10, 0x1F)
+- VAR_FLOAT     - Floating-point numbers (3.14, -0.5)
+- VAR_STRING    - Text strings ("hello", 'world')
+- VAR_BOOL      - Boolean values (true, false)
+- VAR_TIME      - Date/time values
+- VAR_FILE      - File handles for I/O operations
+
+Memory Types:
+- VAR_BUFFER    - Mutable buffer for SWI output
+- VAR_POINTER   - Pointer to memory
+- VAR_BLOCK     - Fixed-size data block (icon/window blocks)
+- VAR_ARRAY     - Array of integers
+- VAR_BYTES     - Raw byte array (no null termination)
+- VAR_REFERENCE - Reference to another variable
+
+Advanced Data Structures:
+- VAR_DICT      - Dictionary/map (key-value pairs)
+- VAR_LIST      - Dynamic list/array
+- VAR_SET       - Set (unique values)
+- VAR_LAMBDA    - Lambda function
+- VAR_REGEX     - Regular expression
+- VAR_OPTIONAL  - Optional type (can be null)
+- VAR_UNION     - Union type (multiple possible types)
+- VAR_EXCEPTION - Exception object
+- VAR_FUTURE    - Async future/promise
+- VAR_NULL      - Null value
+
+BASIC SYNTAX
+============
+Comments:
+- // Single line comment
+- /* Multi-line comment */
+
+Variable Assignment:
+- variable_name = value
+- variable_name = "string value"
+- variable_name = 42
+
+Constants:
+- const PI = 3.14159
+- const MAX_SIZE = 100
+
+CONTROL FLOW
+============
+If Statements:
+if condition then
+    statements
+else
+    statements
+end
+
+While Loops:
+while condition do
+    statements
+end
+
+For Loops (Traditional):
+for i = 1 to 10 step 1 do
+    statements
+end
+
+For-In Loops (Enhanced):
+for item in collection do
+    statements
+end
+
+for i in 1..10 do
+    statements
+end
+
+for j in 0..20 step 2 do
+    statements
+end
+
+Switch Statements:
+switch value do
+    case 1
+        statements
+        break
+    case 2
+        statements
+        break
+    default
+        statements
+end
+
+Pattern Matching:
+match value
+    case 1 => statement
+    case 2..10 => statement
+    case _ => statement
+end
+
+Try-Catch-Finally:
+try
+    statements
+catch ExceptionType as e
+    statements
+catch
+    statements
+finally
+    statements
+end
+
+User-Defined Functions:
+function function_name(param1, param2)
+    statements
+    return value
+end
+
+BUILT-IN FUNCTIONS
+==================
+
+SWI (RISC OS System Call) Functions:
+- swi(swi_name, param1, param2, ...)  - Call RISC OS SWI by name with parameters
+                                      - Parameters: string literals, integers, variables
+                                      - String variables automatically create output buffers
+                                      - Returns: R0 register value (integer)
+                                      - Sets global_swi_regs[0-9] with all return registers
+                                      - Example: swi("OS_ReadVarVal", "Run$Path", buffer, 256)
+- swi_error()                         - Get last SWI error number (0 = success)
+                                      - Returns: Error number from last SWI call
+
+Data Structure Functions:
+- dict()                           - Create empty dictionary (returns handle)
+- dict_set(handle, key, value)     - Set dictionary value (key and value are strings)
+- dict_get(handle, key)            - Get dictionary value (returns 1 if found, 0 if not)
+- dict_has(handle, key)            - Check if key exists (returns 1/0)
+- dict_size(handle)                - Get dictionary size (returns integer count)
+
+- list()                           - Create empty list (returns handle)
+- list_append(handle, value)       - Append string value to list
+- list_get(handle, index)          - Get list item at index (returns 1 if found, 0 if not)
+- list_size(handle)                - Get list size (returns integer count)
+
+- set()                            - Create empty set (returns handle)
+- set_add(handle, value)           - Add integer value to set
+- set_contains(handle, value)      - Check if integer value in set (returns 1/0)
+- set_size(handle)                 - Get set size (returns integer count)
+
+Mathematical Functions:
+- add(a, b)                        - Addition (returns a + b)
+- subtract(a, b)                   - Subtraction (returns a - b)  
+- multiply(a, b)                   - Multiplication (returns a * b)
+- divide(a, b)                     - Division (returns a / b, exits on divide by zero)
+- mod(a, b)                        - Modulo (returns a % b, exits on modulo by zero)
+- min(a, b)                        - Minimum value (returns smaller of a or b)
+- max(a, b)                        - Maximum value (returns larger of a or b)
+- abs(number)                      - Absolute value (returns positive version)
+- square(number)                   - Square (returns number * number)
+- pow(base, exponent)              - Power function (returns base^exponent)
+- clamp(value, min, max)           - Clamp value between min and max
+- isqrt(number)                    - Integer square root (returns integer)
+- rand()                           - Random number (full range)
+- rand(min, max)                   - Random number in range [min, max]
+- srand(seed)                      - Seed random number generator (returns 0)
+
+String Functions:
+- len(string)                      - String length (returns integer)
+- upper(string)                    - Convert to uppercase (modifies in-place for assignment)
+- lower(string)                    - Convert to lowercase (modifies in-place for assignment)
+- substr(string, start, length)    - Extract substring
+- find(string, search)             - Find substring position (-1 if not found)
+- replace(string, old, new)        - Replace all occurrences of old with new
+- trim(string)                     - Remove leading/trailing whitespace
+- startswith(string, prefix)       - Check if string starts with prefix (returns 1/0)
+- endswith(string, suffix)         - Check if string ends with suffix (returns 1/0)
+- contains(string, substring)      - Check if string contains substring (returns 1/0)
+- parseint(string)                 - Parse string as integer
+- fromhex(string)                  - Parse hexadecimal string as integer
+- interpolate(template)            - String interpolation with ${variable} syntax
+- multiline(string)                - Multi-line string with \\n escape sequences
+- regex(pattern, flags)            - Compile regex pattern (returns handle)
+- regex_match(regex_handle, text)  - Test if regex matches text (returns 1/0)
+
+File I/O Functions:
+- file_exists(path)                - Check if file exists (returns 1/0)
+- read_file(path)                  - Read entire file as string
+- write_file(path, content)        - Write string content to file (returns 1/0)
+- writefile(path, content)         - Same as write_file (legacy name)
+- appendfile(path, content)        - Append string content to file (returns 1/0)
+- exists(path)                     - Same as file_exists (legacy name)
+
+Memory Management Functions:
+- block(size, element_size)        - Create memory block (returns total size)
+- array(count)                     - Create integer array (returns handle)
+- buffer(size)                     - Create string buffer (returns handle)
+- pointer(address)                 - Create pointer to memory address
+
+Type System Functions:
+- typeof(value)                    - Get type name as string
+- is_type(value, type_name)        - Check if value is specific type (returns 1/0)
+- is_null(value)                   - Check if value is null (returns 1/0)
+- cast(value, type_name)           - Convert value to specified type
+- optional_create(value, type)     - Create optional value with content
+- optional_create()                - Create empty optional value
+- optional_has_value(optional)     - Check if optional has value (returns 1/0)
+- optional_get(optional)           - Get optional value (returns content or 0)
+- union_create(type1, type2, ...)  - Create union type accepting multiple types
+- union_set(union, value, type)    - Set union value with specific type
+
+Functional Programming:
+- lambda(params) => expression     - Create lambda function (REQUIRES => syntax)
+                                  - Returns handle for use with map/filter/reduce
+- map(list_handle, lambda_handle)  - Apply lambda to each list element
+- filter(list_handle, lambda_handle) - Filter list elements using lambda predicate
+- reduce(list_handle, lambda_handle, initial) - Reduce list to single value
+- compose(func1_handle, func2_handle) - Compose two functions
+- curry(func_handle, arg)          - Partial application of function
+
+Exception Handling:
+- throw(type_name, message)        - Throw exception with type and message
+- define_exception(name, parent, description) - Define new exception type
+- exception_type(exception_handle) - Get exception type name
+- exception_message(exception_handle) - Get exception message text
+
+Debug Functions:
+- debug_on()                       - Enable debug mode (returns 0)
+- debug_off()                      - Disable debug mode (returns 0)  
+- debug_print(message)             - Print debug message to debug log
+- debug_logpath(path)              - Set debug log file path
+
+Control Flow Functions:
+- range(start, end, step)          - Create range object for iteration (returns handle)
+
+System Status Functions:
+- status()                         - Get last execution status (returns integer)
+- time()                           - Get current time as integer (seconds since epoch)
+
+OPERATORS
+=========
+Arithmetic:
++ - * / % (modulo)
+++ (increment)
+-- (decrement)
++= -= *= /= (compound assignment)
+
+Comparison:
+== != < > <= >=
+
+Logical:
+and or not
+&& || ! (alternative syntax)
+
+Assignment:
+= (basic assignment)
+
+LITERALS
+========
+Numbers:
+- 42 (decimal)
+- 0x1F (hexadecimal)
+- 3.14 (float)
+
+Strings:
+- "double quotes"
+- 'single quotes'
+- """multi-line strings"""
+
+Booleans:
+- true
+- false
+
+Arrays:
+- [1, 2, 3, 4]
+- ["apple", "banana", "cherry"]
+
+IMPORTANT SYNTAX NOTES
+======================
+1. All function calls MUST have parentheses: function() not function
+2. For-in loops REQUIRE 'do' keyword: for i in 1..10 do
+3. If statements REQUIRE 'then': if condition then
+4. While loops REQUIRE 'do': while condition do
+5. Lambda functions REQUIRE '=>' syntax: lambda(x) => expr not lambda(x)
+6. Pattern matching uses 'case' keyword: case 1 => not 1 =>
+7. All control structures end with 'end'
+8. String interpolation uses: interpolate("Hello ${name}")
+9. File paths use RISC OS format: "<OakScript$Dir>.file"
+10. Exception types must be defined before use with define_exception()
+11. Lists store STRING values only: list_append(list, "value") not integers
+12. Sets store INTEGER values only: set_add(set, 42) not strings
+13. Dictionary values are stored as strings: dict_set(dict, "key", "value")
+
+RESERVED KEYWORDS
+=================
+if then else end while do for to step break continue function return
+true false and or not const print include switch case default
+try catch finally throw match lambda in as from import export
+class extends new null async await typeof union optional

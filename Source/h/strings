@@ -1,0 +1,82 @@
+#ifndef STRINGS_H
+#define STRINGS_H
+
+#include <stddef.h>
+#include <stdbool.h>
+#include "h.engine"
+
+// =============================================================================
+// BASIC STRING UTILITY FUNCTIONS
+// =============================================================================
+
+/* ASCII character classification and conversion functions */
+int ascii_isspace(char c);
+int ascii_isdigit(char c);
+int ascii_isalpha(char c);
+int ascii_isalnum(char c);
+char ascii_toupper(char c);
+char ascii_tolower(char c);
+
+/* String manipulation functions */
+void to_upper_inplace(char *s);
+void to_lower_inplace(char *s);
+char* create_upper_string(const char *s);
+char* create_lower_string(const char *s);
+char* create_trimmed_string(const char *s);
+
+/* String utility functions */
+int string_starts_with(const char *str, const char *prefix);
+int string_ends_with(const char *str, const char *suffix);
+int string_contains(const char *str, const char *substr);
+
+/* String parsing functions */
+int string_parse_int(const char *str);
+int string_from_hex(const char *str);
+
+/* File I/O string functions */
+int string_write_file(const char *filename, const char *content);
+int string_append_file(const char *filename, const char *content);
+int string_file_exists(const char *filename);
+
+// =============================================================================
+// ADVANCED STRING FEATURES
+// =============================================================================
+
+/* Forward declarations - actual struct definitions are in the implementation */
+typedef struct InterpolatedString InterpolatedString;
+typedef struct RegexPattern RegexPattern;
+
+/* String interpolation functions */
+InterpolatedString* parse_interpolated_string(const char* str);
+char* evaluate_interpolated_string(InterpolatedString* istr);
+void interpolated_string_destroy(InterpolatedString* istr);
+
+/* Regular expression functions */
+RegexPattern* regex_compile(const char* pattern, int flags);
+bool regex_match(RegexPattern* regex, const char* text);
+char** regex_find_all(RegexPattern* regex, const char* text, int* count);
+char* regex_replace(RegexPattern* regex, const char* text, const char* replacement);
+void regex_destroy(RegexPattern* regex);
+
+/* Multi-line string support */
+typedef struct {
+    char** lines;
+    int line_count;
+    int total_length;
+} MultilineString;
+
+MultilineString* multiline_create(const char* raw_string);
+char* multiline_to_string(MultilineString* mstr);
+void multiline_destroy(MultilineString* mstr);
+
+/* Advanced string built-in functions */
+int builtin_interpolate(void);
+int builtin_multiline(void);
+int builtin_regex_compile(void);
+int builtin_regex_match(void);
+int builtin_regex_replace(void);
+
+/* Type checking functions */
+const char* type_name(VarType type);
+
+#endif /* STRINGS_H */

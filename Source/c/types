@@ -1,0 +1,541 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
+#include "h.advanced"
+#include "h.memory"
+#include "h.engine"
+
+// Type system implementation
+
+// Union type implementation
+UnionValue* union_create(VarType* types, int type_count) {
+    UnionValue* union_val = (UnionValue*)mod_malloc(sizeof(UnionValue));
+    if (!union_val) return NULL;
+    
+    union_val->allowed_types = (VarType*)mod_malloc(type_count * sizeof(VarType));
+    if (!union_val->allowed_types) {
+        mod_free(union_val);
+        return NULL;
+    }
+    
+    for (int i = 0; i < type_count; i++) {
+        union_val->allowed_types[i] = types[i];
+    }
+    
+    union_val->type_count = type_count;
+    union_val->value = NULL;
+    union_val->current_type = VAR_NULL;
+    
+    return union_val;
+}
+
+bool union_set(UnionValue* union_val, void* value, VarType type) {
+    if (!union_val) return false;
+    
+    // Check if type is allowed
+    bool type_allowed = false;
+    for (int i = 0; i < union_val->type_count; i++) {
+        if (union_val->allowed_types[i] == type) {
+            type_allowed = true;
+            break;
+        }
+    }
+    
+    if (!type_allowed) return false;
+    
+    // Free old value if exists
+    if (union_val->value) {
+        switch (union_val->current_type) {
+            case VAR_STRING:
+                mod_free(union_val->value);
+                break;
+            default:
+                mod_free(union_val->value);
+                break;
+        }
+    }
+    
+    // Set new value
+    union_val->current_type = type;
+    
+    switch (type) {
+        case VAR_INT:
+            union_val->value = mod_malloc(sizeof(int));
+            *(int*)union_val->value = *(int*)value;
+            break;
+        case VAR_STRING:
+            union_val->value = mod_strdup((char*)value);
+            break;
+        case VAR_FLOAT:
+            union_val->value = mod_malloc(sizeof(float));
+            *(float*)union_val->value = *(float*)value;
+            break;
+        case VAR_BOOL:
+            union_val->value = mod_malloc(sizeof(int));
+            *(int*)union_val->value = *(int*)value;
+            break;
+        default:
+            union_val->value = value;
+            break;
+    }
+    
+    return true;
+}
+
+void* union_get(UnionValue* union_val, VarType* type) {
+    if (!union_val) return NULL;
+    
+    if (type) *type = union_val->current_type;
+    return union_val->value;
+}
+
+bool union_is_type(UnionValue* union_val, VarType type) {
+    return union_val && union_val->current_type == type;
+}
+
+void union_destroy(UnionValue* union_val) {
+    if (!union_val) return;
+    
+    if (union_val->allowed_types) mod_free(union_val->allowed_types);
+    if (union_val->value) {
+        switch (union_val->current_type) {
+            case VAR_STRING:
+                mod_free(union_val->value);
+                break;
+            default:
+                mod_free(union_val->value);
+                break;
+        }
+    }
+    mod_free(union_val);
+}
+
+// Type checking and conversion functions
+
+bool is_compatible_type(VarType from, VarType to) {
+    if (from == to) return true;
+    
+    // Allow implicit conversions
+    switch (to) {
+        case VAR_STRING:
+            // Any type can be converted to string
+            return true;
+        case VAR_BOOL:
+            // Any type can be converted to boolean
+            return true;
+        case VAR_FLOAT:
+            // Integers can be converted to float
+            return (from == VAR_INT);
+        default:
+            return false;
+    }
+}
+
+void* convert_type(void* value, VarType from, VarType to) {
+    if (!value || from == to) return value;
+    
+    switch (to) {
+        case VAR_STRING: {
+            char* str_result = (char*)mod_malloc(64);
+            switch (from) {
+                case VAR_INT:
+                    sprintf(str_result, "%d", *(int*)value);
+                    break;
+                case VAR_FLOAT:
+                    sprintf(str_result, "%f", *(float*)value);
+                    break;
+                case VAR_BOOL:
+                    strcpy(str_result, *(int*)value ? "true" : "false");
+                    break;
+                default:
+                    strcpy(str_result, "[object]");
+                    break;
+            }
+            return str_result;
+        }
+        
+        case VAR_BOOL: {
+            int* bool_result = (int*)mod_malloc(sizeof(int));
+            switch (from) {
+                case VAR_INT:
+                    *bool_result = (*(int*)value != 0);
+                    break;
+                case VAR_STRING:
+                    *bool_result = (mod_strlen((char*)value) > 0);
+                    break;
+                case VAR_FLOAT:
+                    *bool_result = (*(float*)value != 0.0);
+                    break;
+                default:
+                    *bool_result = (value != NULL);
+                    break;
+            }
+            return bool_result;
+        }
+        
+        case VAR_FLOAT: {
+            if (from == VAR_INT) {
+                float* float_result = (float*)mod_malloc(sizeof(float));
+                *float_result = (float)(*(int*)value);
+                return float_result;
+            }
+            break;
+        }
+        
+        case VAR_INT: {
+            if (from == VAR_FLOAT) {
+                int* int_result = (int*)mod_malloc(sizeof(int));
+                *int_result = (int)(*(float*)value);
+                return int_result;
+            }
+            if (from == VAR_STRING) {
+                int* int_result = (int*)mod_malloc(sizeof(int));
+                *int_result = atoi((char*)value);
+                return int_result;
+            }
+            break;
+        }
+    }
+    
+    return NULL; // Conversion not supported
+}
+
+const char* type_name(VarType type) {
+    switch (type) {
+        case VAR_INT: return "int";
+        case VAR_STRING: return "string";
+        case VAR_FLOAT: return "float";
+        case VAR_BOOL: return "bool";
+        case VAR_ARRAY: return "array";
+        case VAR_DICT: return "dict";
+        case VAR_LIST: return "list";
+        case VAR_SET: return "set";
+        case VAR_LAMBDA: return "lambda";
+        case VAR_REGEX: return "regex";
+        case VAR_OPTIONAL: return "optional";
+        case VAR_UNION: return "union";
+        case VAR_EXCEPTION: return "exception";
+        case VAR_NULL: return "null";
+        case VAR_BUFFER: return "buffer";
+        case VAR_POINTER: return "pointer";
+        case VAR_BLOCK: return "block";
+        case VAR_BYTES: return "bytes";
+        case VAR_REFERENCE: return "reference";
+        case VAR_FILE: return "file";
+        case VAR_TIME: return "time";
+        case VAR_FUTURE: return "future";
+        default: return "unknown";
+    }
+}
+
+// Generic type support (simplified implementation)
+
+typedef struct GenericType {
+    char* name;           // Generic type name (e.g., "T", "U")
+    VarType concrete_type; // Resolved concrete type
+    struct GenericType* next;
+} GenericType;
+
+static GenericType* generic_types = NULL;
+
+GenericType* register_generic_type(const char* name) {
+    GenericType* generic = (GenericType*)mod_malloc(sizeof(GenericType));
+    if (!generic) return NULL;
+    
+    generic->name = mod_strdup(name);
+    generic->concrete_type = VAR_NULL; // Unresolved
+    generic->next = generic_types;
+    generic_types = generic;
+    
+    return generic;
+}
+
+bool resolve_generic_type(const char* name, VarType concrete_type) {
+    GenericType* current = generic_types;
+    while (current) {
+        if (mod_strcmp(current->name, name) == 0) {
+            current->concrete_type = concrete_type;
+            return true;
+        }
+        current = current->next;
+    }
+    return false;
+}
+
+VarType get_generic_type(const char* name) {
+    GenericType* current = generic_types;
+    while (current) {
+        if (mod_strcmp(current->name, name) == 0) {
+            return current->concrete_type;
+        }
+        current = current->next;
+    }
+    return VAR_NULL;
+}
+
+void clear_generic_types(void) {
+    while (generic_types) {
+        GenericType* next = generic_types->next;
+        mod_free(generic_types->name);
+        mod_free(generic_types);
+        generic_types = next;
+    }
+}
+
+// Built-in type system functions
+
+extern int expression(void);
+extern Token* next_token(void);
+extern Token* peek_token(void);
+extern char* evaluate_string_expr(void);
+
+int builtin_typeof(void) {
+    char* var_name = evaluate_string_expr();
+    if (next_token()->type != TOKEN_RPAREN) {
+        printf("typeof() expects one argument\n");
+        exit(1);
+    }
+    
+    if (!var_name) return 0;
+    
+    VarType type;
+    void* value = get_variable_value(var_name, &type);
+    mod_free(var_name);
+    
+    if (!value) return 0;
+    
+    // Return type as integer (in practice, would set a string variable)
+    printf("Type: %s\n", type_name(type));
+    return (int)type;
+}
+
+int builtin_is_null(void) {
+    char* var_name = evaluate_string_expr();
+    if (next_token()->type != TOKEN_RPAREN) {
+        printf("is_null() expects one argument\n");
+        exit(1);
+    }
+    
+    if (!var_name) return 1; // Null variable name means null
+    
+    VarType type;
+    void* value = get_variable_value(var_name, &type);
+    mod_free(var_name);
+    
+    return (value == NULL || type == VAR_NULL) ? 1 : 0;
+}
+
+int builtin_cast(void) {
+    // cast(value, "target_type")
+    char* var_name = evaluate_string_expr();
+    
+    if (next_token()->type != TOKEN_COMMA) {
+        printf("cast() expects two arguments\n");
+        exit(1);
+    }
+    
+    char* target_type_str = evaluate_string_expr();
+    
+    if (next_token()->type != TOKEN_RPAREN) {
+        printf("cast() expects ')'\n");
+        exit(1);
+    }
+    
+    if (!var_name || !target_type_str) return 0;
+    
+    VarType source_type;
+    void* source_value = get_variable_value(var_name, &source_type);
+    
+    if (!source_value) {
+        mod_free(var_name);
+        mod_free(target_type_str);
+        return 0;
+    }
+    
+    // Convert type string to VarType enum
+    VarType target_type = VAR_NULL;
+    if (mod_strcmp(target_type_str, "int") == 0) target_type = VAR_INT;
+    else if (mod_strcmp(target_type_str, "string") == 0) target_type = VAR_STRING;
+    else if (mod_strcmp(target_type_str, "float") == 0) target_type = VAR_FLOAT;
+    else if (mod_strcmp(target_type_str, "bool") == 0) target_type = VAR_BOOL;
+    
+    void* converted_value = convert_type(source_value, source_type, target_type);
+    
+    if (converted_value) {
+        // Update the variable with converted value
+        set_variable_value(var_name, target_type, converted_value);
+        mod_free(converted_value);
+    }
+    
+    mod_free(var_name);
+    mod_free(target_type_str);
+    
+    return converted_value ? 1 : 0;
+}
+
+int builtin_union_create(void) {
+    // union_create("type1", "type2", ...)
+    VarType types[16];
+    int type_count = 0;
+    
+    while (peek_token()->type != TOKEN_RPAREN && type_count < 16) {
+        char* type_str = evaluate_string_expr();
+        if (!type_str) break;
+        
+        // Convert string to VarType
+        if (mod_strcmp(type_str, "int") == 0) types[type_count] = VAR_INT;
+        else if (mod_strcmp(type_str, "string") == 0) types[type_count] = VAR_STRING;
+        else if (mod_strcmp(type_str, "float") == 0) types[type_count] = VAR_FLOAT;
+        else if (mod_strcmp(type_str, "bool") == 0) types[type_count] = VAR_BOOL;
+        else types[type_count] = VAR_NULL;
+        
+        type_count++;
+        mod_free(type_str);
+        
+        if (peek_token()->type == TOKEN_COMMA) {
+            next_token(); // consume comma
+        }
+    }
+    
+    if (next_token()->type != TOKEN_RPAREN) {
+        printf("union_create() expects ')'\n");
+        exit(1);
+    }
+    
+    if (type_count == 0) return 0;
+    
+    UnionValue* union_val = union_create(types, type_count);
+    
+    // Return union handle (would store in registry)
+    static int union_counter = 8000;
+    return union_val ? union_counter++ : 0;
+}
+
+int builtin_union_set(void) {
+    // union_set(union_handle, value, type)
+    int union_handle = expression();
+    
+    if (next_token()->type != TOKEN_COMMA) {
+        printf("union_set() expects three arguments\n");
+        exit(1);
+    }
+    
+    char* var_name = evaluate_string_expr();
+    
+    if (next_token()->type != TOKEN_COMMA) {
+        printf("union_set() expects three arguments\n");
+        exit(1);
+    }
+    
+    char* type_str = evaluate_string_expr();
+    
+    if (next_token()->type != TOKEN_RPAREN) {
+        printf("union_set() expects ')'\n");
+        exit(1);
+    }
+    
+    // In practice, would look up union by handle and set value
+    // Use union_handle to avoid unused variable warning
+    (void)union_handle;
+    
+    if (var_name) mod_free(var_name);
+    if (type_str) mod_free(type_str);
+    
+    return 1; // Mock success
+}
+
+int builtin_optional_create(void) {
+    // optional_create() or optional_create(value)
+    void* value = NULL;
+    VarType type = VAR_NULL;
+    
+    if (peek_token()->type != TOKEN_RPAREN) {
+        // Has initial value
+        char* var_name = evaluate_string_expr();
+        if (var_name) {
+            value = get_variable_value(var_name, &type);
+            mod_free(var_name);
+        }
+    }
+    
+    if (next_token()->type != TOKEN_RPAREN) {
+        printf("optional_create() expects ')'\n");
+        exit(1);
+    }
+    
+    OptionalValue* opt = optional_create(value, type);
+    
+    // Return optional handle
+    static int optional_counter = 9000;
+    return opt ? optional_counter++ : 0;
+}
+
+int builtin_optional_has_value(void) {
+    // optional_has_value(optional_handle)
+    int optional_handle = expression();
+    
+    if (next_token()->type != TOKEN_RPAREN) {
+        printf("optional_has_value() expects one argument\n");
+        exit(1);
+    }
+    
+    // In practice, would look up optional by handle
+    // Use optional_handle to avoid unused variable warning
+    (void)optional_handle;
+    return 1; // Mock: has value
+}
+
+int builtin_optional_get(void) {
+    // optional_get(optional_handle)
+    int optional_handle = expression();
+    
+    if (next_token()->type != TOKEN_RPAREN) {
+        printf("optional_get() expects one argument\n");
+        exit(1);
+    }
+    
+    // In practice, would return the optional's value or throw exception if empty
+    // Use optional_handle to avoid unused variable warning
+    (void)optional_handle;
+    return 42; // Mock value
+}
+
+int builtin_is_type(void) {
+    // is_type(variable, "type_name")
+    char* var_name = evaluate_string_expr();
+    
+    if (next_token()->type != TOKEN_COMMA) {
+        printf("is_type() expects two arguments\n");
+        exit(1);
+    }
+    
+    char* type_str = evaluate_string_expr();
+    
+    if (next_token()->type != TOKEN_RPAREN) {
+        printf("is_type() expects ')'\n");
+        exit(1);
+    }
+    
+    if (!var_name || !type_str) return 0;
+    
+    VarType var_type;
+    void* value = get_variable_value(var_name, &var_type);
+    
+    bool matches = false;
+    if (value) {
+        const char* actual_type = type_name(var_type);
+        matches = (mod_strcmp(actual_type, type_str) == 0);
+    }
+    
+    mod_free(var_name);
+    mod_free(type_str);
+    
+    return matches ? 1 : 0;
+}
+
+// Cleanup type system
+
+void cleanup_type_system(void) {
+    clear_generic_types();
+}

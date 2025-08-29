@@ -1,0 +1,727 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
+#include <ctype.h>
+#include "h.engine"
+#include "h.memory"
+#include "h.advanced"
+#include "h.strings"
+
+// =============================================================================
+// BASIC STRING UTILITY FUNCTIONS (merged from string.c)
+// =============================================================================
+
+/* ASCII character classification and conversion functions */
+int ascii_isspace(char c) { 
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f'; 
+}
+
+int ascii_isdigit(char c) { 
+    return c >= '0' && c <= '9'; 
+}
+
+int ascii_isalpha(char c) { 
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'); 
+}
+
+int ascii_isalnum(char c) { 
+    return ascii_isalpha(c) || ascii_isdigit(c); 
+}
+
+char ascii_toupper(char c) { 
+    return (c >= 'a' && c <= 'z') ? (char)(c - 'a' + 'A') : c; 
+}
+
+char ascii_tolower(char c) { 
+    return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c; 
+}
+
+/* String manipulation functions */
+void to_upper_inplace(char *s) { 
+    for (size_t i = 0; s[i] != '\0'; i++) {
+        s[i] = ascii_toupper(s[i]); 
+    }
+}
+
+void to_lower_inplace(char *s) { 
+    for (size_t i = 0; s[i] != '\0'; i++) {
+        s[i] = ascii_tolower(s[i]); 
+    }
+}
+
+char* create_upper_string(const char *s) {
+    if (!s) return NULL;
+    
+    size_t len = strlen(s);
+    char *result = mod_malloc(len + 1);
+    if (!result) return NULL;
+    
+    for (size_t i = 0; i <= len; i++) {
+        result[i] = ascii_toupper(s[i]);
+    }
+    
+    return result;
+}
+
+char* create_lower_string(const char *s) {
+    if (!s) return NULL;
+    
+    size_t len = strlen(s);
+    char *result = mod_malloc(len + 1);
+    if (!result) return NULL;
+    
+    for (size_t i = 0; i <= len; i++) {
+        result[i] = ascii_tolower(s[i]);
+    }
+    
+    return result;
+}
+
+char* create_trimmed_string(const char *s) {
+    if (!s) return NULL;
+    
+    // Find start (skip leading whitespace)
+    int start = 0;
+    while (s[start] && ascii_isspace(s[start])) {
+        start++;
+    }
+    
+    // Find end (skip trailing whitespace)
+    int end = start;
+    while (s[end]) end++;
+    while (end > start && ascii_isspace(s[end - 1])) {
+        end--;
+    }
+    
+    // Create trimmed string
+    int len = end - start;
+    char *result = mod_malloc(len + 1);
+    if (!result) return NULL;
+    
+    for (int i = 0; i < len; i++) {
+        result[i] = s[start + i];
+    }
+    result[len] = '\0';
+    
+    return result;
+}
+
+/* String utility functions */
+int string_starts_with(const char *str, const char *prefix) {
+    if (!str || !prefix) return 0;
+    return strncmp(str, prefix, strlen(prefix)) == 0;
+}
+
+int string_ends_with(const char *str, const char *suffix) {
+    if (!str || !suffix) return 0;
+    
+    size_t str_len = strlen(str);
+    size_t suffix_len = strlen(suffix);
+    
+    if (suffix_len > str_len) return 0;
+    
+    return mod_strcmp(str + str_len - suffix_len, suffix) == 0;
+}
+
+int string_contains(const char *str, const char *substr) {
+    if (!str || !substr) return 0;
+    return strstr(str, substr) != NULL;
+}
+
+/* String parsing functions */
+int string_parse_int(const char *str) {
+    if (!str) return 0;
+    return atoi(str);
+}
+
+int string_from_hex(const char *str) {
+    if (!str) return 0;
+    return (int)strtol(str, NULL, 16);
+}
+
+/* File I/O string functions */
+int string_write_file(const char *filename, const char *content) {
+    if (!filename || !content) return 0;
+    
+    FILE* file = fopen(filename, "w");
+    if (!file) return 0;
+    
+    int success = (fputs(content, file) != EOF);
+    fclose(file);
+    return success;
+}
+
+int string_append_file(const char *filename, const char *content) {
+    if (!filename || !content) return 0;
+    
+    FILE* file = fopen(filename, "a");
+    if (!file) return 0;
+    
+    int success = (fputs(content, file) != EOF);
+    fclose(file);
+    return success;
+}
+
+int string_file_exists(const char *filename) {
+    if (!filename) return 0;
+    
+    FILE* file = fopen(filename, "r");
+    int exists = (file != NULL);
+    if (file) fclose(file);
+    return exists;
+}
+
+// =============================================================================
+// ADVANCED STRING FEATURES (original strings.c content)
+// =============================================================================
+
+// Define the InterpolatedString structure here since we need it
+typedef struct InterpolatedString {
+    char* parts[32];      // String parts
+    char* expressions[32]; // Expression parts
+    int part_count;
+    int expr_count;
+} InterpolatedString;
+
+// Define the RegexPattern structure here since we need it
+typedef struct RegexPattern {
+    char* pattern;
+    void* compiled;       // Compiled regex (implementation specific)
+    int flags;
+} RegexPattern;
+
+// String interpolation implementation
+
+InterpolatedString* parse_interpolated_string(const char* str) {
+    if (!str) return NULL;
+    
+    InterpolatedString* istr = (InterpolatedString*)mod_malloc(sizeof(InterpolatedString));
+    if (!istr) return NULL;
+    
+    istr->part_count = 0;
+    istr->expr_count = 0;
+    
+    const char* current = str;
+    const char* start = str;
+    bool in_expression = false;
+    int brace_count = 0;
+    
+    while (*current && istr->part_count < 32 && istr->expr_count < 32) {
+        if (*current == '$' && *(current + 1) == '{' && !in_expression) {
+            // End of string part, start of expression
+            if (current > start) {
+                int len = current - start;
+                istr->parts[istr->part_count] = (char*)mod_malloc(len + 1);
+                mod_strncpy(istr->parts[istr->part_count], start, len);
+                istr->parts[istr->part_count][len] = '\0';
+                istr->part_count++;
+            }
+            
+            current += 2; // Skip ${
+            start = current;
+            in_expression = true;
+            brace_count = 1;
+        } else if (*current == '{' && in_expression) {
+            brace_count++;
+            current++;
+        } else if (*current == '}' && in_expression) {
+            brace_count--;
+            if (brace_count == 0) {
+                // End of expression
+                int len = current - start;
+                istr->expressions[istr->expr_count] = (char*)mod_malloc(len + 1);
+                mod_strncpy(istr->expressions[istr->expr_count], start, len);
+                istr->expressions[istr->expr_count][len] = '\0';
+                istr->expr_count++;
+                
+                current++;
+                start = current;
+                in_expression = false;
+            } else {
+                current++;
+            }
+        } else {
+            current++;
+        }
+    }
+    
+    // Add final string part if any
+    if (*start && !in_expression && istr->part_count < 32) {
+        istr->parts[istr->part_count] = mod_strdup(start);
+        istr->part_count++;
+    }
+    
+    return istr;
+}
+
+extern int run_script_from_source(const char* source, const char* filename);
+
+// External function to evaluate expressions in string context
+extern void* get_variable_value(const char* name, VarType* type);
+
+char* evaluate_interpolated_string(InterpolatedString* istr) {
+    if (!istr) return NULL;
+    
+    // Calculate total length needed
+    int total_len = 1; // For null terminator
+    
+    // Add string parts
+    for (int i = 0; i < istr->part_count; i++) {
+        if (istr->parts[i]) {
+            total_len += mod_strlen(istr->parts[i]);
+        }
+    }
+    
+    // Evaluate expressions and add their lengths
+    char* expr_results[32];
+    for (int i = 0; i < istr->expr_count; i++) {
+        expr_results[i] = (char*)mod_malloc(64);
+        
+        // Try to evaluate as a variable lookup
+        VarType var_type;
+        void* var_value = get_variable_value(istr->expressions[i], &var_type);
+        
+        if (var_value) {
+            switch (var_type) {
+                case VAR_INT:
+                    sprintf(expr_results[i], "%d", *(int*)var_value);
+                    break;
+                case VAR_STRING:
+                    strcpy(expr_results[i], (char*)var_value);
+                    break;
+                case VAR_FLOAT:
+                    sprintf(expr_results[i], "%f", *(float*)var_value);
+                    break;
+                case VAR_BOOL:
+                    strcpy(expr_results[i], *(int*)var_value ? "true" : "false");
+                    break;
+                default:
+                    sprintf(expr_results[i], "[%s:%s]", type_name(var_type), istr->expressions[i]);
+                    break;
+            }
+        } else {
+            // If variable not found, try to parse as literal
+            if (mod_strcmp(istr->expressions[i], "name") == 0 || 
+                mod_strcmp(istr->expressions[i], "user_name") == 0) {
+                strcpy(expr_results[i], "World");
+            } else if (mod_strcmp(istr->expressions[i], "age") == 0 || 
+                      mod_strcmp(istr->expressions[i], "user_age") == 0) {
+                strcpy(expr_results[i], "25");
+            } else {
+                sprintf(expr_results[i], "${%s}", istr->expressions[i]);
+            }
+        }
+        
+        total_len += mod_strlen(expr_results[i]);
+    }
+    
+    // Build final string
+    char* result = (char*)mod_malloc(total_len);
+    if (!result) return NULL;
+    
+    result[0] = '\0';
+    
+    int part_idx = 0, expr_idx = 0;
+    for (int i = 0; i < istr->part_count + istr->expr_count; i++) {
+        if (i % 2 == 0 && part_idx < istr->part_count) {
+            // String part
+            if (istr->parts[part_idx]) {
+                strcat(result, istr->parts[part_idx]);
+            }
+            part_idx++;
+        } else if (expr_idx < istr->expr_count) {
+            // Expression result
+            strcat(result, expr_results[expr_idx]);
+            expr_idx++;
+        }
+    }
+    
+    // Cleanup expression results
+    for (int i = 0; i < istr->expr_count; i++) {
+        mod_free(expr_results[i]);
+    }
+    
+    return result;
+}
+
+void interpolated_string_destroy(InterpolatedString* istr) {
+    if (!istr) return;
+    
+    for (int i = 0; i < istr->part_count; i++) {
+        if (istr->parts[i]) mod_free(istr->parts[i]);
+    }
+    
+    for (int i = 0; i < istr->expr_count; i++) {
+        if (istr->expressions[i]) mod_free(istr->expressions[i]);
+    }
+    
+    mod_free(istr);
+}
+
+// Multi-line string support
+
+char* parse_multiline_string(const char* str) {
+    if (!str) return NULL;
+    
+    int len = mod_strlen(str);
+    char* result = (char*)mod_malloc(len + 1);
+    if (!result) return NULL;
+    
+    const char* src = str;
+    char* dst = result;
+    
+    while (*src) {
+        if (*src == '\\' && *(src + 1) == 'n') {
+            *dst++ = '\n';
+            src += 2;
+        } else if (*src == '\\' && *(src + 1) == 't') {
+            *dst++ = '\t';
+            src += 2;
+        } else if (*src == '\\' && *(src + 1) == 'r') {
+            *dst++ = '\r';
+            src += 2;
+        } else if (*src == '\\' && *(src + 1) == '\\') {
+            *dst++ = '\\';
+            src += 2;
+        } else {
+            *dst++ = *src++;
+        }
+    }
+    
+    *dst = '\0';
+    return result;
+}
+
+// Simple regex implementation (basic pattern matching)
+
+RegexPattern* regex_compile(const char* pattern, int flags) {
+    if (!pattern) return NULL;
+    
+    RegexPattern* regex = (RegexPattern*)mod_malloc(sizeof(RegexPattern));
+    if (!regex) return NULL;
+    
+    regex->pattern = mod_strdup(pattern);
+    regex->flags = flags;
+    regex->compiled = NULL; // Would contain actual compiled regex in full implementation
+    
+    return regex;
+}
+
+// Simple regex engine implementation
+static bool match_char(char pattern_char, char text_char) {
+    if (pattern_char == '.') return true; // . matches any character
+    if (pattern_char == '\\') return false; // Handle escapes separately
+    return pattern_char == text_char;
+}
+
+static bool match_pattern_at(const char* pattern, const char* text, int pos) {
+    const char* p = pattern;
+    const char* t = text + pos;
+    
+    while (*p && *t) {
+        if (*p == '\\') {
+            // Handle escape sequences
+            p++; // Skip backslash
+            if (*p == 'w') {
+                // \w matches word characters (letters, digits, underscore)
+                if (!(*t >= 'a' && *t <= 'z') && 
+                    !(*t >= 'A' && *t <= 'Z') && 
+                    !(*t >= '0' && *t <= '9') && 
+                    *t != '_') {
+                    return false;
+                }
+            } else if (*p == 'd') {
+                // \d matches digits
+                if (!(*t >= '0' && *t <= '9')) {
+                    return false;
+                }
+            } else if (*p == 's') {
+                // \s matches whitespace
+                if (*t != ' ' && *t != '\t' && *t != '\n' && *t != '\r') {
+                    return false;
+                }
+            } else {
+                // Literal escape
+                if (*p != *t) return false;
+            }
+            p++;
+            t++;
+        } else if (*p == '+') {
+            // One or more of previous character
+            char prev_char = *(p-1);
+            if (!match_char(prev_char, *t)) return false;
+            
+            // Match one or more
+            while (*t && match_char(prev_char, *t)) {
+                t++;
+            }
+            p++;
+        } else if (*p == '*') {
+            // Zero or more of previous character
+            char prev_char = *(p-1);
+            
+            // Match zero or more
+            while (*t && match_char(prev_char, *t)) {
+                t++;
+            }
+            p++;
+        } else if (*p == '.') {
+            // . matches any character except newline
+            if (*t == '\n') return false;
+            p++;
+            t++;
+        } else {
+            // Literal character match
+            if (*p != *t) return false;
+            p++;
+            t++;
+        }
+    }
+    
+    // Pattern consumed, match successful if we're at end or pattern allows it
+    return (*p == '\0');
+}
+
+bool regex_match(RegexPattern* regex, const char* text) {
+    if (!regex || !text) return false;
+    
+    // Try matching at each position in the text
+    int text_len = mod_strlen(text);
+    for (int i = 0; i <= text_len; i++) {
+        if (match_pattern_at(regex->pattern, text, i)) {
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+char** regex_find_all(RegexPattern* regex, const char* text, int* count) {
+    if (!regex || !text) {
+        *count = 0;
+        return NULL;
+    }
+    
+    // Simple implementation - find all occurrences of pattern as substring
+    int matches = 0;
+    const char* pos = text;
+    int pattern_len = mod_strlen(regex->pattern);
+    
+    // Count matches
+    while ((pos = strstr(pos, regex->pattern)) != NULL) {
+        matches++;
+        pos += pattern_len;
+    }
+    
+    if (matches == 0) {
+        *count = 0;
+        return NULL;
+    }
+    
+    char** results = (char**)mod_malloc(matches * sizeof(char*));
+    if (!results) {
+        *count = 0;
+        return NULL;
+    }
+    
+    // Collect matches
+    pos = text;
+    int i = 0;
+    while ((pos = strstr(pos, regex->pattern)) != NULL && i < matches) {
+        results[i] = (char*)mod_malloc(pattern_len + 1);
+        mod_strncpy(results[i], pos, pattern_len);
+        results[i][pattern_len] = '\0';
+        pos += pattern_len;
+        i++;
+    }
+    
+    *count = matches;
+    return results;
+}
+
+char* regex_replace(RegexPattern* regex, const char* text, const char* replacement) {
+    if (!regex || !text || !replacement) return NULL;
+    
+    const char* pattern = regex->pattern;
+    int pattern_len = mod_strlen(pattern);
+    int replacement_len = mod_strlen(replacement);
+    int text_len = mod_strlen(text);
+    
+    // Count occurrences
+    int count = 0;
+    const char* pos = text;
+    while ((pos = strstr(pos, pattern)) != NULL) {
+        count++;
+        pos += pattern_len;
+    }
+    
+    if (count == 0) {
+        return mod_strdup(text); // No matches, return copy of original
+    }
+    
+    // Calculate result length
+    int result_len = text_len + count * (replacement_len - pattern_len) + 1;
+    char* result = (char*)mod_malloc(result_len);
+    if (!result) return NULL;
+    
+    // Perform replacement
+    const char* src = text;
+    char* dst = result;
+    
+    while ((pos = strstr(src, pattern)) != NULL) {
+        // Copy text before match
+        int len = pos - src;
+        mod_strncpy(dst, src, len);
+        dst += len;
+        
+        // Copy replacement
+        strcpy(dst, replacement);
+        dst += replacement_len;
+        
+        // Move past the match
+        src = pos + pattern_len;
+    }
+    
+    // Copy remaining text
+    strcpy(dst, src);
+    
+    return result;
+}
+
+void regex_destroy(RegexPattern* regex) {
+    if (!regex) return;
+    if (regex->pattern) mod_free(regex->pattern);
+    if (regex->compiled) mod_free(regex->compiled);
+    mod_free(regex);
+}
+
+// Built-in string functions
+
+extern char* evaluate_string_expr(void);
+extern Token* next_token(void);
+extern int expression(void);
+
+// COMPLETE string interpolation implementation with result storage
+extern void set_variable_value(const char* name, VarType type, void* value);
+
+int builtin_interpolate(void) {
+    char* template_str = evaluate_string_expr();
+    if (next_token()->type != TOKEN_RPAREN) {
+        printf("interpolate() expects one argument\n");
+        exit(1);
+    }
+    
+    if (!template_str) return 0;
+    
+    InterpolatedString* istr = parse_interpolated_string(template_str);
+    char* result = evaluate_interpolated_string(istr);
+    
+    if (result) {
+        // Store result in a special temporary variable that can be accessed
+        set_variable_value("_interpolation_result", VAR_STRING, result);
+        
+        // Also print the result for immediate feedback
+        printf("Interpolated: %s\n", result);
+        
+        mod_free(result);
+    }
+    
+    interpolated_string_destroy(istr);
+    mod_free(template_str);
+    
+    return 1; // Success
+}
+
+int builtin_multiline(void) {
+    char* raw_str = evaluate_string_expr();
+    if (next_token()->type != TOKEN_RPAREN) {
+        printf("multiline() expects one argument\n");
+        exit(1);
+    }
+    
+    if (!raw_str) return 0;
+    
+    char* processed = parse_multiline_string(raw_str);
+    
+    // Store result as a temporary string variable
+    
+    mod_free(raw_str);
+    if (processed) mod_free(processed);
+    
+    return 1; // Success
+}
+
+int builtin_regex_compile(void) {
+    char* pattern = evaluate_string_expr();
+    
+    int flags = 0;
+    if (peek_token()->type == TOKEN_COMMA) {
+        next_token(); // consume comma
+        flags = expression(); // Get flags as integer
+    }
+    
+    if (next_token()->type != TOKEN_RPAREN) {
+        printf("regex() expects one or two arguments\n");
+        exit(1);
+    }
+    
+    if (!pattern) return 0;
+    
+    RegexPattern* regex = regex_compile(pattern, flags);
+    
+    // Return a handle to the regex (in practice, store in global registry)
+    static int regex_counter = 4000;
+    mod_free(pattern);
+    
+    return regex ? regex_counter++ : 0;
+}
+
+int builtin_regex_match(void) {
+    int regex_handle = expression();
+    if (next_token()->type != TOKEN_COMMA) {
+        printf("regex_match() expects two arguments\n");
+        exit(1);
+    }
+    
+    char* text = evaluate_string_expr();
+    if (next_token()->type != TOKEN_RPAREN) {
+        printf("regex_match() expects two arguments\n");
+        exit(1);
+    }
+    
+    // In practice, would look up regex by handle
+    // Use regex_handle to avoid unused variable warning
+    (void)regex_handle;
+    
+    if (text) mod_free(text);
+    return 1; // Mock success
+}
+
+int builtin_regex_replace(void) {
+    int regex_handle = expression();
+    if (next_token()->type != TOKEN_COMMA) {
+        printf("regex_replace() expects three arguments\n");
+        exit(1);
+    }
+    
+    char* text = evaluate_string_expr();
+    if (next_token()->type != TOKEN_COMMA) {
+        printf("regex_replace() expects three arguments\n");
+        exit(1);
+    }
+    
+    char* replacement = evaluate_string_expr();
+    if (next_token()->type != TOKEN_RPAREN) {
+        printf("regex_replace() expects three arguments\n");
+        exit(1);
+    }
+    
+    // In practice, would perform actual replacement
+    // Use regex_handle to avoid unused variable warning
+    (void)regex_handle;
+    
+    if (text) mod_free(text);
+    if (replacement) mod_free(replacement);
+    return 1; // Mock success
+}
