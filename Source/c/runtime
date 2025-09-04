@@ -37,6 +37,29 @@ typedef struct {
 static stack_value_t runtime_stack[MAX_STACK_SIZE];
 static int stack_top = -1;
 
+/* Call frame stack */
+#define MAX_CALL_DEPTH 64
+typedef struct {
+    int return_pc;
+    int stack_marker; // stack_top at call time (before args evaluation)
+    runtime_variable_t locals[MAX_RUNTIME_VARS];
+    int local_count;
+} call_frame_t;
+
+static call_frame_t call_stack[MAX_CALL_DEPTH];
+static int call_top = -1;
+
+/* Try/catch stack for exceptions */
+#define MAX_TRY_DEPTH 128
+typedef struct {
+    int handler_pc;
+    int call_top_at_try;
+    int stack_top_at_try;
+} try_entry_t;
+
+static try_entry_t try_stack[MAX_TRY_DEPTH];
+static int try_top = -1;
+
 /* Stack operations */
 static void push_int(int value) {
     if (stack_top < MAX_STACK_SIZE - 1) {
@@ -65,6 +88,33 @@ static stack_value_t pop_value() {
 
 /* Variable operations */
 static void store_variable(const char *name, stack_value_t value) {
+    // If inside a function, store to current frame's locals
+    if (call_top >= 0) {
+        call_frame_t *frame = &call_stack[call_top];
+        for (int i = 0; i < frame->local_count; i++) {
+            if (frame->locals[i].is_used && mod_strcmp(frame->locals[i].name, name) == 0) {
+                if (frame->locals[i].type == RT_VAR_STRING && frame->locals[i].value.string_value) {
+                    mod_free(frame->locals[i].value.string_value);
+                }
+                frame->locals[i].type = value.type;
+                if (value.type == RT_VAR_INT) frame->locals[i].value.int_value = value.value.int_value;
+                else frame->locals[i].value.string_value = value.value.string_value;
+                return;
+            }
+        }
+        if (frame->local_count < MAX_RUNTIME_VARS) {
+            mod_strcpy(frame->locals[frame->local_count].name, name);
+            frame->locals[frame->local_count].type = value.type;
+            if (value.type == RT_VAR_INT) frame->locals[frame->local_count].value.int_value = value.value.int_value;
+            else frame->locals[frame->local_count].value.string_value = value.value.string_value;
+            frame->locals[frame->local_count].is_used = 1;
+            frame->local_count++;
+            return;
+        } else {
+            printf("Runtime error: Too many local variables\n");
+            return;
+        }
+    }
     // Look for existing variable
     for (int i = 0; i < runtime_var_count; i++) {
         if (runtime_vars[i].is_used && mod_strcmp(runtime_vars[i].name, name) == 0) {
@@ -101,6 +151,19 @@ static void store_variable(const char *name, stack_value_t value) {
 }
 
 static void load_variable(const char *name) {
+    // Search locals from innermost frame outward
+    if (call_top >= 0) {
+        for (int f = call_top; f >= 0; f--) {
+            call_frame_t *frame = &call_stack[f];
+            for (int i = 0; i < frame->local_count; i++) {
+                if (frame->locals[i].is_used && mod_strcmp(frame->locals[i].name, name) == 0) {
+                    if (frame->locals[i].type == RT_VAR_INT) push_int(frame->locals[i].value.int_value);
+                    else push_string(frame->locals[i].value.string_value);
+                    return;
+                }
+            }
+        }
+    }
     for (int i = 0; i < runtime_var_count; i++) {
         if (runtime_vars[i].is_used && mod_strcmp(runtime_vars[i].name, name) == 0) {
             if (runtime_vars[i].type == RT_VAR_INT) {
@@ -118,6 +181,17 @@ static void load_variable(const char *name) {
 }
 
 static void cleanup_runtime_vars() {
+    // Free locals in any remaining frames
+    for (int f = call_top; f >= 0; f--) {
+        for (int i = 0; i < call_stack[f].local_count; i++) {
+            if (call_stack[f].locals[i].is_used && call_stack[f].locals[i].type == RT_VAR_STRING && call_stack[f].locals[i].value.string_value) {
+                mod_free(call_stack[f].locals[i].value.string_value);
+            }
+            call_stack[f].locals[i].is_used = 0;
+        }
+        call_stack[f].local_count = 0;
+    }
+    call_top = -1;
     for (int i = 0; i < runtime_var_count; i++) {
         if (runtime_vars[i].is_used && runtime_vars[i].type == RT_VAR_STRING && 
             runtime_vars[i].value.string_value) {
@@ -195,6 +269,8 @@ int run_bytecode_file(const char *bytecode_file)
     // Initialize runtime state
     runtime_var_count = 0;
     stack_top = -1;
+    call_top = -1;
+    try_top = -1;
     
     // Execute bytecode
     int pc = 0;  // Program counter
@@ -549,6 +625,99 @@ int run_bytecode_file(const char *bytecode_file)
                 break;
             }
 
+            case OP_TRY: {
+                // Format: [handler_pc:int]
+                if (pc + 4 > (int)header.code_size) {
+                    printf("Runtime error: Truncated TRY instruction\n");
+                    goto cleanup;
+                }
+                int handler_pc = 0;
+                mod_memcpy(&handler_pc, code + pc, 4);
+                pc += 4;
+                if (try_top >= MAX_TRY_DEPTH - 1) {
+                    printf("Runtime error: Try stack overflow\n");
+                    goto cleanup;
+                }
+                try_top++;
+                try_stack[try_top].handler_pc = handler_pc;
+                try_stack[try_top].call_top_at_try = call_top;
+                try_stack[try_top].stack_top_at_try = stack_top;
+                break;
+            }
+
+            case OP_END_TRY: {
+                if (try_top < 0) {
+                    printf("Runtime error: END_TRY with empty try stack\n");
+                    goto cleanup;
+                }
+                try_top--;
+                break;
+            }
+
+            case OP_THROW: {
+                // Pop exception value (int or string), then unwind to nearest handler
+                stack_value_t exc;
+                if (stack_top >= 0) exc = pop_value();
+                else { exc.type = RT_VAR_INT; exc.value.int_value = 1; }
+
+                if (try_top < 0) {
+                    // Uncaught exception
+                    if (exc.type == RT_VAR_STRING && exc.value.string_value) {
+                        printf("Uncaught exception: %s\n", exc.value.string_value);
+                        mod_free(exc.value.string_value);
+                    } else if (exc.type == RT_VAR_INT) {
+                        printf("Uncaught exception: %d\n", exc.value.int_value);
+                    } else {
+                        printf("Uncaught exception\n");
+                    }
+                    goto cleanup;
+                }
+
+                // Get nearest handler
+                try_entry_t handler = try_stack[try_top];
+                // Pop handler (we're transferring control to catch)
+                try_top--;
+
+                // Unwind call frames until we reach the frame depth at time of try
+                while (call_top > handler.call_top_at_try) {
+                    // Clean locals
+                    for (int i = 0; i < call_stack[call_top].local_count; i++) {
+                        if (call_stack[call_top].locals[i].is_used &&
+                            call_stack[call_top].locals[i].type == RT_VAR_STRING &&
+                            call_stack[call_top].locals[i].value.string_value) {
+                            mod_free(call_stack[call_top].locals[i].value.string_value);
+                        }
+                        call_stack[call_top].locals[i].is_used = 0;
+                    }
+                    call_stack[call_top].local_count = 0;
+                    // Drop stack to marker
+                    int marker = call_stack[call_top].stack_marker;
+                    while (stack_top >= marker) {
+                        stack_value_t v = pop_value();
+                        if (v.type == RT_VAR_STRING && v.value.string_value) mod_free(v.value.string_value);
+                    }
+                    call_top--;
+                }
+
+                // Restore stack to the depth at time of try
+                while (stack_top > handler.stack_top_at_try) {
+                    stack_value_t v = pop_value();
+                    if (v.type == RT_VAR_STRING && v.value.string_value) mod_free(v.value.string_value);
+                }
+
+                // Push exception value for catch block
+                if (exc.type == RT_VAR_INT) {
+                    push_int(exc.value.int_value);
+                } else if (exc.type == RT_VAR_STRING) {
+                    push_string(exc.value.string_value);
+                    if (exc.value.string_value) mod_free(exc.value.string_value);
+                }
+
+                // Jump to handler PC
+                pc = handler.handler_pc;
+                break;
+            }
+
             case OP_PRINT: {
                 // Handle both int and string printing
                 if (stack_top < 0) {
@@ -566,92 +735,158 @@ int run_bytecode_file(const char *bytecode_file)
             }
             
             case OP_CALL_BUILTIN: {
-                // Read function name from data section
-                if (pc + 4 > (int)header.code_size) {
+                // Format: [name_offset:int][argc:int]
+                if (pc + 8 > (int)header.code_size) {
                     printf("Runtime error: Truncated CALL_BUILTIN instruction\n");
                     goto cleanup;
                 }
-                int string_offset;
-                mod_memcpy(&string_offset, code + pc, 4);
-                pc += 4;
-                
-                if (string_offset >= (int)header.data_size) {
+                int name_off = 0; int argc = 0;
+                mod_memcpy(&name_off, code + pc, 4);
+                mod_memcpy(&argc, code + pc + 4, 4);
+                pc += 8;
+
+                if (name_off < 0 || name_off >= (int)header.data_size) {
                     printf("Runtime error: Invalid string offset in CALL_BUILTIN\n");
                     goto cleanup;
                 }
-                
-                char *func_name = (char *)(data + string_offset);
-                
-                // Handle built-in functions
+                char *func_name = (char *)(data + name_off);
+
+                // Pop args into an array in call order (args[0] is first argument)
+                #define BUILTIN_MAX_ARGS 8
+                if (argc < 0 || argc > BUILTIN_MAX_ARGS) argc = (argc < 0) ? 0 : BUILTIN_MAX_ARGS;
+                stack_value_t args[BUILTIN_MAX_ARGS];
+                for (int i = 0; i < argc; i++) {
+                    // Stack is LIFO: last pushed is last arg
+                    args[argc - 1 - i] = pop_value();
+                }
+
+                // Helper to free all string args
+                #define FREE_ARGS() do { \
+                    for (int ai = 0; ai < argc; ai++) { \
+                        if (args[ai].type == RT_VAR_STRING && args[ai].value.string_value) \
+                            mod_free(args[ai].value.string_value); \
+                    } \
+                } while (0)
+
+                // Built-ins
                 if (mod_strcmp(func_name, "file_exists") == 0) {
-                    // For now, always return 0 (false) - no file checking in bytecode yet
                     push_int(0);
+                    FREE_ARGS();
                 } else if (mod_strcmp(func_name, "min") == 0) {
-                    // min() function - requires 2 arguments on stack
-                    if (stack_top < 1) {
-                        printf("Runtime error: min() requires 2 arguments\n");
-                        goto cleanup;
-                    }
-                    stack_value_t b = pop_value();
-                    stack_value_t a = pop_value();
-                    
-                    if (a.type == RT_VAR_INT && b.type == RT_VAR_INT) {
-                        push_int(a.value.int_value < b.value.int_value ? a.value.int_value : b.value.int_value);
-                    } else {
-                        printf("Runtime error: min() requires two integers\n");
-                        if (a.type == RT_VAR_STRING && a.value.string_value) mod_free(a.value.string_value);
-                        if (b.type == RT_VAR_STRING && b.value.string_value) mod_free(b.value.string_value);
-                        goto cleanup;
-                    }
+                    if (argc < 2 || args[0].type != RT_VAR_INT || args[1].type != RT_VAR_INT) { printf("Runtime error: min() requires two integers\n"); FREE_ARGS(); break; }
+                    push_int(args[0].value.int_value < args[1].value.int_value ? args[0].value.int_value : args[1].value.int_value);
+                    FREE_ARGS();
                 } else if (mod_strcmp(func_name, "max") == 0) {
-                    // max() function - requires 2 arguments on stack
-                    if (stack_top < 1) {
-                        printf("Runtime error: max() requires 2 arguments\n");
-                        goto cleanup;
-                    }
-                    stack_value_t b = pop_value();
-                    stack_value_t a = pop_value();
-                    
-                    if (a.type == RT_VAR_INT && b.type == RT_VAR_INT) {
-                        push_int(a.value.int_value > b.value.int_value ? a.value.int_value : b.value.int_value);
-                    } else {
-                        printf("Runtime error: max() requires two integers\n");
-                        if (a.type == RT_VAR_STRING && a.value.string_value) mod_free(a.value.string_value);
-                        if (b.type == RT_VAR_STRING && b.value.string_value) mod_free(b.value.string_value);
-                        goto cleanup;
-                    }
+                    if (argc < 2 || args[0].type != RT_VAR_INT || args[1].type != RT_VAR_INT) { printf("Runtime error: max() requires two integers\n"); FREE_ARGS(); break; }
+                    push_int(args[0].value.int_value > args[1].value.int_value ? args[0].value.int_value : args[1].value.int_value);
+                    FREE_ARGS();
                 } else if (mod_strcmp(func_name, "abs") == 0) {
-                    // abs() function - requires 1 argument on stack
-                    if (stack_top < 0) {
-                        printf("Runtime error: abs() requires 1 argument\n");
-                        goto cleanup;
-                    }
-                    stack_value_t a = pop_value();
-                    
-                    if (a.type == RT_VAR_INT) {
-                        push_int(a.value.int_value < 0 ? -a.value.int_value : a.value.int_value);
-                    } else {
-                        printf("Runtime error: abs() requires an integer\n");
-                        if (a.type == RT_VAR_STRING && a.value.string_value) mod_free(a.value.string_value);
-                        goto cleanup;
-                    }
+                    if (argc < 1 || args[0].type != RT_VAR_INT) { printf("Runtime error: abs() requires an integer\n"); FREE_ARGS(); break; }
+                    push_int(args[0].value.int_value < 0 ? -args[0].value.int_value : args[0].value.int_value);
+                    FREE_ARGS();
+                }
+                // Data structure stubs
+                else if (mod_strcmp(func_name, "dict") == 0 || mod_strcmp(func_name, "list") == 0 || mod_strcmp(func_name, "set") == 0 || mod_strcmp(func_name, "regex") == 0 || mod_strcmp(func_name, "range") == 0 || mod_strcmp(func_name, "compose") == 0 || mod_strcmp(func_name, "curry") == 0 || mod_strcmp(func_name, "map") == 0 || mod_strcmp(func_name, "filter") == 0 || mod_strcmp(func_name, "reduce") == 0 || mod_strcmp(func_name, "define_exception") == 0 || mod_strcmp(func_name, "optional_create") == 0 || mod_strcmp(func_name, "union_create") == 0) {
+                    push_int(0);
+                    FREE_ARGS();
+                } else if (mod_strcmp(func_name, "dict_set") == 0 || mod_strcmp(func_name, "list_append") == 0 || mod_strcmp(func_name, "set_add") == 0 || mod_strcmp(func_name, "union_set") == 0) {
+                    // Procedure-like: return 0
+                    push_int(0);
+                    FREE_ARGS();
+                } else if (mod_strcmp(func_name, "dict_get") == 0 || mod_strcmp(func_name, "list_get") == 0) {
+                    push_int(0);
+                    FREE_ARGS();
+                } else if (mod_strcmp(func_name, "optional_get") == 0) {
+                    push_int(0);
+                    FREE_ARGS();
+                } else if (mod_strcmp(func_name, "dict_has") == 0 || mod_strcmp(func_name, "set_contains") == 0 || mod_strcmp(func_name, "regex_match") == 0 || mod_strcmp(func_name, "optional_has_value") == 0 || mod_strcmp(func_name, "is_type") == 0 || mod_strcmp(func_name, "is_null") == 0) {
+                    push_int(0);
+                    FREE_ARGS();
+                } else if (mod_strcmp(func_name, "dict_size") == 0 || mod_strcmp(func_name, "list_size") == 0 || mod_strcmp(func_name, "set_size") == 0) {
+                    push_int(0);
+                    FREE_ARGS();
+                } else if (mod_strcmp(func_name, "interpolate") == 0 || mod_strcmp(func_name, "multiline") == 0 || mod_strcmp(func_name, "cast") == 0 || mod_strcmp(func_name, "typeof") == 0) {
+                    // Return a placeholder string
+                    push_string("");
+                    FREE_ARGS();
                 } else {
                     printf("Runtime error: Unknown built-in function '%s'\n", func_name);
-                    goto cleanup;
+                    FREE_ARGS();
+                    break;
                 }
                 break;
             }
             
             case OP_CALL_USER: {
-                // User-defined functions not yet implemented
-                printf("Runtime error: User-defined functions not yet supported\n");
-                goto cleanup;
+                // Format: [addr:int][argc:int] with args already pushed (left-to-right)
+                if (pc + 8 > (int)header.code_size) {
+                    printf("Runtime error: Truncated CALL_USER instruction\n");
+                    goto cleanup;
+                }
+                int target_addr = 0;
+                int argc = 0;
+                mod_memcpy(&target_addr, code + pc, 4);
+                mod_memcpy(&argc, code + pc + 4, 4);
+                pc += 8;
+
+                if (call_top >= MAX_CALL_DEPTH - 1) {
+                    printf("Runtime error: Call stack overflow\n");
+                    goto cleanup;
+                }
+                call_top++;
+                call_stack[call_top].return_pc = pc;
+                call_stack[call_top].stack_marker = stack_top - argc + 1; // position of first arg on stack
+                call_stack[call_top].local_count = 0;
+
+                // Jump to function body
+                pc = target_addr;
+                break;
             }
             
             case OP_RETURN: {
-                // Function return not yet implemented
-                printf("Runtime error: Function return not yet supported\n");
-                goto cleanup;
+                if (call_top < 0) {
+                    printf("Runtime error: RETURN with empty call stack\n");
+                    goto cleanup;
+                }
+                // Return value is on stack top
+                if (stack_top < 0) {
+                    printf("Runtime error: RETURN without value on stack\n");
+                    goto cleanup;
+                }
+                stack_value_t ret = pop_value();
+
+                // Drop any leftover stack entries back to stack_marker
+                int marker = call_stack[call_top].stack_marker;
+                while (stack_top >= marker) {
+                    stack_value_t v = pop_value();
+                    if (v.type == RT_VAR_STRING && v.value.string_value) mod_free(v.value.string_value);
+                }
+
+                // Push return value
+                if (ret.type == RT_VAR_INT) {
+                    push_int(ret.value.int_value);
+                } else if (ret.type == RT_VAR_STRING) {
+                    push_string(ret.value.string_value);
+                    if (ret.value.string_value) mod_free(ret.value.string_value);
+                }
+
+                // Restore PC
+                pc = call_stack[call_top].return_pc;
+                // Free any string locals
+                for (int i = 0; i < call_stack[call_top].local_count; i++) {
+                    if (call_stack[call_top].locals[i].is_used && call_stack[call_top].locals[i].type == RT_VAR_STRING && call_stack[call_top].locals[i].value.string_value) {
+                        mod_free(call_stack[call_top].locals[i].value.string_value);
+                    }
+                    call_stack[call_top].locals[i].is_used = 0;
+                }
+                call_stack[call_top].local_count = 0;
+                // Remove any try frames associated with this call frame
+                int cur_frame = call_top;
+                while (try_top >= 0 && try_stack[try_top].call_top_at_try == cur_frame) {
+                    try_top--;
+                }
+                call_top--;
+                break;
             }
             
             case OP_EXIT:

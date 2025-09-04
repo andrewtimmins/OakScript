@@ -206,6 +206,28 @@ char *mod_strncpy(char *dest, const char *src, size_t n) {
     return dest;
 }
 
+char *mod_strcat(char *dest, const char *src) {
+    char *d = dest;
+    // Find end of dest
+    while (*d) d++;
+    // Append src
+    while ((*d++ = *src++) != '\0');
+    return dest;
+}
+
+char *mod_strncat(char *dest, const char *src, size_t n) {
+    char *d = dest;
+    // Move to end of dest
+    while (*d) d++;
+    // Append up to n chars from src
+    while (n-- && *src) {
+        *d++ = *src++;
+    }
+    // Null-terminate
+    *d = '\0';
+    return dest;
+}
+
 size_t mod_strcspn(const char *s, const char *reject) {
     size_t count = 0;
     const char *p1, *p2;

@@ -1,0 +1,239 @@
+#include "h.value"
+#include "h.memory"
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+ValueStack expr_stack;
+
+// Value creation functions
+Value value_int(int val) {
+    Value v;
+    v.type = VALUE_INT;
+    v.data.int_val = val;
+    return v;
+}
+
+Value value_float(float val) {
+    Value v;
+    v.type = VALUE_FLOAT;
+    v.data.float_val = val;
+    return v;
+}
+
+Value value_string(const char* str) {
+    Value v;
+    v.type = VALUE_STRING;
+    if (str) {
+        int len = mod_strlen(str);
+        v.data.string_val = (char*)mod_malloc(len + 1);
+        mod_strcpy(v.data.string_val, str);
+    } else {
+        v.data.string_val = NULL;
+    }
+    return v;
+}
+
+Value value_bool(int val) {
+    Value v;
+    v.type = VALUE_BOOL;
+    v.data.bool_val = val ? 1 : 0;
+    return v;
+}
+
+Value value_handle(int handle) {
+    Value v;
+    v.type = VALUE_HANDLE;
+    v.data.handle_val = handle;
+    return v;
+}
+
+Value value_null(void) {
+    Value v;
+    v.type = VALUE_NULL;
+    v.data.int_val = 0;
+    return v;
+}
+
+Value value_error(const char* msg) {
+    Value v;
+    v.type = VALUE_ERROR;
+    if (msg) {
+        int len = mod_strlen(msg);
+        v.data.error_msg = (char*)mod_malloc(len + 1);
+        mod_strcpy(v.data.error_msg, msg);
+    } else {
+        v.data.error_msg = NULL;
+    }
+    return v;
+}
+
+// Value utility functions
+void value_destroy(Value* val) {
+    if (!val) return;
+    
+    if (val->type == VALUE_STRING && val->data.string_val) {
+        mod_free(val->data.string_val);
+        val->data.string_val = NULL;
+    } else if (val->type == VALUE_ERROR && val->data.error_msg) {
+        mod_free(val->data.error_msg);
+        val->data.error_msg = NULL;
+    }
+    val->type = VALUE_NULL;
+}
+
+Value value_copy(const Value* val) {
+    if (!val) return value_null();
+    
+    switch (val->type) {
+        case VALUE_INT:
+            return value_int(val->data.int_val);
+        case VALUE_FLOAT:
+            return value_float(val->data.float_val);
+        case VALUE_STRING:
+            return value_string(val->data.string_val);
+        case VALUE_BOOL:
+            return value_bool(val->data.bool_val);
+        case VALUE_HANDLE:
+            return value_handle(val->data.handle_val);
+        case VALUE_ERROR:
+            return value_error(val->data.error_msg);
+        case VALUE_NULL:
+        default:
+            return value_null();
+    }
+}
+
+int value_is_truthy(const Value* val) {
+    if (!val) return 0;
+    
+    switch (val->type) {
+        case VALUE_INT:
+            return val->data.int_val != 0;
+        case VALUE_FLOAT:
+            return val->data.float_val != 0.0f;
+        case VALUE_STRING:
+            return val->data.string_val != NULL && val->data.string_val[0] != '\0';
+        case VALUE_BOOL:
+            return val->data.bool_val;
+        case VALUE_HANDLE:
+            return val->data.handle_val != 0;
+        case VALUE_NULL:
+        case VALUE_ERROR:
+        default:
+            return 0;
+    }
+}
+
+char* value_to_string(const Value* val) {
+    if (!val) return mod_strdup("null");
+    
+    switch (val->type) {
+        case VALUE_INT: {
+            char buffer[32];
+            sprintf(buffer, "%d", val->data.int_val);
+            return mod_strdup(buffer);
+        }
+        case VALUE_FLOAT: {
+            char buffer[32];
+            sprintf(buffer, "%.6f", val->data.float_val);
+            return mod_strdup(buffer);
+        }
+        case VALUE_STRING:
+            return val->data.string_val ? mod_strdup(val->data.string_val) : mod_strdup("");
+        case VALUE_BOOL:
+            return mod_strdup(val->data.bool_val ? "true" : "false");
+        case VALUE_HANDLE: {
+            char buffer[32];
+            sprintf(buffer, "handle:%d", val->data.handle_val);
+            return mod_strdup(buffer);
+        }
+        case VALUE_ERROR:
+            return val->data.error_msg ? mod_strdup(val->data.error_msg) : mod_strdup("error");
+        case VALUE_NULL:
+        default:
+            return mod_strdup("null");
+    }
+}
+
+int value_to_int(const Value* val) {
+    if (!val) return 0;
+    
+    switch (val->type) {
+        case VALUE_INT:
+            return val->data.int_val;
+        case VALUE_FLOAT:
+            return (int)val->data.float_val;
+        case VALUE_STRING:
+            return val->data.string_val ? atoi(val->data.string_val) : 0;
+        case VALUE_BOOL:
+            return val->data.bool_val;
+        case VALUE_HANDLE:
+            return val->data.handle_val;
+        case VALUE_NULL:
+        case VALUE_ERROR:
+        default:
+            return 0;
+    }
+}
+
+float value_to_float(const Value* val) {
+    if (!val) return 0.0f;
+    
+    switch (val->type) {
+        case VALUE_INT:
+            return (float)val->data.int_val;
+        case VALUE_FLOAT:
+            return val->data.float_val;
+        case VALUE_STRING:
+            return val->data.string_val ? (float)atof(val->data.string_val) : 0.0f;
+        case VALUE_BOOL:
+            return val->data.bool_val ? 1.0f : 0.0f;
+        case VALUE_HANDLE:
+            return (float)val->data.handle_val;
+        case VALUE_NULL:
+        case VALUE_ERROR:
+        default:
+            return 0.0f;
+    }
+}
+
+// Stack operations
+void stack_init(void) {
+    expr_stack.top = -1;
+}
+
+void stack_push(Value val) {
+    if (expr_stack.top < MAX_VALUE_STACK - 1) {
+        expr_stack.top++;
+        expr_stack.values[expr_stack.top] = val;
+    }
+}
+
+Value stack_pop(void) {
+    if (expr_stack.top >= 0) {
+        Value val = expr_stack.values[expr_stack.top];
+        expr_stack.top--;
+        return val;
+    }
+    return value_null();
+}
+
+Value stack_peek(void) {
+    if (expr_stack.top >= 0) {
+        return expr_stack.values[expr_stack.top];
+    }
+    return value_null();
+}
+
+int stack_size(void) {
+    return expr_stack.top + 1;
+}
+
+void stack_clear(void) {
+    while (expr_stack.top >= 0) {
+        value_destroy(&expr_stack.values[expr_stack.top]);
+        expr_stack.top--;
+    }
+}
+

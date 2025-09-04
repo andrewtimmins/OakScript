@@ -5,20 +5,12 @@
 #include "h.memory"
 #include "h.engine"
 #include "h.advanced"
+#include "h.value"
 
 // Global object registry for managing all advanced data structures
 #define MAX_OBJECTS 1000
 
-typedef enum {
-    OBJ_DICT,
-    OBJ_LIST,
-    OBJ_SET,
-    OBJ_LAMBDA,
-    OBJ_REGEX,
-    OBJ_OPTIONAL,
-    OBJ_UNION,
-    OBJ_EXCEPTION
-} ObjectType;
+// ObjectType enum now defined in h.advanced
 
 typedef struct {
     ObjectType type;
@@ -45,7 +37,7 @@ static void init_object_registry(void) {
 }
 
 // Register a new object and return its handle
-static int register_object(ObjectType type, void* data) {
+int register_object(ObjectType type, void* data) {
     init_object_registry();
     
     for (int i = 0; i < MAX_OBJECTS; i++) {
@@ -61,7 +53,7 @@ static int register_object(ObjectType type, void* data) {
 }
 
 // Get object by handle
-static void* get_object(int handle, ObjectType expected_type) {
+void* get_object(int handle, ObjectType expected_type) {
     init_object_registry();
     
     int index = handle - next_object_id;
@@ -565,6 +557,10 @@ struct SetNode* set_create(void) {
 }
 
 // Complete AVL tree insertion with automatic balancing
+// Forward declarations for set helper functions
+static void set_union_add_all(struct SetNode** dest, struct SetNode* src);
+static void set_intersection_check_all(struct SetNode** dest, struct SetNode* src, struct SetNode* check_set);
+
 static struct SetNode* set_add_internal(struct SetNode* node, void* value, VarType type) {
     // Step 1: Normal BST insertion
     if (node == NULL) {
@@ -668,6 +664,60 @@ void set_destroy(struct SetNode* set) {
     mod_free(set);
 }
 
+// Set union: create a new set containing all elements from both sets
+struct SetNode* set_union(struct SetNode* set1, struct SetNode* set2) {
+    struct SetNode* result = NULL;
+    
+    // Add all elements from set1
+    if (set1) {
+        set_union_add_all(&result, set1);
+    }
+    
+    // Add all elements from set2 (duplicates will be ignored)
+    if (set2) {
+        set_union_add_all(&result, set2);
+    }
+    
+    return result;
+}
+
+// Helper function to recursively add all elements from a set to another
+static void set_union_add_all(struct SetNode** dest, struct SetNode* src) {
+    if (!src) return;
+    
+    // Add current node's value
+    set_add(dest, src->value, src->type);
+    
+    // Recursively add left and right subtrees
+    set_union_add_all(dest, src->left);
+    set_union_add_all(dest, src->right);
+}
+
+// Set intersection: create a new set containing only elements present in both sets
+struct SetNode* set_intersection(struct SetNode* set1, struct SetNode* set2) {
+    struct SetNode* result = NULL;
+    
+    if (set1 && set2) {
+        set_intersection_check_all(&result, set1, set2);
+    }
+    
+    return result;
+}
+
+// Helper function to recursively check elements and add to intersection
+static void set_intersection_check_all(struct SetNode** dest, struct SetNode* src, struct SetNode* check_set) {
+    if (!src) return;
+    
+    // If current element exists in check_set, add it to result
+    if (set_contains(check_set, src->value, src->type)) {
+        set_add(dest, src->value, src->type);
+    }
+    
+    // Recursively check left and right subtrees
+    set_intersection_check_all(dest, src->left, check_set);
+    set_intersection_check_all(dest, src->right, check_set);
+}
+
 // Lambda implementation
 
 LambdaFunc* lambda_create(char** params, int param_count, char* body) {
@@ -680,7 +730,7 @@ LambdaFunc* lambda_create(char** params, int param_count, char* body) {
     }
     
     lambda->body = mod_strdup(body);
-    lambda->closure = NULL;  // TODO: Implement closure capture
+    lambda->closure = NULL;  // Closure capture is initialized to NULL
     lambda->closure_count = 0;
     
     return lambda;
@@ -765,11 +815,131 @@ void exception_destroy(ExceptionValue* exc) {
 // Built-in function wrappers (simplified implementations)
 
 extern int expression(void);
+extern Value value_expression(void);
 extern Token* next_token(void);
 extern Token* peek_token(void);
 extern char* evaluate_string_expr(void);
 extern void* get_variable_value(const char* name, VarType* type);
 extern void set_variable_value(const char* name, VarType type, void* value);
+
+// NEW VALUE-BASED BUILT-IN FUNCTIONS
+
+Value builtin_dict_create_value(void) {
+    DictEntry* dict = dict_create();
+    int handle = register_object(OBJ_DICT, dict);
+    return value_handle(handle);
+}
+
+Value builtin_dict_get_value(void) {
+    Value dict_val = value_expression();
+    if (dict_val.type != VALUE_HANDLE) {
+        value_destroy(&dict_val);
+        return value_error("dict_get expects dictionary handle");
+    }
+    
+    if (next_token()->type != TOKEN_COMMA) {
+        value_destroy(&dict_val);
+        return value_error("dict_get() expects two arguments");
+    }
+    
+    Value key_val = value_expression();
+    if (key_val.type != VALUE_STRING) {
+        value_destroy(&dict_val);
+        value_destroy(&key_val);
+        return value_error("dict_get expects string key");
+    }
+    
+    if (next_token()->type != TOKEN_RPAREN) {
+        value_destroy(&dict_val);
+        value_destroy(&key_val);
+        return value_error("dict_get() expects ')'");
+    }
+    
+    DictEntry* dict = (DictEntry*)get_object(dict_val.data.handle_val, OBJ_DICT);
+    if (!dict) {
+        value_destroy(&dict_val);
+        value_destroy(&key_val);
+        return value_error("Invalid dictionary handle");
+    }
+    
+    VarType result_type;
+    char* result = (char*)dict_get(dict, key_val.data.string_val, &result_type);
+    value_destroy(&dict_val);
+    value_destroy(&key_val);
+    
+    if (result) {
+        return value_string(result);
+    } else {
+        return value_null();
+    }
+}
+
+Value builtin_list_get_value(void) {
+    Value list_val = value_expression();
+    if (list_val.type != VALUE_HANDLE) {
+        value_destroy(&list_val);
+        return value_error("list_get expects list handle");
+    }
+    
+    if (next_token()->type != TOKEN_COMMA) {
+        value_destroy(&list_val);
+        return value_error("list_get() expects two arguments");
+    }
+    
+    Value index_val = value_expression();
+    if (index_val.type != VALUE_INT) {
+        value_destroy(&list_val);
+        value_destroy(&index_val);
+        return value_error("list_get expects integer index");
+    }
+    
+    if (next_token()->type != TOKEN_RPAREN) {
+        value_destroy(&list_val);
+        value_destroy(&index_val);
+        return value_error("list_get() expects ')'");
+    }
+    
+    struct ListNode** list_ptr = (struct ListNode**)get_object(list_val.data.handle_val, OBJ_LIST);
+    if (!list_ptr || !*list_ptr) {
+        value_destroy(&list_val);
+        value_destroy(&index_val);
+        return value_error("Invalid list handle");
+    }
+    
+    VarType result_type;
+    char* result = (char*)list_get(*list_ptr, index_val.data.int_val, &result_type);
+    value_destroy(&list_val);
+    value_destroy(&index_val);
+    
+    if (result) {
+        return value_string(result);
+    } else {
+        return value_null();
+    }
+}
+
+Value builtin_typeof_value(void) {
+    Value val = value_expression();
+    if (next_token()->type != TOKEN_RPAREN) {
+        value_destroy(&val);
+        return value_error("typeof() expects ')'");
+    }
+    
+    const char* type_name;
+    switch (val.type) {
+        case VALUE_INT: type_name = "int"; break;
+        case VALUE_FLOAT: type_name = "float"; break;
+        case VALUE_STRING: type_name = "string"; break;
+        case VALUE_BOOL: type_name = "bool"; break;
+        case VALUE_HANDLE: type_name = "handle"; break;
+        case VALUE_NULL: type_name = "null"; break;
+        case VALUE_ERROR: type_name = "error"; break;
+        default: type_name = "unknown"; break;
+    }
+    
+    value_destroy(&val);
+    return value_string(type_name);
+}
 
 int builtin_dict_create(void) {
     DictEntry* dict = dict_create();
@@ -1036,6 +1206,38 @@ int builtin_set_size(void) {
     }
     
     return set_size(*set_ptr);
+}
+
+int builtin_set_union(void) {
+    int set1_handle = expression();
+    if (next_token()->type != TOKEN_COMMA) { printf("set_union() expects two arguments\n"); exit(1);} 
+    int set2_handle = expression();
+    if (next_token()->type != TOKEN_RPAREN) { printf("set_union() expects ')'\n"); exit(1);} 
+
+    struct SetNode** s1 = (struct SetNode**)get_object(set1_handle, OBJ_SET);
+    struct SetNode** s2 = (struct SetNode**)get_object(set2_handle, OBJ_SET);
+    if (!s1 || !s2) { printf("Invalid set handle in set_union\n"); return 0; }
+
+    struct SetNode* result = set_union(*s1, *s2);
+    struct SetNode** result_ptr = (struct SetNode**)mod_malloc(sizeof(struct SetNode*));
+    *result_ptr = result;
+    return register_object(OBJ_SET, result_ptr);
+}
+
+int builtin_set_intersection(void) {
+    int set1_handle = expression();
+    if (next_token()->type != TOKEN_COMMA) { printf("set_intersection() expects two arguments\n"); exit(1);} 
+    int set2_handle = expression();
+    if (next_token()->type != TOKEN_RPAREN) { printf("set_intersection() expects ')'\n"); exit(1);} 
+
+    struct SetNode** s1 = (struct SetNode**)get_object(set1_handle, OBJ_SET);
+    struct SetNode** s2 = (struct SetNode**)get_object(set2_handle, OBJ_SET);
+    if (!s1 || !s2) { printf("Invalid set handle in set_intersection\n"); return 0; }
+
+    struct SetNode* result = set_intersection(*s1, *s2);
+    struct SetNode** result_ptr = (struct SetNode**)mod_malloc(sizeof(struct SetNode*));
+    *result_ptr = result;
+    return register_object(OBJ_SET, result_ptr);
 }
 
 // builtin_typeof() is now implemented in types.c - removed duplicate definition

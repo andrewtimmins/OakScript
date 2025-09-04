@@ -4,6 +4,18 @@
 #include "h.engine"
 #include "h.memory"
 
+// Object type enumeration for the registry
+typedef enum {
+    OBJ_DICT,
+    OBJ_LIST,
+    OBJ_SET,
+    OBJ_LAMBDA,
+    OBJ_REGEX,
+    OBJ_OPTIONAL,
+    OBJ_UNION,
+    OBJ_EXCEPTION
+} ObjectType;
+
 // Advanced Data Structures
 
 // Dictionary/Map Entry
@@ -76,6 +88,7 @@ typedef enum {
     PATTERN_RANGE,
     PATTERN_WILDCARD,
     PATTERN_TYPE,
+    PATTERN_VARIABLE,
     PATTERN_GUARD
 } PatternType;
 
@@ -92,7 +105,11 @@ typedef struct {
         } range;
         struct {
             VarType expected_type;
+            char* type_name;
         } type_pattern;
+        struct {
+            char* name;
+        } variable;
         struct {
             char* condition;
         } guard;
@@ -107,6 +124,8 @@ typedef struct {
 // Function prototypes for advanced features
 
 // Object management
+int register_object(ObjectType type, void* data);
+void* get_object(int handle, ObjectType expected_type);
 void release_object(int handle);
 
 // Dictionary operations

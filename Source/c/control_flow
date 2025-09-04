@@ -6,6 +6,8 @@
 #include "h.memory"
 #include "h.engine"
 
+extern void set_variable_value(const char* name, VarType type, void* value);
+
 // Pattern matching implementation
 
 bool pattern_match(Pattern* pattern, void* value, VarType type) {
@@ -301,6 +303,50 @@ void match_statement(void) {
                 if (!found_match && match_value >= start && match_value <= end) {
                     found_match = true;
                     in_case = true;
+                }
+            } else if (pattern_tok->type == TOKEN_STRING) {
+                // String literal pattern
+                char* string_literal = mod_strdup(pattern_tok->lexeme);
+                next_token(); // consume string
+                
+                cases[case_count].pattern.type = PATTERN_LITERAL;
+                cases[case_count].pattern.data.literal.value = string_literal;
+                cases[case_count].pattern.data.literal.value_type = VAR_STRING;
+                
+                // For string matching, we need to get the actual variable value
+                // Note: This currently matches any string pattern - full implementation would require 
+                // the match expression to provide string values for comparison
+                if (!found_match) {
+                    found_match = true;
+                    in_case = true;
+                }
+            } else if (pattern_tok->type == TOKEN_IDENT) {
+                // Variable pattern or type pattern
+                char* identifier = pattern_tok->lexeme;
+                next_token(); // consume identifier
+                
+                // Check if this looks like a type pattern (starts with uppercase)
+                if (identifier[0] >= 'A' && identifier[0] <= 'Z') {
+                    // Type pattern (e.g., Int, String, Bool)
+                    cases[case_count].pattern.type = PATTERN_TYPE;
+                    cases[case_count].pattern.data.type_pattern.type_name = mod_strdup(identifier);
+                    
+                    // Type checking would be implemented here in a full system
+                    if (!found_match) {
+                        found_match = true;
+                        in_case = true;
+                    }
+                } else {
+                    // Variable pattern - always matches and binds the value
+                    cases[case_count].pattern.type = PATTERN_VARIABLE;
+                    cases[case_count].pattern.data.variable.name = mod_strdup(identifier);
+                    
+                    if (!found_match) {
+                        // Bind the match value to this variable
+                        set_variable_value(identifier, VAR_INT, &match_value);
+                        found_match = true;
+                        in_case = true;
+                    }
                 }
             }
             

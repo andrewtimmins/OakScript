@@ -7,7 +7,7 @@ LINK      = link
 TARGET    = <OakScript$Dir>.OakScript
 
 # Objects
-OBJS      = o.module o.header o.engine o.core o.memory o.variables o.math o.swi o.debug o.compile o.runtime o.advanced o.strings o.control_flow o.functional o.exceptions o.types
+OBJS      = o.module o.header o.engine o.core o.memory o.variables o.math o.swi o.debug o.compile o.runtime o.value o.advanced o.strings o.control_flow o.functional o.exceptions o.types
 
 # Libraries (stubs + kernel for RMA alloc/free)
 LIBS      = C:o.stubs
@@ -75,6 +75,9 @@ o.functional: c.functional h.advanced h.engine h.memory
 o.exceptions: c.exceptions h.advanced h.engine h.memory
 	$(CC) $(CFLAGS) c.exceptions -o o.exceptions
 
+o.value: c.value h.value h.memory
+	$(CC) $(CFLAGS) c.value -o o.value
+
 o.types: c.types h.advanced h.engine h.memory
 	$(CC) $(CFLAGS) c.types -o o.types
 
@@ -89,10 +92,39 @@ install: $(TARGET)
 
 
 
+o.math:	c.math
+o.math:	h.math
+o.math:	h.engine
+o.module:	c.module
+o.module:	C:h.kernel
+o.module:	C:h.swis
+o.module:	h.header
+o.module:	h.memory
+o.module:	h.compile
+o.module:	h.runtime
+o.module:	h.compile
 o.engine:	c.engine
 o.engine:	C:h.kernel
 o.engine:	h.memory
 o.engine:	h.engine
+o.core:	c.script
+o.core:	C:h.kernel
+o.core:	h.memory
+o.core:	h.engine
+o.core:	h.variables
+o.core:	h.engine
+o.core:	h.strings
+o.core:	h.engine
+o.core:	h.math
+o.core:	h.swi
+o.core:	C:h.kernel
+o.core:	h.engine
+o.core:	h.debug
+o.core:	h.advanced
+o.core:	h.engine
+o.core:	h.memory
+o.core:	h.value
+o.core:	h.engine
 o.memory:	c.memory
 o.memory:	C:h.kernel
 o.memory:	C:h.swis
@@ -102,9 +134,6 @@ o.variables:	h.memory
 o.variables:	h.engine
 o.variables:	h.variables
 o.variables:	h.engine
-o.math:	c.math
-o.math:	h.math
-o.math:	h.engine
 o.swi:	c.swi
 o.swi:	C:h.kernel
 o.swi:	h.memory
@@ -119,22 +148,22 @@ o.debug:	h.memory
 o.debug:	h.engine
 o.debug:	C:h.kernel
 o.debug:	C:h.swis
-o.compile:	c.compile
-o.compile:	C:h.kernel
-o.compile:	C:h.swis
-o.compile:	h.compile
-o.compile:	h.engine
-o.compile:	h.memory
 o.runtime:	c.runtime
 o.runtime:	h.runtime
 o.runtime:	h.compile
 o.runtime:	h.memory
+o.value:	c.value
+o.value:	h.value
+o.value:	h.engine
+o.value:	h.memory
 o.advanced:	c.advanced
 o.advanced:	h.memory
 o.advanced:	h.engine
 o.advanced:	h.advanced
 o.advanced:	h.engine
 o.advanced:	h.memory
+o.advanced:	h.value
+o.advanced:	h.engine
 o.strings:	c.strings
 o.strings:	h.engine
 o.strings:	h.memory
@@ -155,6 +184,8 @@ o.functional:	h.engine
 o.functional:	h.memory
 o.functional:	h.memory
 o.functional:	h.engine
+o.functional:	h.value
+o.functional:	h.engine
 o.exceptions:	c.exceptions
 o.exceptions:	h.advanced
 o.exceptions:	h.engine
@@ -167,27 +198,9 @@ o.types:	h.engine
 o.types:	h.memory
 o.types:	h.memory
 o.types:	h.engine
-o.module:	c.module
-o.module:	C:h.kernel
-o.module:	C:h.swis
-o.module:	h.header
-o.module:	h.memory
-o.module:	h.compile
-o.module:	h.runtime
-o.module:	h.compile
-o.core:	c.script
-o.core:	C:h.kernel
-o.core:	h.memory
-o.core:	h.engine
-o.core:	h.variables
-o.core:	h.engine
-o.core:	h.strings
-o.core:	h.engine
-o.core:	h.math
-o.core:	h.swi
-o.core:	C:h.kernel
-o.core:	h.engine
-o.core:	h.debug
-o.core:	h.advanced
-o.core:	h.engine
-o.core:	h.memory
+o.compile:	c.compile
+o.compile:	C:h.kernel
+o.compile:	C:h.swis
+o.compile:	h.compile
+o.compile:	h.engine
+o.compile:	h.memory

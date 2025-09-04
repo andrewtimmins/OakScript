@@ -13,6 +13,7 @@
 #include "h.swi"
 #include "h.debug"
 #include "h.advanced"
+#include "h.value"
 #ifndef __uintptr_t_defined
 typedef unsigned int uintptr_t;
 #define __uintptr_t_defined
@@ -32,6 +33,14 @@ extern int builtin_set_create(void);
 extern int builtin_set_add(void);
 extern int builtin_set_contains(void);
 extern int builtin_set_size(void);
+extern int builtin_set_union(void);
+extern int builtin_set_intersection(void);
+
+// New Value-based built-in function declarations
+extern Value builtin_dict_create_value(void);
+extern Value builtin_dict_get_value(void);
+extern Value builtin_list_get_value(void);
+extern Value builtin_typeof_value(void);
 extern int builtin_interpolate(void);
 extern int builtin_multiline(void);
 extern int builtin_regex_compile(void);
@@ -61,6 +70,12 @@ extern int builtin_range(void);
 int swi_builtin(void);
 int swi_error_builtin(void);
 void match_statement(void);
+
+// Value-based evaluation functions
+Value value_factor(void);
+Value value_term(void);
+Value value_expression(void);
+Value value_function_call(char *name);
 
 Token tokens[MAX_TOKENS];
 int token_count = 0;
@@ -923,6 +938,220 @@ int expression(void) {
     return left;
 }
 
+// ===== NEW VALUE-BASED EVALUATION SYSTEM =====
+
+Value value_factor(void) {
+    Token *token = peek_token();
+    if (token->type == TOKEN_INT) {
+        next_token();
+        return value_int(token->value);
+    } else if (token->type == TOKEN_FLOAT) {
+        next_token();
+        return value_float(token->float_value);
+    } else if (token->type == TOKEN_MINUS) {
+        // Unary minus
+        next_token();
+        Value v = value_factor();
+        if (v.type == VALUE_INT) {
+            return value_int(-v.data.int_val);
+        } else if (v.type == VALUE_FLOAT) {
+            return value_float(-v.data.float_val);
+        }
+        value_destroy(&v);
+        return value_error("Cannot negate non-numeric value");
+    } else if (token->type == TOKEN_TRUE) {
+        next_token();
+        return value_bool(1);
+    } else if (token->type == TOKEN_FALSE) {
+        next_token();
+        return value_bool(0);
+    } else if (token->type == TOKEN_STRING) {
+        char* str = token->lexeme;
+        next_token();
+        return value_string(str);
+    } else if (token->type == TOKEN_IDENT) {
+        char name[MAX_VAR_NAME];
+        mod_strcpy(name, next_token()->lexeme);
+        if (peek_token()->type == TOKEN_LPAREN) {
+            // Function call - return Value
+            return value_function_call(name);
+        } else {
+            // Variable lookup
+            VarType type;
+            void* var_value = get_variable_value(name, &type);
+            if (!var_value) {
+                return value_error("Undefined variable");
+            }
+            switch (type) {
+                case VAR_INT:
+                    return value_int(*(int*)var_value);
+                case VAR_FLOAT:
+                    return value_float(*(float*)var_value);
+                case VAR_BOOL:
+                    return value_bool(*(int*)var_value);
+                case VAR_STRING:
+                    return value_string((char*)var_value);
+                case VAR_DICT:
+                case VAR_LIST:
+                case VAR_SET:
+                case VAR_LAMBDA:
+                case VAR_REGEX:
+                case VAR_OPTIONAL:
+                case VAR_UNION:
+                    // Return handle for complex types
+                    return value_handle(*(int*)var_value);
+                default:
+                    return value_null();
+            }
+        }
+    } else if (token->type == TOKEN_LPAREN) {
+        next_token();  // Consume '('
+        Value result = value_expression();
+        if (peek_token()->type != TOKEN_RPAREN) {
+            value_destroy(&result);
+            return value_error("Expected ')'");
+        }
+        next_token();  // Consume ')'
+        return result;
+    } else if (token->type == TOKEN_NULL) {
+        next_token();
+        return value_null();
+    }
+    
+    return value_error("Unexpected token in factor");
+}
+
+Value value_term(void) {
+    Value left = value_factor();
+    if (left.type == VALUE_ERROR) return left;
+    
+    while (peek_token()->type == TOKEN_MULTIPLY || peek_token()->type == TOKEN_DIVIDE) {
+        Token *op = next_token();
+        Value right = value_factor();
+        if (right.type == VALUE_ERROR) {
+            value_destroy(&left);
+            return right;
+        }
+        
+        // Perform arithmetic on compatible types
+        if (left.type == VALUE_INT && right.type == VALUE_INT) {
+            if (op->type == TOKEN_MULTIPLY) {
+                int result = left.data.int_val * right.data.int_val;
+                value_destroy(&left);
+                value_destroy(&right);
+                left = value_int(result);
+            } else { // TOKEN_DIVIDE
+                if (right.data.int_val == 0) {
+                    value_destroy(&left);
+                    value_destroy(&right);
+                    return value_error("Division by zero");
+                }
+                int result = left.data.int_val / right.data.int_val;
+                value_destroy(&left);
+                value_destroy(&right);
+                left = value_int(result);
+            }
+        } else if ((left.type == VALUE_INT || left.type == VALUE_FLOAT) &&
+                   (right.type == VALUE_INT || right.type == VALUE_FLOAT)) {
+            float left_f = (left.type == VALUE_INT) ? (float)left.data.int_val : left.data.float_val;
+            float right_f = (right.type == VALUE_INT) ? (float)right.data.int_val : right.data.float_val;
+            
+            if (op->type == TOKEN_MULTIPLY) {
+                float result = left_f * right_f;
+                value_destroy(&left);
+                value_destroy(&right);
+                left = value_float(result);
+            } else { // TOKEN_DIVIDE
+                if (right_f == 0.0f) {
+                    value_destroy(&left);
+                    value_destroy(&right);
+                    return value_error("Division by zero");
+                }
+                float result = left_f / right_f;
+                value_destroy(&left);
+                value_destroy(&right);
+                left = value_float(result);
+            }
+        } else {
+            value_destroy(&left);
+            value_destroy(&right);
+            return value_error("Type mismatch in arithmetic");
+        }
+    }
+    return left;
+}
+
+Value value_expression(void) {
+    Value left = value_term();
+    if (left.type == VALUE_ERROR) return left;
+    
+    while (peek_token()->type == TOKEN_PLUS || peek_token()->type == TOKEN_MINUS) {
+        Token *op = next_token();
+        Value right = value_term();
+        if (right.type == VALUE_ERROR) {
+            value_destroy(&left);
+            return right;
+        }
+        
+        // Handle string concatenation with +
+        if (op->type == TOKEN_PLUS && (left.type == VALUE_STRING || right.type == VALUE_STRING)) {
+            char* left_str = value_to_string(&left);
+            char* right_str = value_to_string(&right);
+            int total_len = mod_strlen(left_str) + mod_strlen(right_str);
+            char* result_str = (char*)mod_malloc(total_len + 1);
+            mod_strcpy(result_str, left_str);
+            mod_strcat(result_str, right_str);
+            
+            mod_free(left_str);
+            mod_free(right_str);
+            value_destroy(&left);
+            value_destroy(&right);
+            
+            Value result = value_string(result_str);
+            mod_free(result_str);
+            return result;
+        }
+        // Arithmetic operations
+        else if (left.type == VALUE_INT && right.type == VALUE_INT) {
+            if (op->type == TOKEN_PLUS) {
+                int result = left.data.int_val + right.data.int_val;
+                value_destroy(&left);
+                value_destroy(&right);
+                left = value_int(result);
+            } else { // TOKEN_MINUS
+                int result = left.data.int_val - right.data.int_val;
+                value_destroy(&left);
+                value_destroy(&right);
+                left = value_int(result);
+            }
+        } else if ((left.type == VALUE_INT || left.type == VALUE_FLOAT) &&
+                   (right.type == VALUE_INT || right.type == VALUE_FLOAT)) {
+            float left_f = (left.type == VALUE_INT) ? (float)left.data.int_val : left.data.float_val;
+            float right_f = (right.type == VALUE_INT) ? (float)right.data.int_val : right.data.float_val;
+            
+            if (op->type == TOKEN_PLUS) {
+                float result = left_f + right_f;
+                value_destroy(&left);
+                value_destroy(&right);
+                left = value_float(result);
+            } else { // TOKEN_MINUS
+                float result = left_f - right_f;
+                value_destroy(&left);
+                value_destroy(&right);
+                left = value_float(result);
+            }
+        } else {
+            value_destroy(&left);
+            value_destroy(&right);
+            return value_error("Type mismatch in arithmetic");
+        }
+    }
+    return left;
+}
+
+// Forward declaration for value_function_call
+Value value_function_call(char *name);
+
 bool condition(void) {
     // Parse optional 'not'
     bool negate = false;
@@ -1633,6 +1862,12 @@ int function_call(char *name) {
         } else if (mod_strcmp(name, "set_size") == 0) {
             if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after set_size\n"); exit(1); }
             return builtin_set_size();
+        } else if (mod_strcmp(name, "set_union") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after set_union\n"); exit(1); }
+            return builtin_set_union();
+        } else if (mod_strcmp(name, "set_intersection") == 0) {
+            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after set_intersection\n"); exit(1); }
+            return builtin_set_intersection();
             
         // String Processing Functions
         } else if (mod_strcmp(name, "interpolate") == 0) {
@@ -3068,6 +3303,62 @@ static char *evaluate_string_element(void) {
     }
 }
 
+// Value-based function call dispatcher
+Value value_function_call(char *name) {
+    // Try user-defined functions first
+    int func_index = -1;
+    for (int i = 0; i < function_count; i++) {
+        if (mod_strcmp(functions[i].name, name) == 0) {
+            func_index = i;
+            break;
+        }
+    }
+    
+    if (func_index != -1) {
+        // Call user function and convert int result to Value
+        int result = 0; // User function execution would be implemented here
+        return value_int(result);
+    }
+    
+    // Built-in functions that now return Value
+    if (mod_strcmp(name, "dict") == 0) {
+        if (next_token()->type != TOKEN_LPAREN) return value_error("Expected '(' after dict");
+        if (next_token()->type != TOKEN_RPAREN) return value_error("dict() expects no arguments");
+        return builtin_dict_create_value();
+    } else if (mod_strcmp(name, "list") == 0) {
+        if (next_token()->type != TOKEN_LPAREN) return value_error("Expected '(' after list");
+        if (next_token()->type != TOKEN_RPAREN) return value_error("list() expects no arguments");
+        int handle = builtin_list_create();
+        return value_handle(handle);
+    } else if (mod_strcmp(name, "set") == 0) {
+        if (next_token()->type != TOKEN_LPAREN) return value_error("Expected '(' after set");
+        if (next_token()->type != TOKEN_RPAREN) return value_error("set() expects no arguments");
+        int handle = builtin_set_create();
+        return value_handle(handle);
+    } else if (mod_strcmp(name, "dict_get") == 0) {
+        if (next_token()->type != TOKEN_LPAREN) return value_error("Expected '(' after dict_get");
+        return builtin_dict_get_value();
+    } else if (mod_strcmp(name, "list_get") == 0) {
+        if (next_token()->type != TOKEN_LPAREN) return value_error("Expected '(' after list_get");
+        return builtin_list_get_value();
+    } else if (mod_strcmp(name, "typeof") == 0) {
+        if (next_token()->type != TOKEN_LPAREN) return value_error("Expected '(' after typeof");
+        return builtin_typeof_value();
+    } else if (mod_strcmp(name, "optional_create") == 0) {
+        if (next_token()->type != TOKEN_LPAREN) return value_error("Expected '(' after optional_create");
+        int handle = builtin_optional_create();
+        return value_handle(handle);
+    } else if (mod_strcmp(name, "lambda") == 0) {
+        if (next_token()->type != TOKEN_LPAREN) return value_error("Expected '(' after lambda");
+        int handle = builtin_lambda();
+        return value_handle(handle);
+    }
+    
+    // For other built-ins, call the old function and convert result
+    int result = function_call(name);
+    return value_int(result);
+}
+
 char *evaluate_string_expr(void) {
     // element {'+' element}
     char *acc = evaluate_string_element();
@@ -3087,6 +3378,98 @@ char *evaluate_string_expr(void) {
         acc = joined;
     }
     return acc;
+}
+
+#define DICT_SIZE 256  // Should match the definition in advanced.c
+
+// ----- Collection iteration helper -----
+static void for_in_collection(const char* varname, int collection_handle) {
+    // Determine collection type and iterate accordingly
+    // Try to get as list first
+    struct ListNode** list_ptr = (struct ListNode**)get_object(collection_handle, OBJ_LIST);
+    if (list_ptr && *list_ptr) {
+        // Iterate over list
+        loop_depth++;
+        struct ListNode* current = *list_ptr;
+        while (current) {
+            // Set loop variable to current item value
+            if (current->type == VAR_STRING) {
+                set_variable_value(varname, VAR_STRING, current->data);
+            } else if (current->type == VAR_INT) {
+                set_variable_value(varname, VAR_INT, current->data);
+            } else {
+                set_variable_value(varname, VAR_STRING, current->data); // Default to string
+            }
+            
+            // Execute loop body until 'end'
+            while (peek_token()->type != TOKEN_END && peek_token()->type != TOKEN_EOF) {
+                statement();
+                if (function_return_flag) { loop_depth--; return; }
+                if (loop_break_flag || loop_continue_flag) {
+                    // Skip to end of loop
+                    while (peek_token()->type != TOKEN_END && peek_token()->type != TOKEN_EOF) next_token();
+                    break;
+                }
+            }
+            
+            if (loop_break_flag || loop_continue_flag) break;
+            current = current->next;
+        }
+        
+        if (peek_token()->type == TOKEN_EOF) { 
+            printf("Expected 'end' after for-in loop body\n"); 
+            exit(1);
+        }
+        next_token(); // consume 'end'
+        
+        if (loop_break_flag) loop_break_flag = false;
+        if (loop_continue_flag) loop_continue_flag = false;
+        loop_depth--;
+        return;
+    }
+    
+    // Try as dictionary
+    DictEntry* dict = (DictEntry*)get_object(collection_handle, OBJ_DICT);
+    if (dict) {
+        // Iterate over dictionary keys
+        loop_depth++;
+        for (int i = 0; i < DICT_SIZE; i++) {
+            DictEntry* entry = &dict[i];
+            while (entry && entry->key) {
+                // Set loop variable to key
+                set_variable_value(varname, VAR_STRING, entry->key);
+                
+                // Execute loop body until 'end'
+                while (peek_token()->type != TOKEN_END && peek_token()->type != TOKEN_EOF) {
+                    statement();
+                    if (function_return_flag) { loop_depth--; return; }
+                    if (loop_break_flag || loop_continue_flag) {
+                        while (peek_token()->type != TOKEN_END && peek_token()->type != TOKEN_EOF) next_token();
+                        break;
+                    }
+                }
+                
+                if (loop_break_flag || loop_continue_flag) break;
+                entry = entry->next;
+            }
+            if (loop_break_flag || loop_continue_flag) break;
+        }
+        
+        if (peek_token()->type == TOKEN_EOF) { 
+            printf("Expected 'end' after for-in loop body\n"); 
+            exit(1);
+        }
+        next_token(); // consume 'end'
+        
+        if (loop_break_flag) loop_break_flag = false;
+        if (loop_continue_flag) loop_continue_flag = false;
+        loop_depth--;
+        return;
+    }
+    
+    // Set iteration would be implemented here for complete collection support
+    printf("Invalid collection handle for for-in loop: %d\n", collection_handle);
+    exit(1);
 }
 
 // ----- For loop: for i = a to b step n ... end -----
@@ -3109,14 +3492,30 @@ static void for_statement(void) {
         if (peek_token()->type == TOKEN_STEP) { next_token(); step = expression(); if (step == 0) { printf("step cannot be 0\n"); exit(1);} }
         if (next_token()->type != TOKEN_DO) { printf("Expected 'do' after for range\n"); exit(1);} 
     } else if (after_var->type == TOKEN_IN) {
-        // Enhanced: for i in a..b [step n] do
+        // Enhanced: for i in a..b [step n] do  OR  for item in collection do
         next_token(); // consume 'in'
-        start = expression();
-        if (peek_token()->type != TOKEN_RANGE) { printf("Expected '..' in for-in range\n"); exit(1);} 
-        next_token(); // consume '..'
-        endv = expression();
-        if (peek_token()->type == TOKEN_STEP) { next_token(); step = expression(); if (step == 0) { printf("step cannot be 0\n"); exit(1);} }
-        if (next_token()->type != TOKEN_DO) { printf("Expected 'do' after for-in range\n"); exit(1);} 
+        
+        // Check if this is a range (next token is an expression followed by ..)
+        // or a collection (next token is an identifier/expression that's a handle)
+        int saved_token = current_token;
+        int first_expr = expression();
+        
+        if (peek_token()->type == TOKEN_RANGE) {
+            // Range iteration: for i in a..b [step n] do
+            next_token(); // consume '..'
+            start = first_expr;
+            endv = expression();
+            if (peek_token()->type == TOKEN_STEP) { next_token(); step = expression(); if (step == 0) { printf("step cannot be 0\n"); exit(1);} }
+            if (next_token()->type != TOKEN_DO) { printf("Expected 'do' after for-in range\n"); exit(1);} 
+        } else {
+            // Collection iteration: for item in collection do
+            if (next_token()->type != TOKEN_DO) { printf("Expected 'do' after for-in collection\n"); exit(1);} 
+            
+            // Execute collection iteration
+            int collection_handle = first_expr;
+            for_in_collection(varname, collection_handle);
+            return; // for_in_collection handles the entire loop
+        }
     } else {
         printf("Expected '=' or 'in' after loop var\n");
         exit(1);

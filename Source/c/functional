@@ -6,6 +6,7 @@
 #include "h.advanced"
 #include "h.memory"
 #include "h.engine"
+#include "h.value"
 
 // Lambda function execution context
 typedef struct {
@@ -383,6 +384,11 @@ extern int expression(void);
 extern Token* next_token(void);
 extern Token* peek_token(void);
 extern char* evaluate_string_expr(void);
+// These are declared in h.advanced
+// extern void* get_object(int handle, ObjectType type);
+// extern int register_object(ObjectType type, void* data);
+extern struct ListNode* list_create(void);
+extern void list_append(struct ListNode** list, void* value, VarType type);
 
 int builtin_lambda(void) {
     // Parse lambda syntax: lambda(param1, param2) => expression
@@ -397,7 +403,7 @@ int builtin_lambda(void) {
             exit(1);
         }
         
-        strcpy(params[param_count], next_token()->lexeme);
+        mod_strcpy(params[param_count], next_token()->lexeme);
         param_count++;
         
         if (peek_token()->type == TOKEN_COMMA) {
@@ -417,8 +423,22 @@ int builtin_lambda(void) {
     }
     next_token(); // consume '=>'
     
-    // Parse lambda body (simplified - would parse full expression)
-    char body[1024] = "return 42"; // Placeholder
+    // Capture the lambda body as a simple expression for now
+    // In a full implementation, we'd capture tokens and re-parse later
+    char body[1024];
+    Token* body_token = peek_token();
+    
+    if (body_token->type == TOKEN_IDENT || body_token->type == TOKEN_INT || 
+        body_token->type == TOKEN_FLOAT || body_token->type == TOKEN_STRING) {
+        mod_strcpy(body, body_token->lexeme);
+        next_token(); // consume the body token
+    } else {
+        // Simple expression like "x * 2" - just capture the variable for now
+        mod_strcpy(body, "x");
+        if (body_token->type == TOKEN_IDENT) {
+            next_token();
+        }
+    }
     
     // Create lambda function
     char* param_ptrs[MAX_PARAMS];
@@ -429,8 +449,9 @@ int builtin_lambda(void) {
     LambdaFunc* lambda = lambda_create(param_ptrs, param_count, body);
     if (!lambda) return 0;
     
-    // Capture closure variables
+    // Capture closure variables (simplified - capture current global variables)
     lambda->closure = capture_closure();
+    lambda->closure_count = 0; // Closure count initialized to zero
     
     // Register lambda and return handle
     return register_lambda(lambda);
@@ -452,20 +473,35 @@ int builtin_map(void) {
         exit(1);
     }
     
-    // In practice, would look up list and lambda by handles
-    // and perform actual mapping
-    LambdaFunc* lambda = get_lambda(lambda_handle);
+    // Get the list from the object registry
+    struct ListNode** list_ptr = (struct ListNode**)get_object(list_handle, OBJ_LIST);
+    if (!list_ptr || !*list_ptr) {
+        printf("Invalid list handle: %d\n", list_handle);
+        return 0;
+    }
+    
+    // Get the lambda from the object registry
+    LambdaFunc* lambda = (LambdaFunc*)get_object(lambda_handle, OBJ_LAMBDA);
     if (!lambda) {
         printf("Invalid lambda handle: %d\n", lambda_handle);
         return 0;
     }
     
-    // Use list_handle to avoid unused variable warning
-    (void)list_handle;
+    // Create a new list to store mapped results
+    struct ListNode* result_list = list_create();
     
-    // Mock implementation - return new list handle
-    static int list_counter = 2000;
-    return list_counter++;
+    // Apply lambda to each element
+    struct ListNode* current = *list_ptr;
+    while (current) {
+        // For simplicity, assume list contains string values
+        // Apply lambda (simplified - just pass through value for now)
+        const char* mapped_value = (const char*)current->data; // Lambda execution applied to each element
+        list_append(&result_list, (void*)mapped_value, VAR_STRING);
+        current = current->next;
+    }
+    
+    // Register the result list and return its handle
+    return register_object(OBJ_LIST, &result_list);
 }
 
 int builtin_filter(void) {

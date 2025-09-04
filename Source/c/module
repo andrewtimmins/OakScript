@@ -25,6 +25,23 @@ typedef struct {
 static module_workspace workspace_store;
 static module_workspace *workspace = &workspace_store;
 
+// Create a stable error block to return to the CLI (avoid OS_GenerateError pointer issues)
+static _kernel_oserror *make_error(int number, const char *msg)
+{
+    static _kernel_oserror err;
+    err.errnum = number;
+    // Ensure message is terminated
+    if (msg) {
+        size_t n = strlen(msg);
+        if (n >= sizeof(err.errmess)) n = sizeof(err.errmess) - 1;
+        memcpy(err.errmess, msg, n);
+        err.errmess[n] = '\0';
+    } else {
+        err.errmess[0] = '\0';
+    }
+    return &err;
+}
+
 /*
  * Module initialisation
  */
@@ -38,8 +55,7 @@ _kernel_oserror *module_init(const char *cmd_tail, int podule_base, void *pw)
     
     // Create our private dynamic area heap (start small, allow to grow)
     if (!mod_init(64 * 1024, 8 * 1024 * 1024)) {
-        return (_kernel_oserror *)_swix(OS_GenerateError, _INR(0,2),
-               0, "Failed to create dynamic area", 0);
+        return make_error(0, "Failed to create dynamic area");
     }
 
     // Initialize the script engine (this will use dynamic memory)
@@ -48,8 +64,7 @@ _kernel_oserror *module_init(const char *cmd_tail, int podule_base, void *pw)
         return NULL;  // Success
     } else {
         mod_shutdown();
-        return (_kernel_oserror *)_swix(OS_GenerateError, _INR(0,2),
-               0, "Failed to initialize OakScript script engine", 0);
+        return make_error(0, "Failed to initialize OakScript script engine");
     }
 }
 
@@ -87,22 +102,19 @@ _kernel_oserror *module_command(const char *arg_string, int argc, int cmd_no, vo
                 while (*filename == ' ') filename++;
                 
                 if (!workspace || !workspace->initialized) {
-                    return (_kernel_oserror *)_swix(OS_GenerateError, _INR(0,2),
-                           0, "OakScript module not properly initialized", 0);
+                    return make_error(0, "OakScript module not properly initialized");
                 }
                 
                 // Run the script
                 int result = run_script_file(filename);
                 if (result != 0) {
-                    return (_kernel_oserror *)_swix(OS_GenerateError, _INR(0,2),
-                           result, "Script execution failed", 0);
+                    return make_error(result, "Script execution failed");
                 }
                 return NULL;
             }
         case 1: // *OakScriptCompile command
             if (argc != 2) {
-                return (_kernel_oserror *)_swix(OS_GenerateError, _INR(0,2),
-                       0, "OakScriptCompile requires source and output filenames", 0);
+                return make_error(0, "OakScriptCompile requires source and output filenames");
             } else {
                 // Parse the two arguments from arg_string
                 const char *args = arg_string;
@@ -122,15 +134,13 @@ _kernel_oserror *module_command(const char *arg_string, int argc, int cmd_no, vo
                 int output_len = args - output_start;
                 
                 if (source_len == 0 || output_len == 0) {
-                    return (_kernel_oserror *)_swix(OS_GenerateError, _INR(0,2),
-                           0, "Both source and output filenames required", 0);
+                    return make_error(0, "Both source and output filenames required");
                 }
                 
                 // Create null-terminated strings
                 char source_file[256], output_file[256];
                 if (source_len >= 256 || output_len >= 256) {
-                    return (_kernel_oserror *)_swix(OS_GenerateError, _INR(0,2),
-                           0, "Filename too long", 0);
+                    return make_error(0, "Filename too long");
                 }
                 
                 strncpy(source_file, source_start, source_len);
@@ -139,22 +149,19 @@ _kernel_oserror *module_command(const char *arg_string, int argc, int cmd_no, vo
                 output_file[output_len] = '\0';
                 
                 if (!workspace || !workspace->initialized) {
-                    return (_kernel_oserror *)_swix(OS_GenerateError, _INR(0,2),
-                           0, "OakScript module not properly initialized", 0);
+                    return make_error(0, "OakScript module not properly initialized");
                 }
                 
                 // Compile the script to bytecode
                 int result = compile_script_to_bytecode(source_file, output_file);
                 if (result != 0) {
-                    return (_kernel_oserror *)_swix(OS_GenerateError, _INR(0,2),
-                           result, "Script compilation failed", 0);
+                    return make_error(result, "Script compilation failed");
                 }
                 return NULL;
             }
         case 2: // *OakScriptRun command
             if (argc != 1) {
-                return (_kernel_oserror *)_swix(OS_GenerateError, _INR(0,2),
-                       0, "OakScriptRun requires bytecode filename", 0);
+                return make_error(0, "OakScriptRun requires bytecode filename");
             } else {
                 // Extract filename from arg_string
                 const char *filename = arg_string;
@@ -168,29 +175,25 @@ _kernel_oserror *module_command(const char *arg_string, int argc, int cmd_no, vo
                 char bytecode_file[256];
                 int len = end - filename;
                 if (len >= 256) {
-                    return (_kernel_oserror *)_swix(OS_GenerateError, _INR(0,2),
-                           0, "Filename too long", 0);
+                    return make_error(0, "Filename too long");
                 }
                 
                 strncpy(bytecode_file, filename, len);
                 bytecode_file[len] = '\0';
                 
                 if (!workspace || !workspace->initialized) {
-                    return (_kernel_oserror *)_swix(OS_GenerateError, _INR(0,2),
-                           0, "OakScript module not properly initialized", 0);
+                    return make_error(0, "OakScript module not properly initialized");
                 }
                 
                 // Run the bytecode
                 int result = run_bytecode_file(bytecode_file);
                 if (result != 0) {
-                    return (_kernel_oserror *)_swix(OS_GenerateError, _INR(0,2),
-                           result, "Bytecode execution failed", 0);
+                    return make_error(result, "Bytecode execution failed");
                 }
                 return NULL;
             }
         default:
-            return (_kernel_oserror *)_swix(OS_GenerateError, _INR(0,2),
-                   0, "Unknown command", 0);
+            return make_error(0, "Unknown command");
     }
 }
 

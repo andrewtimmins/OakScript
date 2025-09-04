@@ -39,6 +39,9 @@ typedef enum {
     OP_RETURN,          // Return from function
     OP_JUMP,            // Unconditional jump to address
     OP_JUMP_IF_FALSE,   // Conditional jump if top of stack is false/zero
+    OP_TRY,             // Push try handler address onto try stack
+    OP_END_TRY,         // Pop try handler (normal exit from try)
+    OP_THROW,           // Throw exception (jump to nearest handler)
     OP_LOOP_START,      // Mark loop start for while/for
     OP_LOOP_END,        // Mark loop end and jump back to start
     OP_EXIT             // End program
