@@ -39,11 +39,63 @@ typedef enum {
     OP_RETURN,          // Return from function
     OP_JUMP,            // Unconditional jump to address
     OP_JUMP_IF_FALSE,   // Conditional jump if top of stack is false/zero
+    OP_JUMP_FALSE,      // Alias for OP_JUMP_IF_FALSE (compatibility)
+    OP_POP,             // Pop top value from stack
     OP_TRY,             // Push try handler address onto try stack
     OP_END_TRY,         // Pop try handler (normal exit from try)
     OP_THROW,           // Throw exception (jump to nearest handler)
     OP_LOOP_START,      // Mark loop start for while/for
     OP_LOOP_END,        // Mark loop end and jump back to start
+    
+    // Advanced control flow
+    OP_SWITCH,          // Switch statement start
+    OP_CASE,            // Case comparison
+    OP_DEFAULT,         // Default case
+    OP_MATCH,           // Pattern matching
+    OP_FOR_IN,          // For-in loop over collection
+    OP_BREAK,           // Break from loop
+    OP_CONTINUE,        // Continue loop
+    
+    // Data structure operations
+    OP_DICT_CREATE,     // Create dictionary
+    OP_DICT_SET,        // Set dictionary key-value
+    OP_DICT_GET,        // Get dictionary value
+    OP_LIST_CREATE,     // Create list
+    OP_LIST_APPEND,     // Append to list
+    OP_LIST_GET,        // Get list element
+    OP_SET_CREATE,      // Create set
+    OP_SET_ADD,         // Add to set
+    OP_SET_CONTAINS,    // Check set membership
+    
+    // Functional programming
+    OP_LAMBDA_CREATE,   // Create lambda function
+    OP_LAMBDA_CALL,     // Call lambda function
+    OP_MAP,             // Map operation
+    OP_FILTER,          // Filter operation
+    OP_REDUCE,          // Reduce operation
+    
+    // String processing
+    OP_STRING_INTERPOLATE, // String interpolation
+    OP_STRING_MULTILINE,   // Multi-line string
+    OP_REGEX_COMPILE,      // Compile regex
+    OP_REGEX_MATCH,        // Match regex
+    OP_REGEX_REPLACE,      // Replace with regex
+    
+    // Type system
+    OP_TYPEOF,          // Get type of value
+    OP_CAST,            // Cast value to type
+    OP_IS_TYPE,         // Check if value is type
+    OP_OPTIONAL_CREATE, // Create optional value
+    OP_UNION_CREATE,    // Create union value
+    
+    // Enhanced expressions
+    OP_AND,             // Logical AND
+    OP_OR,              // Logical OR
+    OP_NOT,             // Logical NOT
+    OP_NEGATE,          // Unary negation
+    OP_INCREMENT,       // Increment variable
+    OP_DECREMENT,       // Decrement variable
+    
     OP_EXIT             // End program
 } opcode_t;
 

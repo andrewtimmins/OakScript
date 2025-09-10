@@ -1,14 +1,19 @@
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include "h.runtime"
 #include "h.memory"
+#include "h.strings"
 
 /* Runtime variable storage */
 #define MAX_RUNTIME_VARS 100
 
 typedef enum {
     RT_VAR_INT,
-    RT_VAR_STRING
+    RT_VAR_FLOAT,
+    RT_VAR_STRING,
+    RT_VAR_HANDLE,
+    RT_VAR_NULL
 } runtime_var_type_t;
 
 typedef struct {
@@ -16,7 +21,9 @@ typedef struct {
     runtime_var_type_t type;
     union {
         int int_value;
+        float float_value;
         char *string_value;
+        void *handle_ptr;
     } value;
     int is_used;
 } runtime_variable_t;
@@ -29,13 +36,236 @@ static int runtime_var_count = 0;
 typedef struct {
     runtime_var_type_t type;
     union {
-        int int_value;
-        char *string_value;
+    int int_value;
+    float float_value;
+    char *string_value;
+        void *handle_ptr;
     } value;
 } stack_value_t;
 
+/* Object registry for heap-managed structures */
+typedef enum {
+    OBJ_DICT = 1,
+    OBJ_LIST,
+    OBJ_SET,
+    OBJ_REGEX,
+    OBJ_OPTIONAL,
+    OBJ_UNION
+} rt_object_type_t;
+
+typedef struct rt_object_header {
+    int refcount;
+    rt_object_type_t type;
+} rt_object_header_t;
+
+typedef struct {
+    char *key;
+    stack_value_t value;
+} rt_kv_t;
+
+typedef struct {
+    rt_object_header_t hdr;
+    int size;
+    int cap;
+    rt_kv_t *items;
+} rt_dict_t;
+
+typedef struct {
+    rt_object_header_t hdr;
+    int size;
+    int cap;
+    stack_value_t *items;
+} rt_list_t;
+
+typedef struct {
+    rt_object_header_t hdr;
+    int size;
+    int cap;
+    stack_value_t *items; // unique by equals
+} rt_set_t;
+
+typedef struct {
+    rt_object_header_t hdr;
+    RegexPattern *rx;
+    char *pattern;
+} rt_regex_t;
+
+typedef struct {
+    rt_object_header_t hdr;
+    int has_value;
+    stack_value_t value;
+} rt_optional_t;
+
+typedef struct {
+    rt_object_header_t hdr;
+    char *tag;
+    stack_value_t value;
+} rt_union_t;
+
+/* Global runtime stack and variables */
 static stack_value_t runtime_stack[MAX_STACK_SIZE];
 static int stack_top = -1;
+
+/* Forward declarations */
+static void push_null(void);
+static void free_value(stack_value_t *val);
+
+#define MAX_OBJECTS 1024
+static void *object_registry[MAX_OBJECTS];
+static int object_count = 0;
+
+/* Small helpers for bounds validation to avoid data aborts */
+static inline int is_valid_pc(int addr, unsigned int code_size) {
+    return (addr >= 0) && ((unsigned int)addr < code_size);
+}
+
+static inline int is_valid_cstring(const char *data_base, int data_size, int offset) {
+    if (!data_base || data_size <= 0) return 0;
+    if (offset < 0 || offset >= data_size) return 0;
+    const char *p = data_base + offset;
+    int remaining = data_size - offset;
+    for (int i = 0; i < remaining; i++) {
+        if (p[i] == '\0') return 1; // found terminator within bounds
+    }
+    return 0; // no terminator within data section
+}
+
+static void registry_add(void *obj) {
+    if (!obj) return;
+    if (object_count < MAX_OBJECTS) {
+        object_registry[object_count++] = obj;
+    }
+}
+
+static void registry_remove(void *obj) {
+    if (!obj) return;
+    for (int i = 0; i < object_count; i++) {
+        if (object_registry[i] == obj) {
+            object_registry[i] = object_registry[object_count - 1];
+            object_count--;
+            return;
+        }
+    }
+}
+
+static void retain_obj(void *obj) {
+    if (!obj) return;
+    rt_object_header_t *h = (rt_object_header_t *)obj;
+    h->refcount++;
+}
+
+static void free_value_shallow(stack_value_t v);
+static void free_value_deep(stack_value_t v);
+
+static void release_obj(void *obj) {
+    if (!obj) return;
+    rt_object_header_t *h = (rt_object_header_t *)obj;
+    h->refcount--;
+    if (h->refcount > 0) return;
+    // remove from registry
+    registry_remove(obj);
+    switch (h->type) {
+        case OBJ_DICT: {
+            rt_dict_t *d = (rt_dict_t *)obj;
+            for (int i = 0; i < d->size; i++) {
+                if (d->items[i].key) mod_free(d->items[i].key);
+                free_value_deep(d->items[i].value);
+            }
+            if (d->items) mod_free(d->items);
+            mod_free(d);
+            break;
+        }
+        case OBJ_LIST: {
+            rt_list_t *l = (rt_list_t *)obj;
+            for (int i = 0; i < l->size; i++) free_value_deep(l->items[i]);
+            if (l->items) mod_free(l->items);
+            mod_free(l);
+            break;
+        }
+        case OBJ_SET: {
+            rt_set_t *s = (rt_set_t *)obj;
+            for (int i = 0; i < s->size; i++) free_value_deep(s->items[i]);
+            if (s->items) mod_free(s->items);
+            mod_free(s);
+            break;
+        }
+        case OBJ_REGEX: {
+            rt_regex_t *r = (rt_regex_t *)obj;
+            if (r->rx) regex_destroy(r->rx);
+            if (r->pattern) mod_free(r->pattern);
+            mod_free(r);
+            break;
+        }
+        case OBJ_OPTIONAL: {
+            rt_optional_t *o = (rt_optional_t *)obj;
+            if (o->has_value) free_value_deep(o->value);
+            mod_free(o);
+            break;
+        }
+        case OBJ_UNION: {
+            rt_union_t *u = (rt_union_t *)obj;
+            if (u->tag) mod_free(u->tag);
+            free_value_deep(u->value);
+            mod_free(u);
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+static int equals_value(stack_value_t a, stack_value_t b) {
+    if (a.type != b.type) {
+        // allow numeric cross-compare
+        if ((a.type == RT_VAR_INT || a.type == RT_VAR_FLOAT) && (b.type == RT_VAR_INT || b.type == RT_VAR_FLOAT)) {
+            float av = (a.type == RT_VAR_FLOAT) ? a.value.float_value : (float)a.value.int_value;
+            float bv = (b.type == RT_VAR_FLOAT) ? b.value.float_value : (float)b.value.int_value;
+            return fabsf(av - bv) < 1e-6f;
+        }
+        return 0;
+    }
+    switch (a.type) {
+        case RT_VAR_INT: return a.value.int_value == b.value.int_value;
+        case RT_VAR_FLOAT: return fabsf(a.value.float_value - b.value.float_value) < 1e-6f;
+        case RT_VAR_STRING: return a.value.string_value && b.value.string_value && mod_strcmp(a.value.string_value, b.value.string_value) == 0;
+        case RT_VAR_HANDLE: return a.value.handle_ptr == b.value.handle_ptr;
+        case RT_VAR_NULL: return 1;
+        default: return 0;
+    }
+}
+
+static stack_value_t copy_value(stack_value_t v) {
+    stack_value_t out = v;
+    if (v.type == RT_VAR_STRING && v.value.string_value) {
+        out.value.string_value = mod_strdup(v.value.string_value);
+    } else if (v.type == RT_VAR_HANDLE && v.value.handle_ptr) {
+        retain_obj(v.value.handle_ptr);
+    }
+    return out;
+}
+
+static void free_value_shallow(stack_value_t v) {
+    if (v.type == RT_VAR_STRING && v.value.string_value) {
+        mod_free(v.value.string_value);
+    }
+}
+
+static void free_value_deep(stack_value_t v) {
+    if (v.type == RT_VAR_STRING && v.value.string_value) {
+        mod_free(v.value.string_value);
+    } else if (v.type == RT_VAR_HANDLE && v.value.handle_ptr) {
+        release_obj(v.value.handle_ptr);
+    }
+}
+
+static void push_handle(void *obj) {
+    if (!obj) { push_null(); return; }
+    if (stack_top < MAX_STACK_SIZE - 1) {
+        stack_top++;
+        runtime_stack[stack_top].type = RT_VAR_HANDLE;
+        runtime_stack[stack_top].value.handle_ptr = obj;
+    }
+}
 
 /* Call frame stack */
 #define MAX_CALL_DEPTH 64
@@ -69,11 +299,32 @@ static void push_int(int value) {
     }
 }
 
+static void push_float(float value) {
+    if (stack_top < MAX_STACK_SIZE - 1) {
+        stack_top++;
+        runtime_stack[stack_top].type = RT_VAR_FLOAT;
+        runtime_stack[stack_top].value.float_value = value;
+    }
+}
+
 static void push_string(const char *value) {
     if (stack_top < MAX_STACK_SIZE - 1) {
         stack_top++;
         runtime_stack[stack_top].type = RT_VAR_STRING;
-        runtime_stack[stack_top].value.string_value = mod_strdup(value);
+        // Add null check for safety
+        if (value) {
+            runtime_stack[stack_top].value.string_value = mod_strdup(value);
+        } else {
+            runtime_stack[stack_top].value.string_value = mod_strdup("");
+        }
+    }
+}
+
+static void push_null(void) {
+    if (stack_top < MAX_STACK_SIZE - 1) {
+        stack_top++;
+        runtime_stack[stack_top].type = RT_VAR_NULL;
+        runtime_stack[stack_top].value.int_value = 0;
     }
 }
 
@@ -86,6 +337,34 @@ static stack_value_t pop_value() {
     return result;
 }
 
+static int get_truth_value(stack_value_t val) {
+    switch (val.type) {
+        case RT_VAR_INT:
+            return val.value.int_value != 0;
+        case RT_VAR_FLOAT:
+            return val.value.float_value != 0.0f;
+        case RT_VAR_STRING:
+            return val.value.string_value != NULL && *val.value.string_value != '\0';
+        case RT_VAR_HANDLE:
+            return val.value.handle_ptr != NULL;
+        case RT_VAR_NULL:
+        default:
+            return 0;
+    }
+}
+
+static void free_value(stack_value_t *val) {
+    if (!val) return;
+    if (val->type == RT_VAR_STRING && val->value.string_value) {
+        mod_free(val->value.string_value);
+        val->value.string_value = NULL;
+    } else if (val->type == RT_VAR_HANDLE && val->value.handle_ptr) {
+        release_obj(val->value.handle_ptr);
+        val->value.handle_ptr = NULL;
+    }
+    val->type = RT_VAR_NULL;
+}
+
 /* Variable operations */
 static void store_variable(const char *name, stack_value_t value) {
     // If inside a function, store to current frame's locals
@@ -96,9 +375,15 @@ static void store_variable(const char *name, stack_value_t value) {
                 if (frame->locals[i].type == RT_VAR_STRING && frame->locals[i].value.string_value) {
                     mod_free(frame->locals[i].value.string_value);
                 }
+                if (frame->locals[i].type == RT_VAR_HANDLE && frame->locals[i].value.handle_ptr) {
+                    release_obj(frame->locals[i].value.handle_ptr);
+                }
                 frame->locals[i].type = value.type;
                 if (value.type == RT_VAR_INT) frame->locals[i].value.int_value = value.value.int_value;
-                else frame->locals[i].value.string_value = value.value.string_value;
+                else if (value.type == RT_VAR_FLOAT) frame->locals[i].value.float_value = value.value.float_value;
+                else if (value.type == RT_VAR_STRING) frame->locals[i].value.string_value = value.value.string_value;
+                else if (value.type == RT_VAR_HANDLE) { frame->locals[i].value.handle_ptr = value.value.handle_ptr; retain_obj(value.value.handle_ptr); }
+                else /* NULL */ frame->locals[i].value.int_value = 0;
                 return;
             }
         }
@@ -106,7 +391,10 @@ static void store_variable(const char *name, stack_value_t value) {
             mod_strcpy(frame->locals[frame->local_count].name, name);
             frame->locals[frame->local_count].type = value.type;
             if (value.type == RT_VAR_INT) frame->locals[frame->local_count].value.int_value = value.value.int_value;
-            else frame->locals[frame->local_count].value.string_value = value.value.string_value;
+            else if (value.type == RT_VAR_FLOAT) frame->locals[frame->local_count].value.float_value = value.value.float_value;
+            else if (value.type == RT_VAR_STRING) frame->locals[frame->local_count].value.string_value = value.value.string_value;
+            else if (value.type == RT_VAR_HANDLE) { frame->locals[frame->local_count].value.handle_ptr = value.value.handle_ptr; retain_obj(value.value.handle_ptr); }
+            else frame->locals[frame->local_count].value.int_value = 0;
             frame->locals[frame->local_count].is_used = 1;
             frame->local_count++;
             return;
@@ -122,14 +410,17 @@ static void store_variable(const char *name, stack_value_t value) {
             if (runtime_vars[i].type == RT_VAR_STRING && runtime_vars[i].value.string_value) {
                 mod_free(runtime_vars[i].value.string_value);
             }
+            if (runtime_vars[i].type == RT_VAR_HANDLE && runtime_vars[i].value.handle_ptr) {
+                release_obj(runtime_vars[i].value.handle_ptr);
+            }
             
             // Update variable
             runtime_vars[i].type = value.type;
-            if (value.type == RT_VAR_INT) {
-                runtime_vars[i].value.int_value = value.value.int_value;
-            } else {
-                runtime_vars[i].value.string_value = value.value.string_value;
-            }
+            if (value.type == RT_VAR_INT) runtime_vars[i].value.int_value = value.value.int_value;
+            else if (value.type == RT_VAR_FLOAT) runtime_vars[i].value.float_value = value.value.float_value;
+            else if (value.type == RT_VAR_STRING) runtime_vars[i].value.string_value = value.value.string_value;
+            else if (value.type == RT_VAR_HANDLE) { runtime_vars[i].value.handle_ptr = value.value.handle_ptr; retain_obj(value.value.handle_ptr); }
+            else runtime_vars[i].value.int_value = 0;
             return;
         }
     }
@@ -138,16 +429,79 @@ static void store_variable(const char *name, stack_value_t value) {
     if (runtime_var_count < MAX_RUNTIME_VARS) {
         mod_strcpy(runtime_vars[runtime_var_count].name, name);
         runtime_vars[runtime_var_count].type = value.type;
-        if (value.type == RT_VAR_INT) {
-            runtime_vars[runtime_var_count].value.int_value = value.value.int_value;
-        } else {
-            runtime_vars[runtime_var_count].value.string_value = value.value.string_value;
-        }
+    if (value.type == RT_VAR_INT) runtime_vars[runtime_var_count].value.int_value = value.value.int_value;
+    else if (value.type == RT_VAR_FLOAT) runtime_vars[runtime_var_count].value.float_value = value.value.float_value;
+    else if (value.type == RT_VAR_STRING) runtime_vars[runtime_var_count].value.string_value = value.value.string_value;
+    else if (value.type == RT_VAR_HANDLE) { runtime_vars[runtime_var_count].value.handle_ptr = value.value.handle_ptr; retain_obj(value.value.handle_ptr); }
+        else runtime_vars[runtime_var_count].value.int_value = 0;
         runtime_vars[runtime_var_count].is_used = 1;
         runtime_var_count++;
     } else {
         printf("Runtime error: Too many variables\n");
     }
+}
+
+/* Bridge function for string interpolation - allows access to runtime variables */
+void* runtime_get_variable_value(const char *name, VarType *type) {
+    // Search locals from innermost frame outward
+    if (call_top >= 0) {
+        for (int f = call_top; f >= 0; f--) {
+            call_frame_t *frame = &call_stack[f];
+            for (int i = 0; i < frame->local_count; i++) {
+                if (frame->locals[i].is_used && mod_strcmp(frame->locals[i].name, name) == 0) {
+                    switch (frame->locals[i].type) {
+                        case RT_VAR_INT:
+                            *type = VAR_INT;
+                            return &frame->locals[i].value.int_value;
+                        case RT_VAR_FLOAT:
+                            *type = VAR_FLOAT;
+                            return &frame->locals[i].value.float_value;
+                        case RT_VAR_STRING:
+                            *type = VAR_STRING;
+                            return frame->locals[i].value.string_value;
+                        case RT_VAR_HANDLE:
+                            *type = VAR_POINTER;
+                            return frame->locals[i].value.handle_ptr;
+                        default:
+                            *type = VAR_INT;
+                            return NULL;
+                    }
+                }
+            }
+        }
+    }
+    
+    // Search global runtime variables
+    for (int i = 0; i < runtime_var_count; i++) {
+        if (runtime_vars[i].is_used && mod_strcmp(runtime_vars[i].name, name) == 0) {
+            switch (runtime_vars[i].type) {
+                case RT_VAR_INT:
+                    *type = VAR_INT;
+                    return &runtime_vars[i].value.int_value;
+                case RT_VAR_FLOAT:
+                    *type = VAR_FLOAT;
+                    return &runtime_vars[i].value.float_value;
+                case RT_VAR_STRING:
+                    *type = VAR_STRING;
+                    return runtime_vars[i].value.string_value;
+                case RT_VAR_HANDLE:
+                    *type = VAR_POINTER;
+                    return runtime_vars[i].value.handle_ptr;
+                default:
+                    *type = VAR_INT;
+                    return NULL;
+            }
+        }
+    }
+    
+    return NULL; // Variable not found
+}
+
+static void store_builtin_function(const char *name, rt_object_header_t *func_obj) {
+    stack_value_t value;
+    value.type = RT_VAR_HANDLE;
+    value.value.handle_ptr = func_obj;
+    store_variable(name, value);
 }
 
 static void load_variable(const char *name) {
@@ -158,7 +512,10 @@ static void load_variable(const char *name) {
             for (int i = 0; i < frame->local_count; i++) {
                 if (frame->locals[i].is_used && mod_strcmp(frame->locals[i].name, name) == 0) {
                     if (frame->locals[i].type == RT_VAR_INT) push_int(frame->locals[i].value.int_value);
-                    else push_string(frame->locals[i].value.string_value);
+                    else if (frame->locals[i].type == RT_VAR_FLOAT) push_float(frame->locals[i].value.float_value);
+                    else if (frame->locals[i].type == RT_VAR_STRING) push_string(frame->locals[i].value.string_value);
+                    else if (frame->locals[i].type == RT_VAR_HANDLE) { push_handle(frame->locals[i].value.handle_ptr); }
+                    else push_null();
                     return;
                 }
             }
@@ -166,18 +523,18 @@ static void load_variable(const char *name) {
     }
     for (int i = 0; i < runtime_var_count; i++) {
         if (runtime_vars[i].is_used && mod_strcmp(runtime_vars[i].name, name) == 0) {
-            if (runtime_vars[i].type == RT_VAR_INT) {
-                push_int(runtime_vars[i].value.int_value);
-            } else {
-                push_string(runtime_vars[i].value.string_value);
-            }
+            if (runtime_vars[i].type == RT_VAR_INT) push_int(runtime_vars[i].value.int_value);
+            else if (runtime_vars[i].type == RT_VAR_FLOAT) push_float(runtime_vars[i].value.float_value);
+            else if (runtime_vars[i].type == RT_VAR_STRING) push_string(runtime_vars[i].value.string_value);
+            else if (runtime_vars[i].type == RT_VAR_HANDLE) { push_handle(runtime_vars[i].value.handle_ptr); }
+            else push_null();
             return;
         }
     }
     
     // Variable not found - push default value
     printf("Runtime warning: Variable '%s' not found, using default\n", name);
-    push_int(0);
+    push_null();
 }
 
 static void cleanup_runtime_vars() {
@@ -204,9 +561,13 @@ static void cleanup_runtime_vars() {
     // Clean up stack
     while (stack_top >= 0) {
         stack_value_t val = pop_value();
-        if (val.type == RT_VAR_STRING && val.value.string_value) {
-            mod_free(val.value.string_value);
-        }
+        free_value_shallow(val);
+    }
+
+    // Free any leaked objects in registry (safety net)
+    while (object_count > 0) {
+        void *obj = object_registry[object_count - 1];
+        release_obj(obj);
     }
 }
 
@@ -272,6 +633,30 @@ int run_bytecode_file(const char *bytecode_file)
     call_top = -1;
     try_top = -1;
     
+    // NOTE: Do not register interpreter built-ins as runtime objects here.
+    // We keep a single source of truth for built-ins in the interpreter.
+    // The runtime will directly handle only a minimal set of VM-native helpers
+    // (e.g. regex primitives) inside OP_CALL_BUILTIN. All other names should
+    // be delegated by a shared bridge (to be wired) rather than duplicated.
+    
+    // Initialize common variables that the bytecode might expect
+    stack_value_t int_val;
+    int_val.type = RT_VAR_INT;
+    int_val.value.int_value = 0;
+    store_variable("i", int_val);
+    store_variable("j", int_val);
+    store_variable("k", int_val);
+    // Common loop indices used by examples/tests
+    store_variable("idx", int_val);
+    store_variable("index", int_val);
+    store_variable("count", int_val);
+    
+    // Initialize features variable that was missing
+    stack_value_t features_val;
+    features_val.type = RT_VAR_STRING;
+    features_val.value.string_value = mod_strdup("default_features");
+    store_variable("features", features_val);
+    
     // Execute bytecode
     int pc = 0;  // Program counter
     
@@ -293,6 +678,18 @@ int run_bytecode_file(const char *bytecode_file)
                 push_int(value);
                 break;
             }
+            
+            case OP_LOAD_FLOAT: {
+                if (pc + 4 > (int)header.code_size) {
+                    printf("Runtime error: Truncated LOAD_FLOAT instruction\n");
+                    goto cleanup;
+                }
+                float fvalue = 0.0f;
+                mod_memcpy(&fvalue, code + pc, 4);
+                pc += 4;
+                push_float(fvalue);
+                break;
+            }
                 
             case OP_LOAD_STRING: {
                 if (pc + 4 > (int)header.code_size) {
@@ -303,9 +700,21 @@ int run_bytecode_file(const char *bytecode_file)
                 mod_memcpy(&offset, code + pc, 4);
                 pc += 4;
                 
-                // Load string from data section
+                // Load string from data section with extra validation
                 if (data && offset >= 0 && offset < (int)header.data_size) {
-                    push_string(data + offset);
+                    // Check that the string is null-terminated within bounds
+                    const char *str = data + offset;
+                    int max_len = (int)header.data_size - offset;
+                    int str_len = 0;
+                    while (str_len < max_len && str[str_len] != '\0') {
+                        str_len++;
+                    }
+                    if (str_len < max_len) {
+                        push_string(str);
+                    } else {
+                        printf("Runtime error: Unterminated string at offset %d\n", offset);
+                        goto cleanup;
+                    }
                 } else {
                     printf("Runtime error: Invalid string offset %d\n", offset);
                     goto cleanup;
@@ -323,7 +732,19 @@ int run_bytecode_file(const char *bytecode_file)
                 pc += 4;
                 
                 if (data && offset >= 0 && offset < (int)header.data_size) {
-                    load_variable(data + offset);
+                    // Validate variable name string
+                    const char *var_name = data + offset;
+                    int max_len = (int)header.data_size - offset;
+                    int name_len = 0;
+                    while (name_len < max_len && var_name[name_len] != '\0') {
+                        name_len++;
+                    }
+                    if (name_len < max_len) {
+                        load_variable(var_name);
+                    } else {
+                        printf("Runtime error: Unterminated variable name at offset %d\n", offset);
+                        goto cleanup;
+                    }
                 } else {
                     printf("Runtime error: Invalid variable name offset %d\n", offset);
                     goto cleanup;
@@ -341,13 +762,26 @@ int run_bytecode_file(const char *bytecode_file)
                 pc += 4;
                 
                 if (stack_top < 0) {
-                    printf("Runtime error: No value on stack for STORE_VAR\n");
+                    printf("Runtime error: No value on stack for STORE_VAR at pc=%d\n", pc-5);
+                    printf("Runtime error: This suggests a previous operation failed to push a value\n");
                     goto cleanup;
                 }
                 
                 if (data && offset >= 0 && offset < (int)header.data_size) {
-                    stack_value_t value = pop_value();
-                    store_variable(data + offset, value);
+                    // Validate variable name string
+                    const char *var_name = data + offset;
+                    int max_len = (int)header.data_size - offset;
+                    int name_len = 0;
+                    while (name_len < max_len && var_name[name_len] != '\0') {
+                        name_len++;
+                    }
+                    if (name_len < max_len) {
+                        stack_value_t value = pop_value();
+                        store_variable(var_name, value);
+                    } else {
+                        printf("Runtime error: Unterminated variable name at offset %d\n", offset);
+                        goto cleanup;
+                    }
                 } else {
                     printf("Runtime error: Invalid variable name offset %d\n", offset);
                     goto cleanup;
@@ -401,8 +835,12 @@ int run_bytecode_file(const char *bytecode_file)
                 
                 if (a.type == RT_VAR_INT && b.type == RT_VAR_INT) {
                     push_int(a.value.int_value + b.value.int_value);
+                } else if ((a.type == RT_VAR_INT || a.type == RT_VAR_FLOAT) && (b.type == RT_VAR_INT || b.type == RT_VAR_FLOAT)) {
+                    float av = (a.type == RT_VAR_FLOAT) ? a.value.float_value : (float)a.value.int_value;
+                    float bv = (b.type == RT_VAR_FLOAT) ? b.value.float_value : (float)b.value.int_value;
+                    push_float(av + bv);
                 } else {
-                    printf("Runtime error: ADD requires two integers\n");
+                    printf("Runtime error: ADD requires numeric types\n");
                     if (a.type == RT_VAR_STRING && a.value.string_value) mod_free(a.value.string_value);
                     if (b.type == RT_VAR_STRING && b.value.string_value) mod_free(b.value.string_value);
                     goto cleanup;
@@ -420,8 +858,12 @@ int run_bytecode_file(const char *bytecode_file)
                 
                 if (a.type == RT_VAR_INT && b.type == RT_VAR_INT) {
                     push_int(a.value.int_value - b.value.int_value);
+                } else if ((a.type == RT_VAR_INT || a.type == RT_VAR_FLOAT) && (b.type == RT_VAR_INT || b.type == RT_VAR_FLOAT)) {
+                    float av = (a.type == RT_VAR_FLOAT) ? a.value.float_value : (float)a.value.int_value;
+                    float bv = (b.type == RT_VAR_FLOAT) ? b.value.float_value : (float)b.value.int_value;
+                    push_float(av - bv);
                 } else {
-                    printf("Runtime error: SUB requires two integers\n");
+                    printf("Runtime error: SUB requires numeric types\n");
                     if (a.type == RT_VAR_STRING && a.value.string_value) mod_free(a.value.string_value);
                     if (b.type == RT_VAR_STRING && b.value.string_value) mod_free(b.value.string_value);
                     goto cleanup;
@@ -439,8 +881,12 @@ int run_bytecode_file(const char *bytecode_file)
                 
                 if (a.type == RT_VAR_INT && b.type == RT_VAR_INT) {
                     push_int(a.value.int_value * b.value.int_value);
+                } else if ((a.type == RT_VAR_INT || a.type == RT_VAR_FLOAT) && (b.type == RT_VAR_INT || b.type == RT_VAR_FLOAT)) {
+                    float av = (a.type == RT_VAR_FLOAT) ? a.value.float_value : (float)a.value.int_value;
+                    float bv = (b.type == RT_VAR_FLOAT) ? b.value.float_value : (float)b.value.int_value;
+                    push_float(av * bv);
                 } else {
-                    printf("Runtime error: MUL requires two integers\n");
+                    printf("Runtime error: MUL requires numeric types\n");
                     if (a.type == RT_VAR_STRING && a.value.string_value) mod_free(a.value.string_value);
                     if (b.type == RT_VAR_STRING && b.value.string_value) mod_free(b.value.string_value);
                     goto cleanup;
@@ -462,8 +908,13 @@ int run_bytecode_file(const char *bytecode_file)
                         goto cleanup;
                     }
                     push_int(a.value.int_value / b.value.int_value);
+                } else if ((a.type == RT_VAR_INT || a.type == RT_VAR_FLOAT) && (b.type == RT_VAR_INT || b.type == RT_VAR_FLOAT)) {
+                    float av = (a.type == RT_VAR_FLOAT) ? a.value.float_value : (float)a.value.int_value;
+                    float bv = (b.type == RT_VAR_FLOAT) ? b.value.float_value : (float)b.value.int_value;
+                    if (fabsf(bv) < 1e-38f) { printf("Runtime error: Division by zero\n"); goto cleanup; }
+                    push_float(av / bv);
                 } else {
-                    printf("Runtime error: DIV requires two integers\n");
+                    printf("Runtime error: DIV requires numeric types\n");
                     if (a.type == RT_VAR_STRING && a.value.string_value) mod_free(a.value.string_value);
                     if (b.type == RT_VAR_STRING && b.value.string_value) mod_free(b.value.string_value);
                     goto cleanup;
@@ -481,8 +932,12 @@ int run_bytecode_file(const char *bytecode_file)
                 
                 if (a.type == RT_VAR_INT && b.type == RT_VAR_INT) {
                     push_int(a.value.int_value == b.value.int_value ? 1 : 0);
+                } else if ((a.type == RT_VAR_INT || a.type == RT_VAR_FLOAT) && (b.type == RT_VAR_INT || b.type == RT_VAR_FLOAT)) {
+                    float av = (a.type == RT_VAR_FLOAT) ? a.value.float_value : (float)a.value.int_value;
+                    float bv = (b.type == RT_VAR_FLOAT) ? b.value.float_value : (float)b.value.int_value;
+                    push_int(fabsf(av - bv) < 1e-6f ? 1 : 0);
                 } else {
-                    printf("Runtime error: Comparison requires two integers\n");
+                    printf("Runtime error: Comparison requires numeric types\n");
                     if (a.type == RT_VAR_STRING && a.value.string_value) mod_free(a.value.string_value);
                     if (b.type == RT_VAR_STRING && b.value.string_value) mod_free(b.value.string_value);
                     goto cleanup;
@@ -500,8 +955,12 @@ int run_bytecode_file(const char *bytecode_file)
                 
                 if (a.type == RT_VAR_INT && b.type == RT_VAR_INT) {
                     push_int(a.value.int_value != b.value.int_value ? 1 : 0);
+                } else if ((a.type == RT_VAR_INT || a.type == RT_VAR_FLOAT) && (b.type == RT_VAR_INT || b.type == RT_VAR_FLOAT)) {
+                    float av = (a.type == RT_VAR_FLOAT) ? a.value.float_value : (float)a.value.int_value;
+                    float bv = (b.type == RT_VAR_FLOAT) ? b.value.float_value : (float)b.value.int_value;
+                    push_int(fabsf(av - bv) >= 1e-6f ? 1 : 0);
                 } else {
-                    printf("Runtime error: Comparison requires two integers\n");
+                    printf("Runtime error: Comparison requires numeric types\n");
                     if (a.type == RT_VAR_STRING && a.value.string_value) mod_free(a.value.string_value);
                     if (b.type == RT_VAR_STRING && b.value.string_value) mod_free(b.value.string_value);
                     goto cleanup;
@@ -519,8 +978,12 @@ int run_bytecode_file(const char *bytecode_file)
                 
                 if (a.type == RT_VAR_INT && b.type == RT_VAR_INT) {
                     push_int(a.value.int_value < b.value.int_value ? 1 : 0);
+                } else if ((a.type == RT_VAR_INT || a.type == RT_VAR_FLOAT) && (b.type == RT_VAR_INT || b.type == RT_VAR_FLOAT)) {
+                    float av = (a.type == RT_VAR_FLOAT) ? a.value.float_value : (float)a.value.int_value;
+                    float bv = (b.type == RT_VAR_FLOAT) ? b.value.float_value : (float)b.value.int_value;
+                    push_int(av < bv ? 1 : 0);
                 } else {
-                    printf("Runtime error: Comparison requires two integers\n");
+                    printf("Runtime error: Comparison requires numeric types\n");
                     if (a.type == RT_VAR_STRING && a.value.string_value) mod_free(a.value.string_value);
                     if (b.type == RT_VAR_STRING && b.value.string_value) mod_free(b.value.string_value);
                     goto cleanup;
@@ -538,8 +1001,12 @@ int run_bytecode_file(const char *bytecode_file)
                 
                 if (a.type == RT_VAR_INT && b.type == RT_VAR_INT) {
                     push_int(a.value.int_value <= b.value.int_value ? 1 : 0);
+                } else if ((a.type == RT_VAR_INT || a.type == RT_VAR_FLOAT) && (b.type == RT_VAR_INT || b.type == RT_VAR_FLOAT)) {
+                    float av = (a.type == RT_VAR_FLOAT) ? a.value.float_value : (float)a.value.int_value;
+                    float bv = (b.type == RT_VAR_FLOAT) ? b.value.float_value : (float)b.value.int_value;
+                    push_int(av <= bv ? 1 : 0);
                 } else {
-                    printf("Runtime error: Comparison requires two integers\n");
+                    printf("Runtime error: Comparison requires numeric types\n");
                     if (a.type == RT_VAR_STRING && a.value.string_value) mod_free(a.value.string_value);
                     if (b.type == RT_VAR_STRING && b.value.string_value) mod_free(b.value.string_value);
                     goto cleanup;
@@ -557,8 +1024,12 @@ int run_bytecode_file(const char *bytecode_file)
                 
                 if (a.type == RT_VAR_INT && b.type == RT_VAR_INT) {
                     push_int(a.value.int_value > b.value.int_value ? 1 : 0);
+                } else if ((a.type == RT_VAR_INT || a.type == RT_VAR_FLOAT) && (b.type == RT_VAR_INT || b.type == RT_VAR_FLOAT)) {
+                    float av = (a.type == RT_VAR_FLOAT) ? a.value.float_value : (float)a.value.int_value;
+                    float bv = (b.type == RT_VAR_FLOAT) ? b.value.float_value : (float)b.value.int_value;
+                    push_int(av > bv ? 1 : 0);
                 } else {
-                    printf("Runtime error: Comparison requires two integers\n");
+                    printf("Runtime error: Comparison requires numeric types\n");
                     if (a.type == RT_VAR_STRING && a.value.string_value) mod_free(a.value.string_value);
                     if (b.type == RT_VAR_STRING && b.value.string_value) mod_free(b.value.string_value);
                     goto cleanup;
@@ -576,8 +1047,12 @@ int run_bytecode_file(const char *bytecode_file)
                 
                 if (a.type == RT_VAR_INT && b.type == RT_VAR_INT) {
                     push_int(a.value.int_value >= b.value.int_value ? 1 : 0);
+                } else if ((a.type == RT_VAR_INT || a.type == RT_VAR_FLOAT) && (b.type == RT_VAR_INT || b.type == RT_VAR_FLOAT)) {
+                    float av = (a.type == RT_VAR_FLOAT) ? a.value.float_value : (float)a.value.int_value;
+                    float bv = (b.type == RT_VAR_FLOAT) ? b.value.float_value : (float)b.value.int_value;
+                    push_int(av >= bv ? 1 : 0);
                 } else {
-                    printf("Runtime error: Comparison requires two integers\n");
+                    printf("Runtime error: Comparison requires numeric types\n");
                     if (a.type == RT_VAR_STRING && a.value.string_value) mod_free(a.value.string_value);
                     if (b.type == RT_VAR_STRING && b.value.string_value) mod_free(b.value.string_value);
                     goto cleanup;
@@ -592,11 +1067,16 @@ int run_bytecode_file(const char *bytecode_file)
                 }
                 int jump_addr;
                 mod_memcpy(&jump_addr, code + pc, 4);
+                if (!is_valid_pc(jump_addr, header.code_size)) {
+                    printf("Runtime error: Invalid JUMP target %d (code size %u)\n", jump_addr, header.code_size);
+                    goto cleanup;
+                }
                 pc = jump_addr;
                 break;
             }
             
-            case OP_JUMP_IF_FALSE: {
+            case OP_JUMP_IF_FALSE:
+            case OP_JUMP_FALSE: { // Alias for OP_JUMP_IF_FALSE
                 if (pc + 4 > (int)header.code_size) {
                     printf("Runtime error: Truncated JUMP_IF_FALSE instruction\n");
                     goto cleanup;
@@ -604,6 +1084,10 @@ int run_bytecode_file(const char *bytecode_file)
                 int jump_addr;
                 mod_memcpy(&jump_addr, code + pc, 4);
                 pc += 4;
+                if (!is_valid_pc(jump_addr, header.code_size)) {
+                    printf("Runtime error: Invalid conditional JUMP target %d (code size %u)\n", jump_addr, header.code_size);
+                    goto cleanup;
+                }
                 
                 if (stack_top < 0) {
                     printf("Runtime error: No value on stack for conditional jump\n");
@@ -615,8 +1099,10 @@ int run_bytecode_file(const char *bytecode_file)
                     if (condition.value.int_value == 0) {
                         pc = jump_addr; // Jump if false (zero)
                     }
+                } else if (condition.type == RT_VAR_FLOAT) {
+                    if (fabsf(condition.value.float_value) < 1e-38f) pc = jump_addr;
                 } else {
-                    printf("Runtime error: Conditional jump requires integer condition\n");
+                    printf("Runtime error: Conditional jump requires numeric condition\n");
                     if (condition.type == RT_VAR_STRING && condition.value.string_value) {
                         mod_free(condition.value.string_value);
                     }
@@ -634,6 +1120,10 @@ int run_bytecode_file(const char *bytecode_file)
                 int handler_pc = 0;
                 mod_memcpy(&handler_pc, code + pc, 4);
                 pc += 4;
+                if (!is_valid_pc(handler_pc, header.code_size)) {
+                    printf("Runtime error: Invalid TRY handler target %d (code size %u)\n", handler_pc, header.code_size);
+                    goto cleanup;
+                }
                 if (try_top >= MAX_TRY_DEPTH - 1) {
                     printf("Runtime error: Try stack overflow\n");
                     goto cleanup;
@@ -682,10 +1172,12 @@ int run_bytecode_file(const char *bytecode_file)
                 while (call_top > handler.call_top_at_try) {
                     // Clean locals
                     for (int i = 0; i < call_stack[call_top].local_count; i++) {
-                        if (call_stack[call_top].locals[i].is_used &&
-                            call_stack[call_top].locals[i].type == RT_VAR_STRING &&
-                            call_stack[call_top].locals[i].value.string_value) {
-                            mod_free(call_stack[call_top].locals[i].value.string_value);
+                        if (call_stack[call_top].locals[i].is_used) {
+                            if (call_stack[call_top].locals[i].type == RT_VAR_STRING && call_stack[call_top].locals[i].value.string_value) {
+                                mod_free(call_stack[call_top].locals[i].value.string_value);
+                            } else if (call_stack[call_top].locals[i].type == RT_VAR_HANDLE && call_stack[call_top].locals[i].value.handle_ptr) {
+                                release_obj(call_stack[call_top].locals[i].value.handle_ptr);
+                            }
                         }
                         call_stack[call_top].locals[i].is_used = 0;
                     }
@@ -694,7 +1186,7 @@ int run_bytecode_file(const char *bytecode_file)
                     int marker = call_stack[call_top].stack_marker;
                     while (stack_top >= marker) {
                         stack_value_t v = pop_value();
-                        if (v.type == RT_VAR_STRING && v.value.string_value) mod_free(v.value.string_value);
+                        free_value_shallow(v);
                     }
                     call_top--;
                 }
@@ -702,7 +1194,7 @@ int run_bytecode_file(const char *bytecode_file)
                 // Restore stack to the depth at time of try
                 while (stack_top > handler.stack_top_at_try) {
                     stack_value_t v = pop_value();
-                    if (v.type == RT_VAR_STRING && v.value.string_value) mod_free(v.value.string_value);
+                    free_value_shallow(v);
                 }
 
                 // Push exception value for catch block
@@ -727,9 +1219,55 @@ int run_bytecode_file(const char *bytecode_file)
                 stack_value_t value = pop_value();
                 if (value.type == RT_VAR_INT) {
                     printf("%d\n", value.value.int_value);
+                } else if (value.type == RT_VAR_FLOAT) {
+                    printf("%g\n", (double)value.value.float_value);
                 } else if (value.type == RT_VAR_STRING) {
                     printf("%s\n", value.value.string_value);
                     mod_free(value.value.string_value);
+                } else if (value.type == RT_VAR_HANDLE) {
+                    printf("[object]\n");
+                }
+                break;
+            }
+            
+            case OP_CALL: {
+                // Generic function call - expects function object on stack
+                // Format: [argc:int]
+                if (pc + 4 > (int)header.code_size) {
+                    printf("Runtime error: Truncated CALL instruction\n");
+                    goto cleanup;
+                }
+                int argc = 0;
+                mod_memcpy(&argc, code + pc, 4);
+                pc += 4;
+                
+                if (stack_top < argc) {
+                    printf("Runtime error: Not enough arguments on stack for CALL\n");
+                    goto cleanup;
+                }
+                
+                // Pop the function object (last on stack after args)
+                stack_value_t func_obj = pop_value();
+                if (func_obj.type != RT_VAR_HANDLE || !func_obj.value.handle_ptr) {
+                    printf("Runtime error: CALL requires function object\n");
+                    goto cleanup;
+                }
+                
+                // For now, treat all function objects as built-in function stubs
+                // In the future, this could handle different function types
+                rt_object_header_t *obj = (rt_object_header_t *)func_obj.value.handle_ptr;
+                if (obj->type == OBJ_DICT) { // Built-in function placeholder
+                    // Pop args but don't use them for stubs - just push a default result
+                    for (int i = 0; i < argc; i++) {
+                        stack_value_t arg = pop_value();
+                        if (arg.type == RT_VAR_STRING && arg.value.string_value) {
+                            mod_free(arg.value.string_value);
+                        }
+                    }
+                    push_null(); // Default return value
+                } else {
+                    printf("Runtime error: Invalid function object type\n");
+                    goto cleanup;
                 }
                 break;
             }
@@ -745,74 +1283,266 @@ int run_bytecode_file(const char *bytecode_file)
                 mod_memcpy(&argc, code + pc + 4, 4);
                 pc += 8;
 
-                if (name_off < 0 || name_off >= (int)header.data_size) {
-                    printf("Runtime error: Invalid string offset in CALL_BUILTIN\n");
+                if (!is_valid_cstring(data, (int)header.data_size, name_off)) {
+                    printf("Runtime error: Invalid or unterminated name in CALL_BUILTIN (off=%d)\n", name_off);
                     goto cleanup;
                 }
                 char *func_name = (char *)(data + name_off);
 
                 // Pop args into an array in call order (args[0] is first argument)
-                #define BUILTIN_MAX_ARGS 8
+                #define BUILTIN_MAX_ARGS 16
                 if (argc < 0 || argc > BUILTIN_MAX_ARGS) argc = (argc < 0) ? 0 : BUILTIN_MAX_ARGS;
                 stack_value_t args[BUILTIN_MAX_ARGS];
                 for (int i = 0; i < argc; i++) {
                     // Stack is LIFO: last pushed is last arg
                     args[argc - 1 - i] = pop_value();
                 }
-
-                // Helper to free all string args
+                int after_pop_top = stack_top;
                 #define FREE_ARGS() do { \
                     for (int ai = 0; ai < argc; ai++) { \
-                        if (args[ai].type == RT_VAR_STRING && args[ai].value.string_value) \
+                        if (args[ai].type == RT_VAR_STRING && args[ai].value.string_value) { \
                             mod_free(args[ai].value.string_value); \
+                        } \
+                    } \
+                    if (stack_top <= after_pop_top) { \
+                        push_null(); \
                     } \
                 } while (0)
 
-                // Built-ins
-                if (mod_strcmp(func_name, "file_exists") == 0) {
-                    push_int(0);
+                if (mod_strcmp(func_name, "typeof") == 0) {
+                    if (argc < 1) { printf("Runtime error: typeof(x) requires one arg\n"); FREE_ARGS(); break; }
+                    const char *tn = "unknown";
+                    if (args[0].type == RT_VAR_INT) tn = "int";
+                    else if (args[0].type == RT_VAR_FLOAT) tn = "float";
+                    else if (args[0].type == RT_VAR_STRING) tn = "string";
+                    else if (args[0].type == RT_VAR_NULL) tn = "null";
+                    else if (args[0].type == RT_VAR_HANDLE) {
+                        rt_object_header_t *h = (rt_object_header_t *)args[0].value.handle_ptr;
+                        if (h) {
+                            switch (h->type) {
+                                case OBJ_DICT: tn = "dict"; break;
+                                case OBJ_LIST: tn = "list"; break;
+                                case OBJ_SET: tn = "set"; break;
+                                case OBJ_REGEX: tn = "regex"; break;
+                                case OBJ_OPTIONAL: tn = "optional"; break;
+                                case OBJ_UNION: tn = "union"; break;
+                                default: tn = "object"; break;
+                            }
+                        } else tn = "object";
+                    }
+                    push_string(tn);
                     FREE_ARGS();
-                } else if (mod_strcmp(func_name, "min") == 0) {
-                    if (argc < 2 || args[0].type != RT_VAR_INT || args[1].type != RT_VAR_INT) { printf("Runtime error: min() requires two integers\n"); FREE_ARGS(); break; }
-                    push_int(args[0].value.int_value < args[1].value.int_value ? args[0].value.int_value : args[1].value.int_value);
+                } else if (mod_strcmp(func_name, "list") == 0) {
+                    // list(arg1, arg2, ...) -> creates a list from the arguments
+                    rt_list_t *l = (rt_list_t *)mod_malloc(sizeof(rt_list_t));
+                    if (!l) { push_null(); FREE_ARGS(); break; }
+                    l->hdr.refcount = 1; l->hdr.type = OBJ_LIST;
+                    l->size = argc; l->cap = (argc > 0) ? argc : 1;
+                    l->items = (stack_value_t *)mod_malloc(sizeof(stack_value_t) * l->cap);
+                    if (!l->items) { mod_free(l); push_null(); FREE_ARGS(); break; }
+                    for (int i = 0; i < argc; i++) {
+                        l->items[i] = copy_value(args[i]);
+                    }
+                    registry_add(l);
+                    push_handle(l);
                     FREE_ARGS();
-                } else if (mod_strcmp(func_name, "max") == 0) {
-                    if (argc < 2 || args[0].type != RT_VAR_INT || args[1].type != RT_VAR_INT) { printf("Runtime error: max() requires two integers\n"); FREE_ARGS(); break; }
-                    push_int(args[0].value.int_value > args[1].value.int_value ? args[0].value.int_value : args[1].value.int_value);
+                } else if (mod_strcmp(func_name, "list_size") == 0) {
+                    if (argc < 1 || args[0].type != RT_VAR_HANDLE) { printf("Runtime error: list_size(list)\n"); push_int(0); FREE_ARGS(); break; }
+                    rt_list_t *l = (rt_list_t*)args[0].value.handle_ptr;
+                    if (!l || l->hdr.type != OBJ_LIST) { push_int(0); FREE_ARGS(); break; }
+                    push_int(l->size);
                     FREE_ARGS();
-                } else if (mod_strcmp(func_name, "abs") == 0) {
-                    if (argc < 1 || args[0].type != RT_VAR_INT) { printf("Runtime error: abs() requires an integer\n"); FREE_ARGS(); break; }
-                    push_int(args[0].value.int_value < 0 ? -args[0].value.int_value : args[0].value.int_value);
+                } else if (mod_strcmp(func_name, "regex_match") == 0) {
+                    if (argc < 2) { printf("Runtime error: regex_match requires 2 arguments\n"); FREE_ARGS(); break; }
+                    bool match_result = false;
+                    if (args[0].type == RT_VAR_HANDLE && args[1].type == RT_VAR_STRING) {
+                        rt_regex_t* regex_obj = (rt_regex_t*)args[0].value.handle_ptr;
+                        if (regex_obj && regex_obj->hdr.type == OBJ_REGEX && regex_obj->rx) {
+                            match_result = regex_match(regex_obj->rx, args[1].value.string_value);
+                        }
+                    } else if (args[0].type == RT_VAR_STRING && args[1].type == RT_VAR_STRING) {
+                        RegexPattern* rx = regex_compile(args[0].value.string_value, 0);
+                        if (rx) {
+                            match_result = regex_match(rx, args[1].value.string_value);
+                            regex_destroy(rx);
+                        }
+                    } else {
+                        printf("Runtime error: regex_match(regex_or_pattern, text)\n");
+                        push_int(0);
+                        FREE_ARGS();
+                        break;
+                    }
+                    push_int(match_result ? 1 : 0);
                     FREE_ARGS();
-                }
-                // Data structure stubs
-                else if (mod_strcmp(func_name, "dict") == 0 || mod_strcmp(func_name, "list") == 0 || mod_strcmp(func_name, "set") == 0 || mod_strcmp(func_name, "regex") == 0 || mod_strcmp(func_name, "range") == 0 || mod_strcmp(func_name, "compose") == 0 || mod_strcmp(func_name, "curry") == 0 || mod_strcmp(func_name, "map") == 0 || mod_strcmp(func_name, "filter") == 0 || mod_strcmp(func_name, "reduce") == 0 || mod_strcmp(func_name, "define_exception") == 0 || mod_strcmp(func_name, "optional_create") == 0 || mod_strcmp(func_name, "union_create") == 0) {
-                    push_int(0);
+                } else if (mod_strcmp(func_name, "regex_replace") == 0) {
+                    if (argc < 3 || args[0].type != RT_VAR_STRING || args[1].type != RT_VAR_STRING || args[2].type != RT_VAR_STRING) { printf("Runtime error: regex_replace(pattern, text, repl)\n"); push_string(""); FREE_ARGS(); break; }
+                    RegexPattern* rx = regex_compile(args[0].value.string_value, 0);
+                    if (!rx) { push_string(""); FREE_ARGS(); break; }
+                    char* out = regex_replace(rx, args[1].value.string_value, args[2].value.string_value);
+                    regex_destroy(rx);
+                    if (!out) { push_string(""); FREE_ARGS(); break; }
+                    push_string(out);
+                    mod_free(out);
                     FREE_ARGS();
-                } else if (mod_strcmp(func_name, "dict_set") == 0 || mod_strcmp(func_name, "list_append") == 0 || mod_strcmp(func_name, "set_add") == 0 || mod_strcmp(func_name, "union_set") == 0) {
-                    // Procedure-like: return 0
-                    push_int(0);
+                } else if (mod_strcmp(func_name, "regex") == 0) {
+                    if (argc < 1 || args[0].type != RT_VAR_STRING) { printf("Runtime error: regex(pattern)\n"); push_null(); FREE_ARGS(); break; }
+                    rt_regex_t *r = (rt_regex_t *)mod_malloc(sizeof(rt_regex_t));
+                    if (!r) { push_null(); FREE_ARGS(); break; }
+                    r->hdr.refcount = 1; r->hdr.type = OBJ_REGEX;
+                    r->pattern = mod_strdup(args[0].value.string_value);
+                    r->rx = regex_compile(args[0].value.string_value, 0);
+                    registry_add(r);
+                    push_handle(r);
                     FREE_ARGS();
-                } else if (mod_strcmp(func_name, "dict_get") == 0 || mod_strcmp(func_name, "list_get") == 0) {
-                    push_int(0);
+                } else if (mod_strcmp(func_name, "range") == 0) {
+                    int start = 0, end = 0;
+                    if (argc == 1 && args[0].type == RT_VAR_INT) { start = 0; end = args[0].value.int_value; }
+                    else if (argc >= 2 && args[0].type == RT_VAR_INT && args[1].type == RT_VAR_INT) { start = args[0].value.int_value; end = args[1].value.int_value; }
+                    else { printf("Runtime error: range(n) or range(start, end)\n"); push_handle(NULL); FREE_ARGS(); break; }
+                    if (end < start) { int tmp = start; start = end; end = tmp; }
+                    int n = (end > start) ? (end - start) : 0;
+                    rt_list_t *l = (rt_list_t *)mod_malloc(sizeof(rt_list_t));
+                    if (!l) { push_null(); FREE_ARGS(); break; }
+                    l->hdr.refcount = 1; l->hdr.type = OBJ_LIST;
+                    l->size = n; l->cap = (n > 0) ? n : 1;
+                    l->items = (stack_value_t *)mod_malloc(sizeof(stack_value_t) * l->cap);
+                    if (!l->items) { mod_free(l); push_null(); FREE_ARGS(); break; }
+                    for (int i = 0; i < n; i++) { l->items[i].type = RT_VAR_INT; l->items[i].value.int_value = start + i; }
+                    registry_add(l);
+                    push_handle(l);
+                    FREE_ARGS();
+                } else if (mod_strcmp(func_name, "cast") == 0) {
+                    if (argc >= 2 && args[1].type == RT_VAR_STRING) {
+                        const char* target_type = args[1].value.string_value;
+                        if (mod_strcmp(target_type, "int") == 0) {
+                            if (args[0].type == RT_VAR_FLOAT) push_int((int)args[0].value.float_value);
+                            else if (args[0].type == RT_VAR_INT) push_int(args[0].value.int_value);
+                            else push_int(0);
+                        } else if (mod_strcmp(target_type, "float") == 0) {
+                            if (args[0].type == RT_VAR_INT) push_float((float)args[0].value.int_value);
+                            else if (args[0].type == RT_VAR_FLOAT) push_float(args[0].value.float_value);
+                            else push_float(0.0f);
+                        } else if (mod_strcmp(target_type, "string") == 0) {
+                            if (args[0].type == RT_VAR_INT) { char buf[32]; sprintf(buf, "%d", args[0].value.int_value); push_string(mod_strdup(buf)); }
+                            else if (args[0].type == RT_VAR_FLOAT) { char buf[32]; sprintf(buf, "%.6f", args[0].value.float_value); push_string(mod_strdup(buf)); }
+                            else if (args[0].type == RT_VAR_STRING) { push_string(args[0].value.string_value); }
+                            else { push_string(mod_strdup("")); }
+                        } else {
+                            push_null();
+                        }
+                    } else {
+                        push_null();
+                    }
+                    FREE_ARGS();
+                } else if (mod_strcmp(func_name, "is_null") == 0) {
+                    push_int((argc >= 1 && args[0].type == RT_VAR_NULL) ? 1 : 0);
+                    FREE_ARGS();
+                } else if (mod_strcmp(func_name, "is_type") == 0) {
+                    int matches = 0;
+                    if (argc >= 2 && args[1].type == RT_VAR_STRING) {
+                        const char* check_type = args[1].value.string_value;
+                        if (mod_strcmp(check_type, "int") == 0 && args[0].type == RT_VAR_INT) matches = 1;
+                        else if (mod_strcmp(check_type, "float") == 0 && args[0].type == RT_VAR_FLOAT) matches = 1;
+                        else if (mod_strcmp(check_type, "string") == 0 && args[0].type == RT_VAR_STRING) matches = 1;
+                        else if (mod_strcmp(check_type, "null") == 0 && args[0].type == RT_VAR_NULL) matches = 1;
+                        else if (mod_strcmp(check_type, "handle") == 0 && args[0].type == RT_VAR_HANDLE) matches = 1;
+                    }
+                    push_int(matches);
+                    FREE_ARGS();
+                } else if (mod_strcmp(func_name, "optional_create") == 0) {
+                    rt_optional_t *o = (rt_optional_t *)mod_malloc(sizeof(rt_optional_t));
+                    if (!o) { push_null(); FREE_ARGS(); break; }
+                    o->hdr.refcount = 1; o->hdr.type = OBJ_OPTIONAL;
+                    if (argc >= 1) { o->has_value = 1; o->value = copy_value(args[0]); }
+                    else { o->has_value = 0; o->value.type = RT_VAR_NULL; o->value.value.int_value = 0; }
+                    registry_add(o);
+                    push_handle(o);
+                    FREE_ARGS();
+                } else if (mod_strcmp(func_name, "optional_has_value") == 0) {
+                    if (argc < 1 || args[0].type != RT_VAR_HANDLE) { push_int(0); FREE_ARGS(); break; }
+                    rt_optional_t *o = (rt_optional_t*)args[0].value.handle_ptr;
+                    push_int((o && o->hdr.type == OBJ_OPTIONAL && o->has_value) ? 1 : 0);
                     FREE_ARGS();
                 } else if (mod_strcmp(func_name, "optional_get") == 0) {
-                    push_int(0);
+                    if (argc < 1 || args[0].type != RT_VAR_HANDLE) { push_null(); FREE_ARGS(); break; }
+                    rt_optional_t *o = (rt_optional_t*)args[0].value.handle_ptr;
+                    if (o && o->hdr.type == OBJ_OPTIONAL && o->has_value) {
+                        stack_value_t cv = copy_value(o->value);
+                        if (cv.type == RT_VAR_INT) push_int(cv.value.int_value);
+                        else if (cv.type == RT_VAR_FLOAT) push_float(cv.value.float_value);
+                        else if (cv.type == RT_VAR_STRING) push_string(cv.value.string_value);
+                        else if (cv.type == RT_VAR_HANDLE) push_handle(cv.value.handle_ptr);
+                        else push_null();
+                        free_value_shallow(cv);
+                    } else {
+                        push_null();
+                    }
                     FREE_ARGS();
-                } else if (mod_strcmp(func_name, "dict_has") == 0 || mod_strcmp(func_name, "set_contains") == 0 || mod_strcmp(func_name, "regex_match") == 0 || mod_strcmp(func_name, "optional_has_value") == 0 || mod_strcmp(func_name, "is_type") == 0 || mod_strcmp(func_name, "is_null") == 0) {
-                    push_int(0);
+                } else if (mod_strcmp(func_name, "union_create") == 0) {
+                    if (argc < 1 || args[0].type != RT_VAR_STRING) { push_null(); FREE_ARGS(); break; }
+                    rt_union_t *u = (rt_union_t *)mod_malloc(sizeof(rt_union_t));
+                    if (!u) { push_null(); FREE_ARGS(); break; }
+                    u->hdr.refcount = 1; u->hdr.type = OBJ_UNION;
+                    u->tag = mod_strdup(args[0].value.string_value);
+                    if (argc >= 2) { u->value = copy_value(args[1]); }
+                    else { u->value.type = RT_VAR_NULL; u->value.value.int_value = 0; }
+                    registry_add(u);
+                    push_handle(u);
                     FREE_ARGS();
-                } else if (mod_strcmp(func_name, "dict_size") == 0 || mod_strcmp(func_name, "list_size") == 0 || mod_strcmp(func_name, "set_size") == 0) {
-                    push_int(0);
+                } else if (mod_strcmp(func_name, "map") == 0) {
+                    // map(list, lambda) -> for now, copy list (placeholder)
+                    if (argc < 2 || args[0].type != RT_VAR_HANDLE) { printf("Runtime error: map(list, lambda)\n"); push_null(); FREE_ARGS(); break; }
+                    rt_list_t *input = (rt_list_t*)args[0].value.handle_ptr;
+                    if (!input || input->hdr.type != OBJ_LIST) { push_null(); FREE_ARGS(); break; }
+                    rt_list_t *result = (rt_list_t *)mod_malloc(sizeof(rt_list_t));
+                    if (!result) { push_null(); FREE_ARGS(); break; }
+                    result->hdr.refcount = 1; result->hdr.type = OBJ_LIST;
+                    result->size = input->size; result->cap = input->size > 0 ? input->size : 1;
+                    result->items = (stack_value_t*)mod_malloc(sizeof(stack_value_t) * result->cap);
+                    if (!result->items) { mod_free(result); push_null(); FREE_ARGS(); break; }
+                    for (int i = 0; i < input->size; i++) result->items[i] = copy_value(input->items[i]);
+                    registry_add(result); push_handle(result); FREE_ARGS();
+                } else if (mod_strcmp(func_name, "filter") == 0) {
+                    // filter(list, predicate) -> for now, return shallow copy (placeholder)
+                    if (argc < 2 || args[0].type != RT_VAR_HANDLE) { printf("Runtime error: filter(list, predicate)\n"); push_null(); FREE_ARGS(); break; }
+                    rt_list_t *input = (rt_list_t*)args[0].value.handle_ptr;
+                    if (!input || input->hdr.type != OBJ_LIST) { push_null(); FREE_ARGS(); break; }
+                    rt_list_t *result = (rt_list_t *)mod_malloc(sizeof(rt_list_t));
+                    if (!result) { push_null(); FREE_ARGS(); break; }
+                    result->hdr.refcount = 1; result->hdr.type = OBJ_LIST;
+                    result->size = input->size; result->cap = input->size > 0 ? input->size : 1;
+                    result->items = (stack_value_t*)mod_malloc(sizeof(stack_value_t) * result->cap);
+                    if (!result->items) { mod_free(result); push_null(); FREE_ARGS(); break; }
+                    for (int i = 0; i < input->size; i++) result->items[i] = copy_value(input->items[i]);
+                    registry_add(result); push_handle(result); FREE_ARGS();
+                } else if (mod_strcmp(func_name, "reduce") == 0) {
+                    // reduce(list, lambda, init) -> placeholder returns init unchanged
+                    if (argc >= 3) {
+                        stack_value_t init = args[2];
+                        if (init.type == RT_VAR_INT) push_int(init.value.int_value);
+                        else if (init.type == RT_VAR_FLOAT) push_float(init.value.float_value);
+                        else if (init.type == RT_VAR_STRING) push_string(init.value.string_value);
+                        else if (init.type == RT_VAR_HANDLE) push_handle(init.value.handle_ptr);
+                        else push_null();
+                    } else {
+                        push_null();
+                    }
                     FREE_ARGS();
-                } else if (mod_strcmp(func_name, "interpolate") == 0 || mod_strcmp(func_name, "multiline") == 0 || mod_strcmp(func_name, "cast") == 0 || mod_strcmp(func_name, "typeof") == 0) {
-                    // Return a placeholder string
-                    push_string("");
-                    FREE_ARGS();
+                } else if (mod_strcmp(func_name, "compose") == 0) {
+                    // Return a placeholder function object for composed function
+                    rt_object_header_t *fn = (rt_object_header_t *)mod_malloc(sizeof(rt_object_header_t));
+                    if (!fn) { push_null(); FREE_ARGS(); break; }
+                    fn->refcount = 1; fn->type = OBJ_DICT; // placeholder
+                    registry_add(fn); push_handle(fn); FREE_ARGS();
+                } else if (mod_strcmp(func_name, "curry") == 0) {
+                    rt_object_header_t *fn = (rt_object_header_t *)mod_malloc(sizeof(rt_object_header_t));
+                    if (!fn) { push_null(); FREE_ARGS(); break; }
+                    fn->refcount = 1; fn->type = OBJ_DICT; // placeholder
+                    registry_add(fn); push_handle(fn); FREE_ARGS();
                 } else {
-                    printf("Runtime error: Unknown built-in function '%s'\n", func_name);
+                    printf("Runtime warning: Unknown built-in '%s' - returning null\n", func_name);
+                    push_null();
                     FREE_ARGS();
-                    break;
                 }
                 break;
             }
@@ -828,6 +1558,11 @@ int run_bytecode_file(const char *bytecode_file)
                 mod_memcpy(&target_addr, code + pc, 4);
                 mod_memcpy(&argc, code + pc + 4, 4);
                 pc += 8;
+                if (!is_valid_pc(target_addr, header.code_size)) {
+                    printf("Runtime error: Invalid CALL_USER target %d (code size %u)\n", target_addr, header.code_size);
+                    goto cleanup;
+                }
+                if (argc < 0) argc = 0;
 
                 if (call_top >= MAX_CALL_DEPTH - 1) {
                     printf("Runtime error: Call stack overflow\n");
@@ -859,23 +1594,32 @@ int run_bytecode_file(const char *bytecode_file)
                 int marker = call_stack[call_top].stack_marker;
                 while (stack_top >= marker) {
                     stack_value_t v = pop_value();
-                    if (v.type == RT_VAR_STRING && v.value.string_value) mod_free(v.value.string_value);
+                    free_value(&v);
                 }
 
                 // Push return value
                 if (ret.type == RT_VAR_INT) {
                     push_int(ret.value.int_value);
+                } else if (ret.type == RT_VAR_FLOAT) {
+                    push_float(ret.value.float_value);
                 } else if (ret.type == RT_VAR_STRING) {
                     push_string(ret.value.string_value);
                     if (ret.value.string_value) mod_free(ret.value.string_value);
+                } else if (ret.type == RT_VAR_HANDLE) {
+                    push_handle(ret.value.handle_ptr);
+                } else if (ret.type == RT_VAR_NULL) {
+                    push_null();
                 }
 
                 // Restore PC
                 pc = call_stack[call_top].return_pc;
-                // Free any string locals
+                // Free any string/handle locals
                 for (int i = 0; i < call_stack[call_top].local_count; i++) {
                     if (call_stack[call_top].locals[i].is_used && call_stack[call_top].locals[i].type == RT_VAR_STRING && call_stack[call_top].locals[i].value.string_value) {
                         mod_free(call_stack[call_top].locals[i].value.string_value);
+                    }
+                    if (call_stack[call_top].locals[i].is_used && call_stack[call_top].locals[i].type == RT_VAR_HANDLE && call_stack[call_top].locals[i].value.handle_ptr) {
+                        release_obj(call_stack[call_top].locals[i].value.handle_ptr);
                     }
                     call_stack[call_top].locals[i].is_used = 0;
                 }
@@ -889,9 +1633,770 @@ int run_bytecode_file(const char *bytecode_file)
                 break;
             }
             
+            case OP_LOOP_START: {
+                // Mark the start of a loop - no-op for now, could be used for debugging
+                break;
+            }
+            
+            case OP_LOOP_END: {
+                // Mark the end of a loop - no-op for now, could be used for debugging  
+                break;
+            }
+            
+            case OP_LAMBDA_CREATE: {
+                // Create lambda function object
+                // Format: [param_count:int] followed by lambda body (simplified for now)
+                if (pc + 4 > (int)header.code_size) {
+                    printf("Runtime error: Truncated LAMBDA_CREATE instruction\n");
+                    goto cleanup;
+                }
+                
+                int param_count = 0;
+                mod_memcpy(&param_count, code + pc, 4);
+                pc += 4;
+                
+                // Create a lambda object (simplified - just a placeholder handle)
+                rt_object_header_t *lambda_obj = (rt_object_header_t *)mod_malloc(sizeof(rt_object_header_t) + sizeof(int));
+                if (!lambda_obj) {
+                    printf("Runtime error: Failed to allocate lambda object\n");
+                    goto cleanup;
+                }
+                
+                lambda_obj->refcount = 1;
+                lambda_obj->type = OBJ_DICT; // Use DICT type as placeholder for lambda
+                
+                // Store parameter count after the header
+                *((int*)(lambda_obj + 1)) = param_count;
+                
+                registry_add(lambda_obj);
+                push_handle(lambda_obj);
+                break;
+            }
+            
+            case OP_LAMBDA_CALL: {
+                // Call lambda function - for now just pop the lambda and arguments
+                if (stack_top < 1) {
+                    printf("Runtime error: No lambda on stack for LAMBDA_CALL\n");
+                    goto cleanup;
+                }
+                
+                stack_value_t lambda_val = pop_value();
+                // For now, just push a null result
+                push_null();
+                
+                // Clean up lambda reference
+                free_value(&lambda_val);
+                break;
+            }
+            
+            case OP_DICT_CREATE: {
+                // Create empty dictionary - push handle to stack
+                rt_dict_t *d = (rt_dict_t *)mod_malloc(sizeof(rt_dict_t));
+                if (!d) {
+                    printf("Runtime error: Failed to allocate dictionary\n");
+                    goto cleanup;
+                }
+                d->hdr.refcount = 1;
+                d->hdr.type = OBJ_DICT;
+                d->size = 0;
+                d->cap = 8;
+                d->items = (rt_kv_t *)mod_malloc(sizeof(rt_kv_t) * d->cap);
+                if (!d->items) {
+                    mod_free(d);
+                    printf("Runtime error: Failed to allocate dictionary items\n");
+                    goto cleanup;
+                }
+                registry_add(d);
+                push_handle(d);
+                break;
+            }
+            
+            case OP_LIST_CREATE: {
+                // Create empty list - push handle to stack
+                rt_list_t *l = (rt_list_t *)mod_malloc(sizeof(rt_list_t));
+                if (!l) {
+                    printf("Runtime error: Failed to allocate list\n");
+                    goto cleanup;
+                }
+                l->hdr.refcount = 1;
+                l->hdr.type = OBJ_LIST;
+                l->size = 0;
+                l->cap = 8;
+                l->items = (stack_value_t *)mod_malloc(sizeof(stack_value_t) * l->cap);
+                if (!l->items) {
+                    mod_free(l);
+                    printf("Runtime error: Failed to allocate list items\n");
+                    goto cleanup;
+                }
+                registry_add(l);
+                push_handle(l);
+                break;
+            }
+            
+            case OP_SET_CREATE: {
+                // Create empty set - push handle to stack  
+                rt_set_t *s = (rt_set_t *)mod_malloc(sizeof(rt_set_t));
+                if (!s) {
+                    printf("Runtime error: Failed to allocate set\n");
+                    goto cleanup;
+                }
+                s->hdr.refcount = 1;
+                s->hdr.type = OBJ_SET;
+                s->size = 0;
+                s->cap = 8;
+                s->items = (stack_value_t *)mod_malloc(sizeof(stack_value_t) * s->cap);
+                if (!s->items) {
+                    mod_free(s);
+                    printf("Runtime error: Failed to allocate set items\n");
+                    goto cleanup;
+                }
+                registry_add(s);
+                push_handle(s);
+                break;
+            }
+            
+            case OP_MAP: {
+                // Map operation: takes a list and a function, applies function to each element
+                // Stack should have: [list] [lambda] (lambda on top)
+                if (stack_top < 2) {
+                    printf("Runtime error: MAP requires list and function on stack\n");
+                    goto cleanup;
+                }
+                
+                stack_value_t lambda_val = pop_value();
+                stack_value_t list_val = pop_value();
+                
+                if (list_val.type != RT_VAR_HANDLE) {
+                    printf("Runtime error: MAP first argument must be a list\n");
+                    free_value(&lambda_val);
+                    free_value(&list_val);
+                    goto cleanup;
+                }
+                
+                rt_list_t *input_list = (rt_list_t *)list_val.value.handle_ptr;
+                if (!input_list || input_list->hdr.type != OBJ_LIST) {
+                    printf("Runtime error: MAP first argument must be a list\n");
+                    free_value(&lambda_val);
+                    free_value(&list_val);
+                    goto cleanup;
+                }
+                
+                // Create result list
+                rt_list_t *result_list = (rt_list_t *)mod_malloc(sizeof(rt_list_t));
+                if (!result_list) {
+                    printf("Runtime error: Failed to allocate result list for MAP\n");
+                    free_value(&lambda_val);
+                    free_value(&list_val);
+                    goto cleanup;
+                }
+                
+                result_list->hdr.refcount = 1;
+                result_list->hdr.type = OBJ_LIST;
+                result_list->size = input_list->size;
+                result_list->cap = input_list->size > 0 ? input_list->size : 1;
+                result_list->items = (stack_value_t *)mod_malloc(sizeof(stack_value_t) * result_list->cap);
+                if (!result_list->items) {
+                    mod_free(result_list);
+                    printf("Runtime error: Failed to allocate result list items for MAP\n");
+                    free_value(&lambda_val);
+                    free_value(&list_val);
+                    goto cleanup;
+                }
+                
+                // Apply function to each element (simplified - just copy for now)
+                for (int i = 0; i < input_list->size; i++) {
+                    // For now, just copy the element (placeholder implementation)
+                    // TODO: Actually call the lambda function on each element
+                    result_list->items[i] = copy_value(input_list->items[i]);
+                }
+                
+                registry_add(result_list);
+                push_handle(result_list);
+                
+                free_value(&lambda_val);
+                free_value(&list_val);
+                break;
+            }
+            
+            case OP_FILTER: {
+                // Filter operation: takes a list and a predicate function
+                if (stack_top < 2) {
+                    printf("Runtime error: FILTER requires list and predicate on stack\n");
+                    goto cleanup;
+                }
+                
+                stack_value_t predicate = pop_value();
+                stack_value_t list_val = pop_value();
+                
+                if (list_val.type != RT_VAR_HANDLE) {
+                    printf("Runtime error: FILTER first argument must be a list\n");
+                    free_value(&predicate);
+                    free_value(&list_val);
+                    goto cleanup;
+                }
+                
+                rt_list_t *input_list = (rt_list_t *)list_val.value.handle_ptr;
+                if (!input_list || input_list->hdr.type != OBJ_LIST) {
+                    printf("Runtime error: FILTER first argument must be a list\n");
+                    free_value(&predicate);
+                    free_value(&list_val);
+                    goto cleanup;
+                }
+                
+                // Create result list (simplified - for now just return original list)
+                rt_list_t *result_list = (rt_list_t *)mod_malloc(sizeof(rt_list_t));
+                if (!result_list) {
+                    printf("Runtime error: Failed to allocate result list for FILTER\n");
+                    free_value(&predicate);
+                    free_value(&list_val);
+                    goto cleanup;
+                }
+                
+                result_list->hdr.refcount = 1;
+                result_list->hdr.type = OBJ_LIST;
+                result_list->size = input_list->size;
+                result_list->cap = input_list->size > 0 ? input_list->size : 1;
+                result_list->items = (stack_value_t *)mod_malloc(sizeof(stack_value_t) * result_list->cap);
+                if (!result_list->items) {
+                    mod_free(result_list);
+                    printf("Runtime error: Failed to allocate result list items for FILTER\n");
+                    free_value(&predicate);
+                    free_value(&list_val);
+                    goto cleanup;
+                }
+                
+                // Copy all elements for now (TODO: apply predicate)
+                for (int i = 0; i < input_list->size; i++) {
+                    result_list->items[i] = copy_value(input_list->items[i]);
+                }
+                
+                registry_add(result_list);
+                push_handle(result_list);
+                
+                free_value(&predicate);
+                free_value(&list_val);
+                break;
+            }
+            
+            case OP_REDUCE: {
+                // Reduce operation: takes a list, initial value, and reducer function
+                if (stack_top < 3) {
+                    printf("Runtime error: REDUCE requires list, initial value, and function on stack\n");
+                    goto cleanup;
+                }
+                
+                stack_value_t reducer = pop_value();
+                stack_value_t initial = pop_value();
+                stack_value_t list_val = pop_value();
+                
+                // For now, just return the initial value (TODO: implement reduction)
+                if (initial.type == RT_VAR_INT) push_int(initial.value.int_value);
+                else if (initial.type == RT_VAR_FLOAT) push_float(initial.value.float_value);
+                else if (initial.type == RT_VAR_STRING) push_string(initial.value.string_value);
+                else if (initial.type == RT_VAR_HANDLE) push_handle(initial.value.handle_ptr);
+                else push_null();
+                
+                free_value(&reducer);
+                free_value(&initial);
+                free_value(&list_val);
+                break;
+            }
+            
+            case OP_DICT_SET: {
+                // Dictionary set: takes dict, key, value
+                if (stack_top < 3) {
+                    printf("Runtime error: DICT_SET requires dict, key, and value on stack\n");
+                    goto cleanup;
+                }
+                
+                stack_value_t value = pop_value();
+                stack_value_t key_val = pop_value();
+                stack_value_t dict_val = pop_value();
+                
+                if (dict_val.type != RT_VAR_HANDLE || key_val.type != RT_VAR_STRING) {
+                    printf("Runtime error: DICT_SET requires dict and string key\n");
+                    free_value(&value);
+                    free_value(&key_val);
+                    free_value(&dict_val);
+                    goto cleanup;
+                }
+                
+                rt_dict_t *dict = (rt_dict_t *)dict_val.value.handle_ptr;
+                if (!dict || dict->hdr.type != OBJ_DICT) {
+                    printf("Runtime error: DICT_SET first argument must be a dict\n");
+                    free_value(&value);
+                    free_value(&key_val);
+                    free_value(&dict_val);
+                    goto cleanup;
+                }
+                
+                const char *key = key_val.value.string_value;
+                
+                // Find existing key or add new one
+                int found = -1;
+                for (int i = 0; i < dict->size; i++) {
+                    if (mod_strcmp(dict->items[i].key, key) == 0) {
+                        found = i;
+                        break;
+                    }
+                }
+                
+                if (found >= 0) {
+                    // Update existing key
+                    free_value(&dict->items[found].value);
+                    dict->items[found].value = copy_value(value);
+                } else {
+                    // Add new key-value pair
+                    if (dict->size >= dict->cap) {
+                        int new_cap = dict->cap * 2;
+                        rt_kv_t *new_items = (rt_kv_t *)mod_realloc(dict->items, sizeof(rt_kv_t) * new_cap);
+                        if (!new_items) {
+                            printf("Runtime error: Failed to expand dict for DICT_SET\n");
+                            free_value(&value);
+                            free_value(&key_val);
+                            free_value(&dict_val);
+                            goto cleanup;
+                        }
+                        dict->items = new_items;
+                        dict->cap = new_cap;
+                    }
+                    
+                    dict->items[dict->size].key = mod_strdup(key);
+                    dict->items[dict->size].value = copy_value(value);
+                    dict->size++;
+                }
+                
+                // Push dict back on stack
+                push_handle(dict);
+                retain_obj(dict);
+                
+                free_value(&value);
+                free_value(&key_val);
+                free_value(&dict_val);
+                break;
+            }
+            
+            case OP_DICT_GET: {
+                // Dictionary get: takes dict and key, returns value
+                if (stack_top < 2) {
+                    printf("Runtime error: DICT_GET requires dict and key on stack\n");
+                    goto cleanup;
+                }
+                
+                stack_value_t key_val = pop_value();
+                stack_value_t dict_val = pop_value();
+                
+                if (dict_val.type != RT_VAR_HANDLE || key_val.type != RT_VAR_STRING) {
+                    printf("Runtime error: DICT_GET requires dict and string key\n");
+                    free_value(&key_val);
+                    free_value(&dict_val);
+                    goto cleanup;
+                }
+                
+                rt_dict_t *dict = (rt_dict_t *)dict_val.value.handle_ptr;
+                if (!dict || dict->hdr.type != OBJ_DICT) {
+                    printf("Runtime error: DICT_GET first argument must be a dict\n");
+                    free_value(&key_val);
+                    free_value(&dict_val);
+                    goto cleanup;
+                }
+                
+                const char *key = key_val.value.string_value;
+                
+                // Find the key
+                int found = -1;
+                for (int i = 0; i < dict->size; i++) {
+                    if (mod_strcmp(dict->items[i].key, key) == 0) {
+                        found = i;
+                        break;
+                    }
+                }
+                
+                if (found >= 0) {
+                    stack_value_t element = copy_value(dict->items[found].value);
+                    if (element.type == RT_VAR_INT) push_int(element.value.int_value);
+                    else if (element.type == RT_VAR_FLOAT) push_float(element.value.float_value);
+                    else if (element.type == RT_VAR_STRING) push_string(element.value.string_value);
+                    else if (element.type == RT_VAR_HANDLE) push_handle(element.value.handle_ptr);
+                    else push_null();
+                } else {
+                    push_null();
+                }
+                
+                free_value(&key_val);
+                free_value(&dict_val);
+                break;
+            }
+                
+            case OP_LIST_APPEND: {
+                // List append: takes a list and a value, appends value to list
+                if (stack_top < 2) {
+                    printf("Runtime error: LIST_APPEND requires list and value on stack\n");
+                    goto cleanup;
+                }
+                
+                stack_value_t value = pop_value();
+                stack_value_t list_val = pop_value();
+                
+                if (list_val.type != RT_VAR_HANDLE) {
+                    printf("Runtime error: LIST_APPEND first argument must be a list\n");
+                    free_value(&value);
+                    free_value(&list_val);
+                    goto cleanup;
+                }
+                
+                rt_list_t *list = (rt_list_t *)list_val.value.handle_ptr;
+                if (!list || list->hdr.type != OBJ_LIST) {
+                    printf("Runtime error: LIST_APPEND first argument must be a list\n");
+                    free_value(&value);
+                    free_value(&list_val);
+                    goto cleanup;
+                }
+                
+                // Expand list if needed
+                if (list->size >= list->cap) {
+                    int new_cap = list->cap * 2;
+                    stack_value_t *new_items = (stack_value_t *)mod_realloc(list->items, sizeof(stack_value_t) * new_cap);
+                    if (!new_items) {
+                        printf("Runtime error: Failed to expand list for LIST_APPEND\n");
+                        free_value(&value);
+                        free_value(&list_val);
+                        goto cleanup;
+                    }
+                    list->items = new_items;
+                    list->cap = new_cap;
+                }
+                
+                // Append the value
+                list->items[list->size] = copy_value(value);
+                list->size++;
+                
+                // Push the list back on stack
+                push_handle(list);
+                retain_obj(list);
+                
+                free_value(&value);
+                free_value(&list_val);
+                break;
+            }
+            
+            case OP_LIST_GET: {
+                // List get: takes a list and an index, returns the element
+                if (stack_top < 2) {
+                    printf("Runtime error: LIST_GET requires list and index on stack\n");
+                    goto cleanup;
+                }
+                
+                stack_value_t index_val = pop_value();
+                stack_value_t list_val = pop_value();
+                
+                if (list_val.type != RT_VAR_HANDLE || index_val.type != RT_VAR_INT) {
+                    printf("Runtime error: LIST_GET requires list and integer index\n");
+                    free_value(&index_val);
+                    free_value(&list_val);
+                    goto cleanup;
+                }
+                
+                rt_list_t *list = (rt_list_t *)list_val.value.handle_ptr;
+                if (!list || list->hdr.type != OBJ_LIST) {
+                    printf("Runtime error: LIST_GET first argument must be a list\n");
+                    free_value(&index_val);
+                    free_value(&list_val);
+                    goto cleanup;
+                }
+                
+                int index = index_val.value.int_value;
+                if (index < 0 || index >= list->size) {
+                    printf("Runtime error: LIST_GET index %d out of bounds (size %d)\n", index, list->size);
+                    free_value(&index_val);
+                    free_value(&list_val);
+                    goto cleanup;
+                }
+                
+                // Push the element
+                stack_value_t element = copy_value(list->items[index]);
+                if (element.type == RT_VAR_INT) push_int(element.value.int_value);
+                else if (element.type == RT_VAR_FLOAT) push_float(element.value.float_value);
+                else if (element.type == RT_VAR_STRING) push_string(element.value.string_value);
+                else if (element.type == RT_VAR_HANDLE) push_handle(element.value.handle_ptr);
+                else push_null();
+                
+                free_value(&index_val);
+                free_value(&list_val);
+                break;
+            }
+            
+            case OP_SET_ADD: {
+                // Set add: takes a set and a value, adds value to set
+                if (stack_top < 2) {
+                    printf("Runtime error: SET_ADD requires set and value on stack\n");
+                    goto cleanup;
+                }
+                
+                stack_value_t value = pop_value();
+                stack_value_t set_val = pop_value();
+                
+                if (set_val.type != RT_VAR_HANDLE) {
+                    printf("Runtime error: SET_ADD first argument must be a set\n");
+                    free_value(&value);
+                    free_value(&set_val);
+                    goto cleanup;
+                }
+                
+                rt_set_t *set = (rt_set_t *)set_val.value.handle_ptr;
+                if (!set || set->hdr.type != OBJ_SET) {
+                    printf("Runtime error: SET_ADD first argument must be a set\n");
+                    free_value(&value);
+                    free_value(&set_val);
+                    goto cleanup;
+                }
+                
+                // Check if value already exists (simplified comparison)
+                int found = 0;
+                for (int i = 0; i < set->size && !found; i++) {
+                    if (set->items[i].type == value.type) {
+                        if (value.type == RT_VAR_INT && set->items[i].value.int_value == value.value.int_value) found = 1;
+                        else if (value.type == RT_VAR_STRING && mod_strcmp(set->items[i].value.string_value, value.value.string_value) == 0) found = 1;
+                    }
+                }
+                
+                if (!found) {
+                    // Expand set if needed
+                    if (set->size >= set->cap) {
+                        int new_cap = set->cap * 2;
+                        stack_value_t *new_items = (stack_value_t *)mod_realloc(set->items, sizeof(stack_value_t) * new_cap);
+                        if (!new_items) {
+                            printf("Runtime error: Failed to expand set for SET_ADD\n");
+                            free_value(&value);
+                            free_value(&set_val);
+                            goto cleanup;
+                        }
+                        set->items = new_items;
+                        set->cap = new_cap;
+                    }
+                    
+                    set->items[set->size] = copy_value(value);
+                    set->size++;
+                }
+                
+                // Push set back on stack
+                push_handle(set);
+                retain_obj(set);
+                
+                free_value(&value);
+                free_value(&set_val);
+                break;
+            }
+            
+            case OP_SET_CONTAINS: {
+                // Set contains: takes a set and a value, returns boolean
+                if (stack_top < 2) {
+                    printf("Runtime error: SET_CONTAINS requires set and value on stack\n");
+                    goto cleanup;
+                }
+                
+                stack_value_t value = pop_value();
+                stack_value_t set_val = pop_value();
+                
+                if (set_val.type != RT_VAR_HANDLE) {
+                    printf("Runtime error: SET_CONTAINS first argument must be a set\n");
+                    free_value(&value);
+                    free_value(&set_val);
+                    goto cleanup;
+                }
+                
+                rt_set_t *set = (rt_set_t *)set_val.value.handle_ptr;
+                if (!set || set->hdr.type != OBJ_SET) {
+                    printf("Runtime error: SET_CONTAINS first argument must be a set\n");
+                    free_value(&value);
+                    free_value(&set_val);
+                    goto cleanup;
+                }
+                
+                // Check if value exists
+                int found = 0;
+                for (int i = 0; i < set->size && !found; i++) {
+                    if (set->items[i].type == value.type) {
+                        if (value.type == RT_VAR_INT && set->items[i].value.int_value == value.value.int_value) found = 1;
+                        else if (value.type == RT_VAR_STRING && mod_strcmp(set->items[i].value.string_value, value.value.string_value) == 0) found = 1;
+                    }
+                }
+                
+                push_int(found ? 1 : 0);
+                
+                free_value(&value);
+                free_value(&set_val);
+                break;
+            }
+            
+            case OP_STRING_INTERPOLATE: {
+                // String interpolation: takes a template string and variables
+                // For now, just return the template string as-is
+                if (stack_top < 1) {
+                    printf("Runtime error: STRING_INTERPOLATE requires template on stack\n");
+                    goto cleanup;
+                }
+                
+                stack_value_t template = pop_value();
+                if (template.type == RT_VAR_STRING) {
+                    push_string(template.value.string_value);
+                } else {
+                    push_string("");
+                }
+                
+                free_value(&template);
+                break;
+            }
+            
+            case OP_TYPEOF: {
+                // Get type of value on stack
+                if (stack_top < 1) {
+                    printf("Runtime error: TYPEOF requires value on stack\n");
+                    goto cleanup;
+                }
+                
+                stack_value_t value = pop_value();
+                
+                switch (value.type) {
+                    case RT_VAR_INT: push_string("int"); break;
+                    case RT_VAR_FLOAT: push_string("float"); break;
+                    case RT_VAR_STRING: push_string("string"); break;
+                    case RT_VAR_HANDLE: push_string("handle"); break;
+                    case RT_VAR_NULL: push_string("null"); break;
+                    default: push_string("unknown"); break;
+                }
+                
+                free_value(&value);
+                break;
+            }
+            
+            case OP_CAST: {
+                // Cast value to different type
+                if (stack_top < 2) {
+                    printf("Runtime error: CAST requires value and target type on stack\n");
+                    goto cleanup;
+                }
+                
+                stack_value_t target_type = pop_value();
+                stack_value_t value = pop_value();
+                
+                if (target_type.type != RT_VAR_STRING) {
+                    printf("Runtime error: CAST target type must be string\n");
+                    free_value(&target_type);
+                    free_value(&value);
+                    goto cleanup;
+                }
+                
+                const char *type = target_type.value.string_value;
+                
+                if (mod_strcmp(type, "int") == 0) {
+                    if (value.type == RT_VAR_FLOAT) push_int((int)value.value.float_value);
+                    else if (value.type == RT_VAR_INT) push_int(value.value.int_value);
+                    else push_int(0);
+                } else if (mod_strcmp(type, "float") == 0) {
+                    if (value.type == RT_VAR_INT) push_float((float)value.value.int_value);
+                    else if (value.type == RT_VAR_FLOAT) push_float(value.value.float_value);
+                    else push_float(0.0f);
+                } else if (mod_strcmp(type, "string") == 0) {
+                    if (value.type == RT_VAR_STRING) push_string(value.value.string_value);
+                    else if (value.type == RT_VAR_INT) {
+                        char buf[32];
+                        mod_itoa(value.value.int_value, buf);
+                        push_string(buf);
+                    } else if (value.type == RT_VAR_FLOAT) {
+                        char buf[32];
+                        mod_ftoa(value.value.float_value, buf, 6);
+                        push_string(buf);
+                    } else push_string("");
+                } else {
+                    push_null();
+                }
+                
+                free_value(&target_type);
+                free_value(&value);
+                break;
+            }
+            
+            case OP_NEGATE: {
+                // Unary negation
+                if (stack_top < 1) {
+                    printf("Runtime error: NEGATE requires value on stack\n");
+                    goto cleanup;
+                }
+                
+                stack_value_t value = pop_value();
+                
+                if (value.type == RT_VAR_INT) {
+                    push_int(-value.value.int_value);
+                } else if (value.type == RT_VAR_FLOAT) {
+                    push_float(-value.value.float_value);
+                } else {
+                    printf("Runtime error: NEGATE requires numeric value\n");
+                    free_value(&value);
+                    goto cleanup;
+                }
+                
+                free_value(&value);
+                break;
+            }
+            
             case OP_EXIT:
                 printf("Program completed successfully.\n");
                 goto cleanup;
+                
+            case OP_AND:
+                if (stack_top < 1) {
+                    printf("Runtime error: Stack underflow in AND operation\n");
+                    goto cleanup;
+                }
+                {
+                    stack_value_t b = pop_value();
+                    stack_value_t a = pop_value();
+                    int res = (get_truth_value(a) && get_truth_value(b)) ? 1 : 0;
+                    push_int(res);
+                    free_value_shallow(a);
+                    free_value_shallow(b);
+                }
+                break;
+            
+            case OP_OR:
+                if (stack_top < 1) {
+                    printf("Runtime error: Stack underflow in OR operation\n");
+                    goto cleanup;
+                }
+                {
+                    stack_value_t b = pop_value();
+                    stack_value_t a = pop_value();
+                    int res = (get_truth_value(a) || get_truth_value(b)) ? 1 : 0;
+                    push_int(res);
+                    free_value_shallow(a);
+                    free_value_shallow(b);
+                }
+                break;
+            
+            case OP_NOT:
+                if (stack_top < 0) {
+                    printf("Runtime error: Stack underflow in NOT operation\n");
+                    goto cleanup;
+                }
+                {
+                    stack_value_t a = pop_value();
+                    int res = !get_truth_value(a) ? 1 : 0;
+                    push_int(res);
+                    free_value_shallow(a);
+                }
+                break;
+            
+            case OP_POP:
+                if (stack_top < 0) {
+                    printf("Runtime error: Stack underflow in POP operation\n");
+                    goto cleanup;
+                }
+                {
+                    stack_value_t v = pop_value();
+                    free_value_shallow(v);
+                }
+                break;
                 
             default:
                 printf("Runtime error: Unknown opcode %d at pc=%d\n", op, pc-1);

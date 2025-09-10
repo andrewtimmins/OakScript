@@ -26,5 +26,10 @@ char *mod_strncpy(char *dest, const char *src, size_t n);
 char *mod_strcat(char *dest, const char *src);
 char *mod_strncat(char *dest, const char *src, size_t n);
 size_t mod_strcspn(const char *s, const char *reject);
+char *mod_strstr(const char *haystack, const char *needle);
+int mod_snprintf(char *str, size_t size, const char *format, ...);
+void mod_itoa(int value, char *str);
+void mod_ftoa(float value, char *str, int precision);
+int mod_ptr_valid(void *ptr);
 
 #endif // OAKSCRPT_MODMEM_H

@@ -21,10 +21,11 @@ int mod_init(size_t initial_size, size_t max_size) {
     initial_size = (initial_size + page - 1) & ~(page - 1);
     max_size = (max_size + page - 1) & ~(page - 1);
 
+    // Allocate at maximum size to prevent moves that would invalidate pointers
     _swix(OS_DynamicArea, _INR(0,9)|_OUT(1)|_OUT(3),
           0,              // reason 0: create
           -1,             // let OS allocate number
-          initial_size,   // initial size
+          max_size,       // initial size = max size to prevent moves
           -1,             // base (internal use)
           flags,
           max_size,       // max logical size
@@ -38,7 +39,7 @@ int mod_init(size_t initial_size, size_t max_size) {
     if ((int)base == 0 || area < 0) return 0;
     da_number = area;
     da_base = (char*)base;
-    da_size = initial_size;
+    da_size = max_size;  // Use full allocated size
     da_max = max_size;
     heap_off = 0;
     return 1;
@@ -241,4 +242,101 @@ size_t mod_strcspn(const char *s, const char *reject) {
         count++;
     }
     return count;
+}
+
+char *mod_strstr(const char *haystack, const char *needle) {
+    if (!haystack || !needle) return NULL;
+    if (*needle == '\0') return (char*)haystack;
+    
+    size_t needle_len = mod_strlen(needle);
+    
+    for (const char *p = haystack; *p; p++) {
+        if (mod_strncmp(p, needle, needle_len) == 0) {
+            return (char*)p;
+        }
+    }
+    return NULL;
+}
+
+void mod_itoa(int value, char *str) {
+    if (!str) return;
+    
+    int i = 0;
+    int is_negative = 0;
+    
+    if (value == 0) {
+        str[0] = '0';
+        str[1] = '\0';
+        return;
+    }
+    
+    if (value < 0) {
+        is_negative = 1;
+        value = -value;
+    }
+    
+    while (value > 0) {
+        str[i++] = (value % 10) + '0';
+        value /= 10;
+    }
+    
+    if (is_negative) {
+        str[i++] = '-';
+    }
+    
+    str[i] = '\0';
+    
+    // Reverse the string
+    int start = 0;
+    int end = i - 1;
+    while (start < end) {
+        char temp = str[start];
+        str[start] = str[end];
+        str[end] = temp;
+        start++;
+        end--;
+    }
+}
+
+void mod_ftoa(float value, char *str, int precision) {
+    if (!str) return;
+    
+    int i = 0;
+    
+    if (value < 0) {
+        str[i++] = '-';
+        value = -value;
+    }
+    
+    int int_part = (int)value;
+    float frac_part = value - int_part;
+    
+    // Convert integer part
+    char int_str[32];
+    mod_itoa(int_part, int_str);
+    
+    int int_len = mod_strlen(int_str);
+    for (int j = 0; j < int_len; j++) {
+        str[i++] = int_str[j];
+    }
+    
+    if (precision > 0) {
+        str[i++] = '.';
+        
+        // Convert fractional part
+        for (int p = 0; p < precision; p++) {
+            frac_part *= 10;
+            int digit = (int)frac_part;
+            str[i++] = digit + '0';
+            frac_part -= digit;
+        }
+    }
+    
+    str[i] = '\0';
+}
+
+int mod_ptr_valid(void *ptr) {
+    if (!ptr || da_number < 0 || !da_base) return 0;
+    char *p = (char*)ptr;
+    return (p >= da_base && p < da_base + da_size);
 }

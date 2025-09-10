@@ -240,6 +240,30 @@ static int emit_opcode(bytecode_buffer_t *buf, opcode_t op)
     return 0;
 }
 
+/* Emit a 4-byte float immediate into the code stream */
+static int emit_float(bytecode_buffer_t *buf, float value)
+{
+    if (buf->size + 4 > buf->capacity) {
+        int newcap = buf->capacity ? buf->capacity * 2 : 1024;
+        while (buf->size + 4 > newcap) newcap *= 2;
+        void *nc = mod_realloc(buf->code, (size_t)newcap);
+        if (!nc) {
+            if (g_current_tok) return report_error(g_current_tok, "Bytecode buffer overflow emitting float (size=%d, cap=%d)", buf->size, buf->capacity);
+            return -1;
+        }
+        buf->code = (unsigned char*)nc;
+        buf->capacity = newcap;
+    }
+    /* Bitwise copy to preserve IEEE754 representation */
+    unsigned char bytes[4];
+    mod_memcpy(bytes, &value, 4);
+    buf->code[buf->size++] = bytes[0];
+    buf->code[buf->size++] = bytes[1];
+    buf->code[buf->size++] = bytes[2];
+    buf->code[buf->size++] = bytes[3];
+    return 0;
+}
+
 static int emit_int(bytecode_buffer_t *buf, int value)
 {
     if (buf->size + 4 > buf->capacity) {
@@ -333,14 +357,911 @@ static int parse_integer(simple_tokenizer_t *tok) {
     return 0;
 }
 
-/* Parse a simple arithmetic expression (left to right evaluation) */
+/* Peek whether a numeric literal at current pos is a float (has a decimal point with digits) */
+static int peek_is_float_literal(simple_tokenizer_t *tok)
+{
+    int p = tok->pos;
+    int seen_digit = 0;
+    while (p < tok->length && tok->source[p] >= '0' && tok->source[p] <= '9') { seen_digit = 1; p++; }
+    if (p < tok->length && tok->source[p] == '.' ) {
+        int q = p + 1;
+        int seen_frac = 0;
+        while (q < tok->length && tok->source[q] >= '0' && tok->source[q] <= '9') { seen_frac = 1; q++; }
+        if (seen_digit && seen_frac) return 1;
+    }
+    return 0;
+}
+
+/* Parse a float literal (digits '.' digits) */
+static float parse_float_literal(simple_tokenizer_t *tok)
+{
+    int start = tok->pos;
+    while (tok->pos < tok->length && tok->source[tok->pos] >= '0' && tok->source[tok->pos] <= '9') tok->pos++;
+    if (tok->pos < tok->length && tok->source[tok->pos] == '.') tok->pos++;
+    while (tok->pos < tok->length && tok->source[tok->pos] >= '0' && tok->source[tok->pos] <= '9') tok->pos++;
+    int len = tok->pos - start;
+    if (len <= 0 || len >= 64) {
+        // Fallback
+        return 0.0f;
+    }
+    char buf[64];
+    mod_strncpy(buf, tok->source + start, len);
+    buf[len] = '\0';
+    /* Use C library atof; Norcroft provides it via stdlib */
+    float v = (float)atof(buf);
+    return v;
+}
+
+/* Forward declarations for recursive descent parser */
+static int parse_expression(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
+static int parse_logical_or(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
+static int parse_logical_and(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
+static int parse_equality(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
+static int parse_comparison(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
+static int parse_term(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
+static int parse_factor(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
+static int parse_unary(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
+static int parse_primary(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
+static int parse_function_call(simple_tokenizer_t *tok, bytecode_buffer_t *buf, const char *func_name);
+static int parse_lambda_expression(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
+
+/* Parse expression with proper precedence: logical_or */
 static int parse_expression(simple_tokenizer_t *tok, bytecode_buffer_t *buf) {
+    return parse_logical_or(tok, buf);
+}
+
+/* Parse logical OR expressions */
+static int parse_logical_or(simple_tokenizer_t *tok, bytecode_buffer_t *buf) {
+    if (parse_logical_and(tok, buf) < 0) return -1;
+    
+    while (tok->pos + 1 < tok->length && 
+           tok->source[tok->pos] == '|' && tok->source[tok->pos + 1] == '|') {
+        tok->pos += 2;
+        skip_whitespace(tok);
+        if (parse_logical_and(tok, buf) < 0) return -1;
+        if (emit_opcode(buf, OP_OR) < 0) return -1;
+    }
+    return 0;
+}
+
+/* Parse logical AND expressions */
+static int parse_logical_and(simple_tokenizer_t *tok, bytecode_buffer_t *buf) {
+    if (parse_equality(tok, buf) < 0) return -1;
+    
+    while (tok->pos + 1 < tok->length && 
+           tok->source[tok->pos] == '&' && tok->source[tok->pos + 1] == '&') {
+        tok->pos += 2;
+        skip_whitespace(tok);
+        if (parse_equality(tok, buf) < 0) return -1;
+        if (emit_opcode(buf, OP_AND) < 0) return -1;
+    }
+    return 0;
+}
+
+/* Parse equality expressions (== !=) */
+static int parse_equality(simple_tokenizer_t *tok, bytecode_buffer_t *buf) {
+    if (parse_comparison(tok, buf) < 0) return -1;
+    
+    while (tok->pos + 1 < tok->length) {
+        char op1 = tok->source[tok->pos];
+        char op2 = tok->source[tok->pos + 1];
+        
+        if ((op1 == '=' && op2 == '=') || (op1 == '!' && op2 == '=')) {
+            tok->pos += 2;
+            skip_whitespace(tok);
+            if (parse_comparison(tok, buf) < 0) return -1;
+            
+            if (op1 == '=' && op2 == '=') {
+                if (emit_opcode(buf, OP_CMP_EQ) < 0) return -1;
+            } else {
+                if (emit_opcode(buf, OP_CMP_NE) < 0) return -1;
+            }
+        } else {
+            break;
+        }
+    }
+    return 0;
+}
+
+/* Parse comparison expressions (< <= > >=) */
+static int parse_comparison(simple_tokenizer_t *tok, bytecode_buffer_t *buf) {
+    if (parse_term(tok, buf) < 0) return -1;
+    
+    while (tok->pos < tok->length) {
+        skip_whitespace(tok);
+        if (tok->pos >= tok->length) break;
+        
+        char op = tok->source[tok->pos];
+        char next_op = (tok->pos + 1 < tok->length) ? tok->source[tok->pos + 1] : 0;
+        
+        if (op == '<' && next_op == '=') {
+            tok->pos += 2;
+            skip_whitespace(tok);
+            if (parse_term(tok, buf) < 0) return -1;
+            if (emit_opcode(buf, OP_CMP_LE) < 0) return -1;
+        } else if (op == '>' && next_op == '=') {
+            tok->pos += 2;
+            skip_whitespace(tok);
+            if (parse_term(tok, buf) < 0) return -1;
+            if (emit_opcode(buf, OP_CMP_GE) < 0) return -1;
+        } else if (op == '<') {
+            tok->pos += 1;
+            skip_whitespace(tok);
+            if (parse_term(tok, buf) < 0) return -1;
+            if (emit_opcode(buf, OP_CMP_LT) < 0) return -1;
+        } else if (op == '>') {
+            tok->pos += 1;
+            skip_whitespace(tok);
+            if (parse_term(tok, buf) < 0) return -1;
+            if (emit_opcode(buf, OP_CMP_GT) < 0) return -1;
+        } else {
+            break;
+        }
+    }
+    return 0;
+}
+
+/* Parse term expressions (+ -) */
+static int parse_term(simple_tokenizer_t *tok, bytecode_buffer_t *buf) {
+    if (parse_factor(tok, buf) < 0) return -1;
+    
+    while (tok->pos < tok->length) {
+        skip_whitespace(tok);
+        if (tok->pos >= tok->length) break;
+        
+        char op = tok->source[tok->pos];
+        if (op == '+' || op == '-') {
+            tok->pos++;
+            skip_whitespace(tok);
+            if (parse_factor(tok, buf) < 0) return -1;
+            
+            if (op == '+') {
+                if (emit_opcode(buf, OP_ADD) < 0) return -1;
+            } else {
+                if (emit_opcode(buf, OP_SUB) < 0) return -1;
+            }
+        } else {
+            break;
+        }
+    }
+    return 0;
+}
+
+/* Parse factor expressions (* /) */
+static int parse_factor(simple_tokenizer_t *tok, bytecode_buffer_t *buf) {
+    if (parse_unary(tok, buf) < 0) return -1;
+    
+    while (tok->pos < tok->length) {
+        skip_whitespace(tok);
+        if (tok->pos >= tok->length) break;
+        
+        char op = tok->source[tok->pos];
+        if (op == '*' || op == '/') {
+            tok->pos++;
+            skip_whitespace(tok);
+            if (parse_unary(tok, buf) < 0) return -1;
+            
+            if (op == '*') {
+                if (emit_opcode(buf, OP_MUL) < 0) return -1;
+            } else {
+                if (emit_opcode(buf, OP_DIV) < 0) return -1;
+            }
+        } else {
+            break;
+        }
+    }
+    return 0;
+}
+
+/* Parse unary expressions (! - +) */
+static int parse_unary(simple_tokenizer_t *tok, bytecode_buffer_t *buf) {
+    skip_whitespace(tok);
+    if (tok->pos >= tok->length) return report_error(tok, "Unexpected end of input in unary expression");
+    
+    char op = tok->source[tok->pos];
+    if (op == '!' || op == '-' || op == '+') {
+        tok->pos++;
+        skip_whitespace(tok);
+        if (parse_unary(tok, buf) < 0) return -1;
+        
+        if (op == '!') {
+            if (emit_opcode(buf, OP_NOT) < 0) return -1;
+        } else if (op == '-') {
+            if (emit_opcode(buf, OP_NEGATE) < 0) return -1;
+        }
+        // Unary + is a no-op
+        return 0;
+    }
+    
+    return parse_primary(tok, buf);
+}
+
+/* Parse primary expressions (literals, variables, function calls, parentheses) */
+static int parse_primary(simple_tokenizer_t *tok, bytecode_buffer_t *buf) {
+    skip_whitespace(tok);
+    if (tok->pos >= tok->length) return report_error(tok, "Unexpected end of input in primary expression");
+    
+    char c = tok->source[tok->pos];
+    
+    // Parenthesized expression
+    if (c == '(') {
+        tok->pos++;
+        skip_whitespace(tok);
+        if (parse_expression(tok, buf) < 0) return -1;
+        skip_whitespace(tok);
+        if (tok->pos >= tok->length || tok->source[tok->pos] != ')') {
+            return report_error(tok, "Expected ')' after expression");
+        }
+        tok->pos++;
+        return 0;
+    }
+    
+    // String literal
+    if (c == '"') {
+        tok->pos++;
+        int start = tok->pos;
+        while (tok->pos < tok->length && tok->source[tok->pos] != '"') {
+            if (tok->source[tok->pos] == '\\' && tok->pos + 1 < tok->length) {
+                tok->pos += 2; // Skip escaped character
+            } else {
+                tok->pos++;
+            }
+        }
+        if (tok->pos >= tok->length) {
+            return report_error(tok, "Unterminated string literal");
+        }
+        
+        int str_len = tok->pos - start;
+        char *str = (char*)mod_malloc(str_len + 1);
+        if (!str) return report_error(tok, "Memory allocation failed for string literal");
+        
+        mod_strncpy(str, tok->source + start, str_len);
+        str[str_len] = '\0';
+        tok->pos++; // Skip closing quote
+        
+        if (emit_opcode(buf, OP_LOAD_STRING) < 0 || emit_string_ref(buf, str) < 0) {
+            mod_free(str);
+            return report_error(tok, "Failed to emit string literal");
+        }
+        mod_free(str);
+        return 0;
+    }
+    
+    // Numeric literal
+    if (is_digit(c)) {
+        if (peek_is_float_literal(tok)) {
+            float f = parse_float_literal(tok);
+            if (emit_opcode(buf, OP_LOAD_FLOAT) < 0 || emit_float(buf, f) < 0) {
+                return report_error(tok, "Failed to emit float literal");
+            }
+        } else {
+            int value = parse_integer(tok);
+            if (emit_opcode(buf, OP_LOAD_INT) < 0 || emit_int(buf, value) < 0) {
+                return report_error(tok, "Failed to emit integer literal");
+            }
+        }
+        return 0;
+    }
+    
+    // Identifier (variable or function call)
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_') {
+        char var_name[64];
+        int len = parse_identifier(tok, var_name, sizeof(var_name));
+        if (len <= 0) {
+            return report_error(tok, "Invalid identifier");
+        }
+        
+        skip_whitespace(tok);
+        
+        // Lambda expression
+        if (mod_strcmp(var_name, "lambda") == 0) {
+            return parse_lambda_expression(tok, buf);
+        }
+        
+        // Check for function call
+        if (tok->pos < tok->length && tok->source[tok->pos] == '(') {
+            return parse_function_call(tok, buf, var_name);
+        }
+        
+        // Regular variable
+        if (emit_opcode(buf, OP_LOAD_VAR) < 0 || emit_string_ref(buf, var_name) < 0) {
+            return report_error(tok, "Failed to emit variable load for '%s'", var_name);
+        }
+        return 0;
+    }
+    
+    return report_error(tok, "Unexpected character '%c' in expression", c);
+}
+
+/* Parse function call with arguments */
+static int parse_function_call(simple_tokenizer_t *tok, bytecode_buffer_t *buf, const char *func_name) {
+    if (tok->pos >= tok->length || tok->source[tok->pos] != '(') {
+        return report_error(tok, "Expected '(' for function call");
+    }
+    
+    tok->pos++; // consume '('
+    skip_whitespace(tok);
+    
+    int arg_count = 0;
+    
+    // Parse arguments
+    if (tok->pos < tok->length && tok->source[tok->pos] != ')') {
+        do {
+            if (parse_expression(tok, buf) < 0) return -1;
+            arg_count++;
+            
+            skip_whitespace(tok);
+            if (tok->pos < tok->length && tok->source[tok->pos] == ',') {
+                tok->pos++;
+                skip_whitespace(tok);
+            } else {
+                break;
+            }
+        } while (tok->pos < tok->length && tok->source[tok->pos] != ')');
+    }
+    
+    if (tok->pos >= tok->length || tok->source[tok->pos] != ')') {
+        return report_error(tok, "Expected ')' to close function call");
+    }
+    tok->pos++; // consume ')'
+    
+    // Check if it's a user-defined function
+    int fi = find_function_index(func_name);
+    if (fi >= 0) {
+        // User-defined function
+        if (emit_opcode(buf, OP_CALL_USER) < 0) return -1;
+        
+        int addr = 0;
+        int addr_pos = buf->size;
+        if (comp_function_table[fi].start_addr >= 0) {
+            addr = comp_function_table[fi].start_addr;
+        }
+        
+        if (emit_int(buf, addr) < 0 || emit_int(buf, arg_count) < 0) return -1;
+        
+        if (addr == 0) {
+            // Add to pending calls for later patching
+            if (comp_pending_call_count < COMP_MAX_PENDING_CALLS) {
+                comp_pending_calls[comp_pending_call_count].code_pos = addr_pos;
+                comp_pending_calls[comp_pending_call_count].func_index = fi;
+                comp_pending_call_count++;
+            } else {
+                return report_error(tok, "Too many pending function calls");
+            }
+        }
+    } else {
+        // Built-in function
+        if (emit_opcode(buf, OP_CALL_BUILTIN) < 0 || 
+            emit_string_ref(buf, func_name) < 0 || 
+            emit_int(buf, arg_count) < 0) {
+            return report_error(tok, "Failed to emit built-in function call");
+        }
+    }
+    
+    return 0;
+}
+
+/* Parse lambda expression: lambda(params) => body */
+static int parse_lambda_expression(simple_tokenizer_t *tok, bytecode_buffer_t *buf) {
+    if (tok->pos >= tok->length || tok->source[tok->pos] != '(') {
+        return report_error(tok, "Expected '(' after lambda");
+    }
+    
+    tok->pos++; // consume '('
+    skip_whitespace(tok);
+    
+    // Skip parameters for now (simplified implementation)
+    int paren_depth = 1;
+    while (tok->pos < tok->length && paren_depth > 0) {
+        char c = tok->source[tok->pos++];
+        if (c == '(') paren_depth++;
+        else if (c == ')') paren_depth--;
+    }
+    
+    skip_whitespace(tok);
+    if (tok->pos + 1 >= tok->length || 
+        tok->source[tok->pos] != '=' || tok->source[tok->pos + 1] != '>') {
+        return report_error(tok, "Expected '=>' after lambda parameters");
+    }
+    
+    tok->pos += 2; // consume '=>'
+    skip_whitespace(tok);
+    
+    // For now, emit a placeholder lambda object
+    if (emit_opcode(buf, OP_LAMBDA_CREATE) < 0 || emit_int(buf, 0) < 0) {
+        return report_error(tok, "Failed to emit lambda creation");
+    }
+    
+    // Skip lambda body (simplified for now)
+    while (tok->pos < tok->length) {
+        char c = tok->source[tok->pos];
+        if (c == '\n' || c == ',' || c == ')' || c == '}' || c == ';') break;
+        tok->pos++;
+    }
+    
+    return 0;
+}
+
+/* Forward declarations for statement parsing */
+static int parse_statement(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
+static int parse_assignment(simple_tokenizer_t *tok, bytecode_buffer_t *buf, const char *var_name);
+static int parse_function_definition(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
+static int parse_if_statement(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
+static int parse_while_statement(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
+static int parse_for_statement(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
+static int parse_switch_statement(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
+static int parse_return_statement(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
+static int parse_break_continue(simple_tokenizer_t *tok, bytecode_buffer_t *buf, const char *keyword);
+
+/* Helper to match exact keyword */
+static int match_keyword(simple_tokenizer_t *tok, const char *keyword) {
+    int len = mod_strlen(keyword);
+    if (tok->pos + len <= tok->length && 
+        mod_strncmp(tok->source + tok->pos, keyword, len) == 0) {
+        // Check that next character is not alphanumeric (proper word boundary)
+        if (tok->pos + len < tok->length && is_identifier_char(tok->source[tok->pos + len])) {
+            return 0;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+/* Parse a block of statements enclosed in braces */
+static int parse_block(simple_tokenizer_t *tok, bytecode_buffer_t *buf) {
+    if (tok->pos >= tok->length || tok->source[tok->pos] != '{') {
+        return report_error(tok, "Expected '{' to start block");
+    }
+    
+    tok->pos++; // consume '{'
+    skip_whitespace(tok);
+    
+    while (tok->pos < tok->length && tok->source[tok->pos] != '}') {
+        if (parse_statement(tok, buf) < 0) return -1;
+        skip_whitespace(tok);
+    }
+    
+    if (tok->pos >= tok->length || tok->source[tok->pos] != '}') {
+        return report_error(tok, "Expected '}' to end block");
+    }
+    
+    tok->pos++; // consume '}'
+    return 0;
+}
+
+/* Parse a single statement */
+static int parse_statement(simple_tokenizer_t *tok, bytecode_buffer_t *buf) {
+    skip_whitespace(tok);
+    if (tok->pos >= tok->length) return 0;
+    
+    // Check for keywords
+    if (match_keyword(tok, "if")) {
+        return parse_if_statement(tok, buf);
+    } else if (match_keyword(tok, "while")) {
+        return parse_while_statement(tok, buf);
+    } else if (match_keyword(tok, "for")) {
+        return parse_for_statement(tok, buf);
+    } else if (match_keyword(tok, "switch")) {
+        return parse_switch_statement(tok, buf);
+    } else if (match_keyword(tok, "function")) {
+        return parse_function_definition(tok, buf);
+    } else if (match_keyword(tok, "return")) {
+        return parse_return_statement(tok, buf);
+    } else if (match_keyword(tok, "break")) {
+        return parse_break_continue(tok, buf, "break");
+    } else if (match_keyword(tok, "continue")) {
+        return parse_break_continue(tok, buf, "continue");
+    } else if (tok->source[tok->pos] == '{') {
+        return parse_block(tok, buf);
+    } else {
+        // Check for assignment or expression statement
+        char var_name[64];
+        int start_pos = tok->pos;
+        int len = parse_identifier(tok, var_name, sizeof(var_name));
+        
+        if (len > 0) {
+            skip_whitespace(tok);
+            if (tok->pos < tok->length && tok->source[tok->pos] == '=') {
+                return parse_assignment(tok, buf, var_name);
+            }
+        }
+        
+        // Reset and parse as expression statement
+        tok->pos = start_pos;
+        if (parse_expression(tok, buf) < 0) return -1;
+        
+        // Emit POP to discard expression result
+        if (emit_opcode(buf, OP_POP) < 0) return -1;
+        
+        // Expect semicolon or newline
+        skip_whitespace(tok);
+        if (tok->pos < tok->length && tok->source[tok->pos] == ';') {
+            tok->pos++;
+        }
+        
+        return 0;
+    }
+}
+
+/* Parse assignment statement */
+static int parse_assignment(simple_tokenizer_t *tok, bytecode_buffer_t *buf, const char *var_name) {
+    // var_name is already parsed, tok is positioned at '='
+    tok->pos++; // consume '='
+    skip_whitespace(tok);
+    
+    if (parse_expression(tok, buf) < 0) return -1;
+    
+    if (emit_opcode(buf, OP_STORE_VAR) < 0 || emit_string_ref(buf, var_name) < 0) {
+        return report_error(tok, "Failed to emit variable assignment for '%s'", var_name);
+    }
+    
+    // Expect semicolon or newline
+    skip_whitespace(tok);
+    if (tok->pos < tok->length && tok->source[tok->pos] == ';') {
+        tok->pos++;
+    }
+    
+    return 0;
+}
+
+/* Parse function definition */
+static int parse_function_definition(simple_tokenizer_t *tok, bytecode_buffer_t *buf) {
+    tok->pos += 8; // consume "function"
+    skip_whitespace(tok);
+    
+    // Parse function name
+    char func_name[64];
+    int len = parse_identifier(tok, func_name, sizeof(func_name));
+    if (len <= 0) {
+        return report_error(tok, "Expected function name after 'function'");
+    }
+    
+    skip_whitespace(tok);
+    if (tok->pos >= tok->length || tok->source[tok->pos] != '(') {
+        return report_error(tok, "Expected '(' after function name");
+    }
+    
+    // Add to function table
+    int func_index = find_function_index(func_name);
+    if (func_index < 0) {
+        func_index = add_function(func_name);
+        if (func_index < 0) {
+            return report_error(tok, "Too many functions defined");
+        }
+    }
+    
+    // Record function start address
+    comp_function_table[func_index].start_addr = buf->size;
+    
+    tok->pos++; // consume '('
+    skip_whitespace(tok);
+    
+    // Parse parameters
+    int param_count = 0;
+    while (tok->pos < tok->length && tok->source[tok->pos] != ')') {
+        char param_name[64];
+        int plen = parse_identifier(tok, param_name, sizeof(param_name));
+        if (plen <= 0) {
+            return report_error(tok, "Expected parameter name");
+        }
+        
+        if (param_count < COMP_MAX_PARAMS) {
+            mod_strncpy(comp_function_table[func_index].params[param_count], 
+                       param_name, sizeof(comp_function_table[func_index].params[param_count]) - 1);
+            comp_function_table[func_index].params[param_count][sizeof(comp_function_table[func_index].params[param_count]) - 1] = '\0';
+        }
+        param_count++;
+        
+        skip_whitespace(tok);
+        if (tok->pos < tok->length && tok->source[tok->pos] == ',') {
+            tok->pos++;
+            skip_whitespace(tok);
+        } else if (tok->pos < tok->length && tok->source[tok->pos] == ')') {
+            break;
+        } else {
+            return report_error(tok, "Expected ',' or ')' in parameter list");
+        }
+    }
+    
+    if (tok->pos >= tok->length || tok->source[tok->pos] != ')') {
+        return report_error(tok, "Expected ')' after parameter list");
+    }
+    tok->pos++; // consume ')'
+    
+    comp_function_table[func_index].param_count = param_count;
+    
+    skip_whitespace(tok);
+    
+    // Parse function body
+    if (parse_block(tok, buf) < 0) return -1;
+    
+    // Emit implicit return
+    if (emit_opcode(buf, OP_LOAD_INT) < 0 || emit_int(buf, 0) < 0 || 
+        emit_opcode(buf, OP_RETURN) < 0) {
+        return report_error(tok, "Failed to emit implicit return");
+    }
+    
+    // Record function end address
+    comp_function_table[func_index].end_addr = buf->size;
+    
+    return 0;
+}
+
+/* Parse if statement */
+static int parse_if_statement(simple_tokenizer_t *tok, bytecode_buffer_t *buf) {
+    tok->pos += 2; // consume "if"
+    skip_whitespace(tok);
+    
+    if (tok->pos >= tok->length || tok->source[tok->pos] != '(') {
+        return report_error(tok, "Expected '(' after 'if'");
+    }
+    tok->pos++; // consume '('
+    skip_whitespace(tok);
+    
+    // Parse condition
+    if (parse_expression(tok, buf) < 0) return -1;
+    
+    skip_whitespace(tok);
+    if (tok->pos >= tok->length || tok->source[tok->pos] != ')') {
+        return report_error(tok, "Expected ')' after if condition");
+    }
+    tok->pos++; // consume ')'
+    
+    // Emit conditional jump
+    if (emit_opcode(buf, OP_JUMP_IF_FALSE) < 0) return -1;
+    int else_addr_pos = buf->size;
+    if (emit_int(buf, 0) < 0) return -1; // placeholder for else address
+    
+    skip_whitespace(tok);
+    
+    // Parse then block
+    if (parse_statement(tok, buf) < 0) return -1;
+    
+    // Check for else clause
+    skip_whitespace(tok);
+    if (match_keyword(tok, "else")) {
+        // Emit jump over else block
+        if (emit_opcode(buf, OP_JUMP) < 0) return -1;
+        int end_addr_pos = buf->size;
+        if (emit_int(buf, 0) < 0) return -1; // placeholder for end address
+        
+        // Patch else address
+        int else_addr = buf->size;
+        memcpy(buf->code + else_addr_pos, &else_addr, 4);
+        
+        tok->pos += 4; // consume "else"
+        skip_whitespace(tok);
+        
+        // Parse else block
+        if (parse_statement(tok, buf) < 0) return -1;
+        
+        // Patch end address
+        int end_addr = buf->size;
+        memcpy(buf->code + end_addr_pos, &end_addr, 4);
+    } else {
+        // No else clause, patch else address to end
+        int end_addr = buf->size;
+        memcpy(buf->code + else_addr_pos, &end_addr, 4);
+    }
+    
+    return 0;
+}
+
+/* Parse while statement */
+static int parse_while_statement(simple_tokenizer_t *tok, bytecode_buffer_t *buf) {
+    tok->pos += 5; // consume "while"
+    skip_whitespace(tok);
+    
+    if (tok->pos >= tok->length || tok->source[tok->pos] != '(') {
+        return report_error(tok, "Expected '(' after 'while'");
+    }
+    tok->pos++; // consume '('
+    
+    int loop_start = buf->size;
+    
+    skip_whitespace(tok);
+    
+    // Parse condition
+    if (parse_expression(tok, buf) < 0) return -1;
+    
+    skip_whitespace(tok);
+    if (tok->pos >= tok->length || tok->source[tok->pos] != ')') {
+        return report_error(tok, "Expected ')' after while condition");
+    }
+    tok->pos++; // consume ')'
+    
+    // Emit conditional jump to end
+    if (emit_opcode(buf, OP_JUMP_IF_FALSE) < 0) return -1;
+    int end_addr_pos = buf->size;
+    if (emit_int(buf, 0) < 0) return -1; // placeholder for end address
+    
+    skip_whitespace(tok);
+    
+    // Parse body
+    if (parse_statement(tok, buf) < 0) return -1;
+    
+    // Emit jump back to start
+    if (emit_opcode(buf, OP_JUMP) < 0 || emit_int(buf, loop_start) < 0) return -1;
+    
+    // Patch end address
+    int end_addr = buf->size;
+    memcpy(buf->code + end_addr_pos, &end_addr, 4);
+    
+    return 0;
+}
+
+/* Parse for statement (basic for loop) */
+static int parse_for_statement(simple_tokenizer_t *tok, bytecode_buffer_t *buf) {
+    tok->pos += 3; // consume "for"
+    skip_whitespace(tok);
+    
+    if (tok->pos >= tok->length || tok->source[tok->pos] != '(') {
+        return report_error(tok, "Expected '(' after 'for'");
+    }
+    tok->pos++; // consume '('
+    skip_whitespace(tok);
+    
+    // Parse initialization (simple assignment or declaration)
+    if (tok->pos < tok->length && tok->source[tok->pos] != ';') {
+        if (parse_statement(tok, buf) < 0) return -1;
+    }
+    
+    skip_whitespace(tok);
+    if (tok->pos >= tok->length || tok->source[tok->pos] != ';') {
+        return report_error(tok, "Expected ';' after for loop initialization");
+    }
+    tok->pos++; // consume ';'
+    
+    int condition_start = buf->size;
+    skip_whitespace(tok);
+    
+    // Parse condition
+    if (tok->pos < tok->length && tok->source[tok->pos] != ';') {
+        if (parse_expression(tok, buf) < 0) return -1;
+    } else {
+        // No condition means infinite loop, push true
+        if (emit_opcode(buf, OP_LOAD_INT) < 0 || emit_int(buf, 1) < 0) return -1;
+    }
+    
+    // Emit conditional jump to end
+    if (emit_opcode(buf, OP_JUMP_IF_FALSE) < 0) return -1;
+    int end_addr_pos = buf->size;
+    if (emit_int(buf, 0) < 0) return -1; // placeholder for end address
+    
+    skip_whitespace(tok);
+    if (tok->pos >= tok->length || tok->source[tok->pos] != ';') {
+        return report_error(tok, "Expected ';' after for loop condition");
+    }
+    tok->pos++; // consume ';'
+    
+    // Skip increment expression for now (simplified)
+    while (tok->pos < tok->length && tok->source[tok->pos] != ')') {
+        tok->pos++;
+    }
+    
+    if (tok->pos >= tok->length || tok->source[tok->pos] != ')') {
+        return report_error(tok, "Expected ')' after for loop");
+    }
+    tok->pos++; // consume ')'
+    
+    skip_whitespace(tok);
+    
+    // Parse body
+    if (parse_statement(tok, buf) < 0) return -1;
+    
+    // Emit jump back to condition
+    if (emit_opcode(buf, OP_JUMP) < 0 || emit_int(buf, condition_start) < 0) return -1;
+    
+    // Patch end address
+    int end_addr = buf->size;
+    memcpy(buf->code + end_addr_pos, &end_addr, 4);
+    
+    return 0;
+}
+
+/* Parse switch statement (simplified) */
+static int parse_switch_statement(simple_tokenizer_t *tok, bytecode_buffer_t *buf) {
+    tok->pos += 6; // consume "switch"
+    skip_whitespace(tok);
+    
+    if (tok->pos >= tok->length || tok->source[tok->pos] != '(') {
+        return report_error(tok, "Expected '(' after 'switch'");
+    }
+    tok->pos++; // consume '('
+    skip_whitespace(tok);
+    
+    // Parse switch expression
+    if (parse_expression(tok, buf) < 0) return -1;
+    
+    skip_whitespace(tok);
+    if (tok->pos >= tok->length || tok->source[tok->pos] != ')') {
+        return report_error(tok, "Expected ')' after switch expression");
+    }
+    tok->pos++; // consume ')'
+    
+    skip_whitespace(tok);
+    if (tok->pos >= tok->length || tok->source[tok->pos] != '{') {
+        return report_error(tok, "Expected '{' after switch");
+    }
+    tok->pos++; // consume '{'
+    
+    // For now, just parse the body as a block (simplified)
+    while (tok->pos < tok->length && tok->source[tok->pos] != '}') {
+        if (parse_statement(tok, buf) < 0) return -1;
+        skip_whitespace(tok);
+    }
+    
+    if (tok->pos >= tok->length || tok->source[tok->pos] != '}') {
+        return report_error(tok, "Expected '}' to end switch");
+    }
+    tok->pos++; // consume '}'
+    
+    // Pop the switch expression value
+    if (emit_opcode(buf, OP_POP) < 0) return -1;
+    
+    return 0;
+}
+
+/* Parse return statement */
+static int parse_return_statement(simple_tokenizer_t *tok, bytecode_buffer_t *buf) {
+    tok->pos += 6; // consume "return"
+    skip_whitespace(tok);
+    
+    // Check if there's a return value
+    if (tok->pos < tok->length && tok->source[tok->pos] != ';' && tok->source[tok->pos] != '\n') {
+        if (parse_expression(tok, buf) < 0) return -1;
+    } else {
+        // No return value, push 0
+        if (emit_opcode(buf, OP_LOAD_INT) < 0 || emit_int(buf, 0) < 0) return -1;
+    }
+    
+    if (emit_opcode(buf, OP_RETURN) < 0) return -1;
+    
+    // Expect semicolon or newline
+    skip_whitespace(tok);
+    if (tok->pos < tok->length && tok->source[tok->pos] == ';') {
+        tok->pos++;
+    }
+    
+    return 0;
+}
+
+/* Parse break/continue statements */
+static int parse_break_continue(simple_tokenizer_t *tok, bytecode_buffer_t *buf, const char *keyword) {
+    tok->pos += mod_strlen(keyword);
+    skip_whitespace(tok);
+    
+    // For now, just emit a placeholder (proper implementation would need loop context)
+    if (mod_strcmp(keyword, "break") == 0) {
+        if (emit_opcode(buf, OP_BREAK) < 0) return -1;
+    } else {
+        if (emit_opcode(buf, OP_CONTINUE) < 0) return -1;
+    }
+    
+    // Expect semicolon or newline
+    if (tok->pos < tok->length && tok->source[tok->pos] == ';') {
+        tok->pos++;
+    }
+    
+    return 0;
+}
+
+#if 0  /* Disabled - legacy function no longer used */
+/* Legacy function kept for compatibility */
+static int old_parse_expression(simple_tokenizer_t *tok, bytecode_buffer_t *buf) {
     // Parse first operand
     if (is_digit(tok->source[tok->pos])) {
-        // Integer literal
-        int value = parse_integer(tok);
-        if (emit_opcode(buf, OP_LOAD_INT) < 0 || emit_int(buf, value) < 0) {
-            return report_error(tok, "Failed to emit bytecode for integer literal %d", value);
+        // Numeric literal: float or int
+        if (peek_is_float_literal(tok)) {
+            float f = parse_float_literal(tok);
+            if (emit_opcode(buf, OP_LOAD_FLOAT) < 0 || emit_float(buf, f) < 0) {
+                return report_error(tok, "Failed to emit bytecode for float literal");
+            }
+        } else {
+            int value = parse_integer(tok);
+            if (emit_opcode(buf, OP_LOAD_INT) < 0 || emit_int(buf, value) < 0) {
+                return report_error(tok, "Failed to emit bytecode for integer literal %d", value);
+            }
         }
     } else {
         // Variable or function call
@@ -380,10 +1301,17 @@ static int parse_expression(simple_tokenizer_t *tok, bytecode_buffer_t *buf) {
             while (tok->pos < tok->length && tok->source[tok->pos] != ')') {
                 // Parse argument expression
                 if (is_digit(tok->source[tok->pos])) {
-                    // Integer literal argument
-                    int value = parse_integer(tok);
-                    if (emit_opcode(buf, OP_LOAD_INT) < 0 || emit_int(buf, value) < 0) {
-                        return report_error(tok, "Failed to emit bytecode for integer argument %d in function call", value);
+                    // Numeric literal argument
+                    if (peek_is_float_literal(tok)) {
+                        float f = parse_float_literal(tok);
+                        if (emit_opcode(buf, OP_LOAD_FLOAT) < 0 || emit_float(buf, f) < 0) {
+                            return report_error(tok, "Failed to emit bytecode for float argument in function call");
+                        }
+                    } else {
+                        int value = parse_integer(tok);
+                        if (emit_opcode(buf, OP_LOAD_INT) < 0 || emit_int(buf, value) < 0) {
+                            return report_error(tok, "Failed to emit bytecode for integer argument %d in function call", value);
+                        }
                     }
                 } else if (tok->source[tok->pos] == '"') {
                     // String literal argument
@@ -477,9 +1405,14 @@ static int parse_expression(simple_tokenizer_t *tok, bytecode_buffer_t *buf) {
                 
                 // Parse right operand
                 if (is_digit(tok->source[tok->pos])) {
-                    int value = parse_integer(tok);
-                    if (emit_opcode(buf, OP_LOAD_INT) < 0 || emit_int(buf, value) < 0) {
-                        return -1;
+                    if (peek_is_float_literal(tok)) {
+                        float f = parse_float_literal(tok);
+                        if (emit_opcode(buf, OP_LOAD_FLOAT) < 0 || emit_float(buf, f) < 0) { return -1; }
+                    } else {
+                        int value = parse_integer(tok);
+                        if (emit_opcode(buf, OP_LOAD_INT) < 0 || emit_int(buf, value) < 0) {
+                            return -1;
+                        }
                     }
                 } else {
                     char var_name[64];
@@ -498,9 +1431,14 @@ static int parse_expression(simple_tokenizer_t *tok, bytecode_buffer_t *buf) {
             int arg_count_inner = 0;
             while (tok->pos < tok->length && tok->source[tok->pos] != ')') {
                             if (is_digit(tok->source[tok->pos])) {
-                                int value = parse_integer(tok);
-                                if (emit_opcode(buf, OP_LOAD_INT) < 0 || emit_int(buf, value) < 0) {
-                                    return -1;
+                                if (peek_is_float_literal(tok)) {
+                                    float f = parse_float_literal(tok);
+                                    if (emit_opcode(buf, OP_LOAD_FLOAT) < 0 || emit_float(buf, f) < 0) { return -1; }
+                                } else {
+                                    int value = parse_integer(tok);
+                                    if (emit_opcode(buf, OP_LOAD_INT) < 0 || emit_int(buf, value) < 0) {
+                                        return -1;
+                                    }
                                 }
                 arg_count_inner++;
                             } else if (tok->source[tok->pos] == '"') {
@@ -564,10 +1502,15 @@ static int parse_expression(simple_tokenizer_t *tok, bytecode_buffer_t *buf) {
             
             // Parse right operand
             if (is_digit(tok->source[tok->pos])) {
-                // Integer literal
-                int value = parse_integer(tok);
-                if (emit_opcode(buf, OP_LOAD_INT) < 0 || emit_int(buf, value) < 0) {
-                    return -1;
+                // Numeric literal
+                if (peek_is_float_literal(tok)) {
+                    float f = parse_float_literal(tok);
+                    if (emit_opcode(buf, OP_LOAD_FLOAT) < 0 || emit_float(buf, f) < 0) { return -1; }
+                } else {
+                    int value = parse_integer(tok);
+                    if (emit_opcode(buf, OP_LOAD_INT) < 0 || emit_int(buf, value) < 0) {
+                        return -1;
+                    }
                 }
             } else {
                 // Variable or function call
@@ -585,9 +1528,14 @@ static int parse_expression(simple_tokenizer_t *tok, bytecode_buffer_t *buf) {
             int arg_counto = 0;
             while (tok->pos < tok->length && tok->source[tok->pos] != ')') {
                         if (is_digit(tok->source[tok->pos])) {
-                            int value = parse_integer(tok);
-                            if (emit_opcode(buf, OP_LOAD_INT) < 0 || emit_int(buf, value) < 0) {
-                                return -1;
+                            if (peek_is_float_literal(tok)) {
+                                float f = parse_float_literal(tok);
+                                if (emit_opcode(buf, OP_LOAD_FLOAT) < 0 || emit_float(buf, f) < 0) { return -1; }
+                            } else {
+                                int value = parse_integer(tok);
+                                if (emit_opcode(buf, OP_LOAD_INT) < 0 || emit_int(buf, value) < 0) {
+                                    return -1;
+                                }
                             }
                 arg_counto++;
                         } else if (tok->source[tok->pos] == '"') {
@@ -659,6 +1607,7 @@ static int parse_expression(simple_tokenizer_t *tok, bytecode_buffer_t *buf) {
     
     return 0;
 }
+#endif  /* Disabled legacy function */
 
 static int compile_to_bytecode(const char *source, bytecode_buffer_t *buf)
 {

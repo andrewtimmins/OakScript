@@ -1,0 +1,46 @@
+Processing: HostFS::HostFS.$.Projects.OakScript.Source.c.runtime
+Errors in : HostFS::HostFS.$.Projects.OakScript.Source.c.runtime
+  1499 S Misplaced 'else' ignored
+  1548 S Misplaced 'else' ignored
+  1569 S 'case' not in switch - ignored
+  1595 S 'case' not in switch - ignored
+  1650 S 'case' not in switch - ignored
+  1655 S 'case' not in switch - ignored
+  1660 S 'case' not in switch - ignored
+  1690 S 'case' not in switch - ignored
+  1706 S 'case' not in switch - ignored
+  1728 S 'case' not in switch - ignored
+  1750 S 'case' not in switch - ignored
+  1772 S 'case' not in switch - ignored
+  1835 S 'case' not in switch - ignored
+  1895 S 'case' not in switch - ignored
+  1919 S 'case' not in switch - ignored
+  1993 S 'case' not in switch - ignored
+  2045 S 'case' not in switch - ignored
+  2097 S 'case' not in switch - ignored
+  2143 S 'case' not in switch - ignored
+  2205 S 'case' not in switch - ignored
+  2246 S 'case' not in switch - ignored
+  2265 S 'case' not in switch - ignored
+  2287 S 'case' not in switch - ignored
+  2334 S 'case' not in switch - ignored
+  2358 S 'case' not in switch - ignored
+  2362 S 'case' not in switch - ignored
+  2375 S 'case' not in switch - ignored
+  2388 S 'case' not in switch - ignored
+  2400 S 'case' not in switch - ignored
+  2408 S 'default' not in switch - ignored
+  2411 S label 'cleanup' has not been set
+  2411 W implicit return in non-void function
+  2413 E declaration lacks type (assuming 'int'): 'cleanup'
+  2413 E expected ';' or ',' - inserted ';' before ':'
+  2413 S Expecting <declarator> or <type> but found ':'
+  2415 E function prototype formal 'code' needs type or class - 'int' assumed
+  2415 E type disagreement for 'mod_free'
+  2415 E declaration lacks type (assuming 'int'): 'mod_free'
+  2416 S Expecting <declarator> or <type> but found 'if'
+  2417 S Expecting <declarator> or <type> but found 'return'
+  2418 S Expecting <declarator> or <type> but found '}'
+  2419 E expected ';' or ',' - inserted ';' before <eof>
+  2419 W static 'cleanup_runtime_vars' declared but not used
+  2419 W static 'equals_value' declared but not used

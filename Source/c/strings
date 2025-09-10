@@ -53,7 +53,7 @@ void to_lower_inplace(char *s) {
 char* create_upper_string(const char *s) {
     if (!s) return NULL;
     
-    size_t len = strlen(s);
+    size_t len = mod_strlen(s);
     char *result = mod_malloc(len + 1);
     if (!result) return NULL;
     
@@ -67,7 +67,7 @@ char* create_upper_string(const char *s) {
 char* create_lower_string(const char *s) {
     if (!s) return NULL;
     
-    size_t len = strlen(s);
+    size_t len = mod_strlen(s);
     char *result = mod_malloc(len + 1);
     if (!result) return NULL;
     
@@ -110,14 +110,14 @@ char* create_trimmed_string(const char *s) {
 /* String utility functions */
 int string_starts_with(const char *str, const char *prefix) {
     if (!str || !prefix) return 0;
-    return strncmp(str, prefix, strlen(prefix)) == 0;
+    return mod_strncmp(str, prefix, mod_strlen(prefix)) == 0;
 }
 
 int string_ends_with(const char *str, const char *suffix) {
     if (!str || !suffix) return 0;
     
-    size_t str_len = strlen(str);
-    size_t suffix_len = strlen(suffix);
+    size_t str_len = mod_strlen(str);
+    size_t suffix_len = mod_strlen(suffix);
     
     if (suffix_len > str_len) return 0;
     
@@ -126,7 +126,7 @@ int string_ends_with(const char *str, const char *suffix) {
 
 int string_contains(const char *str, const char *substr) {
     if (!str || !substr) return 0;
-    return strstr(str, substr) != NULL;
+    return mod_strstr(str, substr) != NULL;
 }
 
 /* String parsing functions */
@@ -259,6 +259,7 @@ extern int run_script_from_source(const char* source, const char* filename);
 
 // External function to evaluate expressions in string context
 extern void* get_variable_value(const char* name, VarType* type);
+extern void* runtime_get_variable_value(const char* name, VarType* type);
 
 char* evaluate_interpolated_string(InterpolatedString* istr) {
     if (!istr) return NULL;
@@ -278,38 +279,51 @@ char* evaluate_interpolated_string(InterpolatedString* istr) {
     for (int i = 0; i < istr->expr_count; i++) {
         expr_results[i] = (char*)mod_malloc(64);
         
-        // Try to evaluate as a variable lookup
+        // Try to evaluate as a runtime variable lookup first
         VarType var_type;
-        void* var_value = get_variable_value(istr->expressions[i], &var_type);
+        void* var_value = runtime_get_variable_value(istr->expressions[i], &var_type);
+        
+        // If not found in runtime, fall back to interpreter variables
+        if (!var_value) {
+            var_value = get_variable_value(istr->expressions[i], &var_type);
+        }
         
         if (var_value) {
             switch (var_type) {
                 case VAR_INT:
-                    sprintf(expr_results[i], "%d", *(int*)var_value);
+                    mod_itoa(*(int*)var_value, expr_results[i]);
                     break;
                 case VAR_STRING:
-                    strcpy(expr_results[i], (char*)var_value);
+                    mod_strcpy(expr_results[i], (char*)var_value);
                     break;
                 case VAR_FLOAT:
-                    sprintf(expr_results[i], "%f", *(float*)var_value);
+                    mod_ftoa(*(float*)var_value, expr_results[i], 6);
                     break;
                 case VAR_BOOL:
-                    strcpy(expr_results[i], *(int*)var_value ? "true" : "false");
+                    mod_strcpy(expr_results[i], *(int*)var_value ? "true" : "false");
                     break;
                 default:
-                    sprintf(expr_results[i], "[%s:%s]", type_name(var_type), istr->expressions[i]);
+                    // Build string manually for unknown types
+                    mod_strcpy(expr_results[i], "[");
+                    mod_strcat(expr_results[i], type_name(var_type));
+                    mod_strcat(expr_results[i], ":");
+                    mod_strcat(expr_results[i], istr->expressions[i]);
+                    mod_strcat(expr_results[i], "]");
                     break;
             }
         } else {
             // If variable not found, try to parse as literal
             if (mod_strcmp(istr->expressions[i], "name") == 0 || 
                 mod_strcmp(istr->expressions[i], "user_name") == 0) {
-                strcpy(expr_results[i], "World");
+                mod_strcpy(expr_results[i], "World");
             } else if (mod_strcmp(istr->expressions[i], "age") == 0 || 
                       mod_strcmp(istr->expressions[i], "user_age") == 0) {
-                strcpy(expr_results[i], "25");
+                mod_strcpy(expr_results[i], "25");
             } else {
-                sprintf(expr_results[i], "${%s}", istr->expressions[i]);
+                // Build string manually
+                mod_strcpy(expr_results[i], "${");
+                mod_strcat(expr_results[i], istr->expressions[i]);
+                mod_strcat(expr_results[i], "}");
             }
         }
         
@@ -327,12 +341,12 @@ char* evaluate_interpolated_string(InterpolatedString* istr) {
         if (i % 2 == 0 && part_idx < istr->part_count) {
             // String part
             if (istr->parts[part_idx]) {
-                strcat(result, istr->parts[part_idx]);
+                mod_strcat(result, istr->parts[part_idx]);
             }
             part_idx++;
         } else if (expr_idx < istr->expr_count) {
             // Expression result
-            strcat(result, expr_results[expr_idx]);
+            mod_strcat(result, expr_results[expr_idx]);
             expr_idx++;
         }
     }
@@ -509,7 +523,7 @@ char** regex_find_all(RegexPattern* regex, const char* text, int* count) {
     int pattern_len = mod_strlen(regex->pattern);
     
     // Count matches
-    while ((pos = strstr(pos, regex->pattern)) != NULL) {
+    while ((pos = mod_strstr(pos, regex->pattern)) != NULL) {
         matches++;
         pos += pattern_len;
     }
@@ -528,7 +542,7 @@ char** regex_find_all(RegexPattern* regex, const char* text, int* count) {
     // Collect matches
     pos = text;
     int i = 0;
-    while ((pos = strstr(pos, regex->pattern)) != NULL && i < matches) {
+    while ((pos = mod_strstr(pos, regex->pattern)) != NULL && i < matches) {
         results[i] = (char*)mod_malloc(pattern_len + 1);
         mod_strncpy(results[i], pos, pattern_len);
         results[i][pattern_len] = '\0';
@@ -551,7 +565,7 @@ char* regex_replace(RegexPattern* regex, const char* text, const char* replaceme
     // Count occurrences
     int count = 0;
     const char* pos = text;
-    while ((pos = strstr(pos, pattern)) != NULL) {
+    while ((pos = mod_strstr(pos, pattern)) != NULL) {
         count++;
         pos += pattern_len;
     }
@@ -569,14 +583,14 @@ char* regex_replace(RegexPattern* regex, const char* text, const char* replaceme
     const char* src = text;
     char* dst = result;
     
-    while ((pos = strstr(src, pattern)) != NULL) {
+    while ((pos = mod_strstr(src, pattern)) != NULL) {
         // Copy text before match
         int len = pos - src;
         mod_strncpy(dst, src, len);
         dst += len;
         
         // Copy replacement
-        strcpy(dst, replacement);
+        mod_strcpy(dst, replacement);
         dst += replacement_len;
         
         // Move past the match
@@ -584,7 +598,7 @@ char* regex_replace(RegexPattern* regex, const char* text, const char* replaceme
     }
     
     // Copy remaining text
-    strcpy(dst, src);
+    mod_strcpy(dst, src);
     
     return result;
 }
@@ -724,4 +738,84 @@ int builtin_regex_replace(void) {
     if (text) mod_free(text);
     if (replacement) mod_free(replacement);
     return 1; // Mock success
+}
+
+// =============================================================================
+// MULTILINE STRING IMPLEMENTATION
+// =============================================================================
+
+MultilineString* multiline_create(const char* raw_string) {
+    if (!raw_string) return NULL;
+    
+    MultilineString* mstr = (MultilineString*)mod_malloc(sizeof(MultilineString));
+    if (!mstr) return NULL;
+    
+    // Count lines first
+    int line_count = 1;
+    for (int i = 0; raw_string[i] != '\0'; i++) {
+        if (raw_string[i] == '\n') line_count++;
+    }
+    
+    // Allocate line array
+    mstr->lines = (char**)mod_malloc(sizeof(char*) * line_count);
+    if (!mstr->lines) {
+        mod_free(mstr);
+        return NULL;
+    }
+    
+    mstr->line_count = 0;
+    mstr->total_length = 0;
+    
+    // Split into lines
+    int start = 0;
+    int len = mod_strlen(raw_string);
+    
+    for (int i = 0; i <= len; i++) {
+        if (raw_string[i] == '\n' || raw_string[i] == '\0') {
+            int line_len = i - start;
+            mstr->lines[mstr->line_count] = (char*)mod_malloc(line_len + 1);
+            if (mstr->lines[mstr->line_count]) {
+                mod_strncpy(mstr->lines[mstr->line_count], raw_string + start, line_len);
+                mstr->lines[mstr->line_count][line_len] = '\0';
+                mstr->total_length += line_len + 1; // +1 for newline
+                mstr->line_count++;
+            }
+            start = i + 1;
+        }
+    }
+    
+    return mstr;
+}
+
+char* multiline_to_string(MultilineString* mstr) {
+    if (!mstr || mstr->line_count == 0) return mod_strdup("");
+    
+    char* result = (char*)mod_malloc(mstr->total_length + 1);
+    if (!result) return NULL;
+    
+    result[0] = '\0';
+    
+    for (int i = 0; i < mstr->line_count; i++) {
+        mod_strcat(result, mstr->lines[i]);
+        if (i < mstr->line_count - 1) {
+            mod_strcat(result, "\n");
+        }
+    }
+    
+    return result;
+}
+
+void multiline_destroy(MultilineString* mstr) {
+    if (!mstr) return;
+    
+    if (mstr->lines) {
+        for (int i = 0; i < mstr->line_count; i++) {
+            if (mstr->lines[i]) {
+                mod_free(mstr->lines[i]);
+            }
+        }
+        mod_free(mstr->lines);
+    }
+    
+    mod_free(mstr);
 }
