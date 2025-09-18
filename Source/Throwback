@@ -1,4 +1,0 @@
-Processing: HostFS::HostFS.$.Projects.OakScript.Source.c.script
-Errors in : HostFS::HostFS.$.Projects.OakScript.Source.c.script
-   412 W lower precision in wider context: '-'
-  2039 E undeclared name, inventing 'extern int error()'
