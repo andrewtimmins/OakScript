@@ -1,6 +1,6 @@
 title-string: OakScript
-help-string: OakScript 0.04 (c) Andrew Timmins
-date-string: 21 Aug 2025
+help-string: OakScript 0.05 (c) Andrew Timmins
+date-string: 18 Sep 2025
 initialisation-code: module_init
 finalisation-code: module_final
 
@@ -8,12 +8,30 @@ command-keyword-table: module_command
     OakScript(min-args:0, max-args:1,
          invalid-syntax: "Syntax: *OakScript [<filename>]",
          help-text: "*OakScript runs an OakScript script file.\r"),
-    OakScriptCompile(min-args:2, max-args:2,
-         invalid-syntax: "Syntax: *OakScriptCompile <source> <output>",
-         help-text: "*OakScriptCompile compiles an OakScript into bytecode.\r"),
-    OakScriptRun(min-args:1, max-args:1,
-         invalid-syntax: "Syntax: *OakScriptRun <bytecode_file>",
-         help-text: "*OakScriptRun executes compiled OakScript bytecode.\r")
+    OakCompile(min-args:2, max-args:2,
+         invalid-syntax: "Syntax: *OakCompile <source> <output>",
+         help-text: "*OakCompile compiles an OakScript into bytecode.\r"),
+    OakRun(min-args:1, max-args:1,
+         invalid-syntax: "Syntax: *OakRun <bytecode_file>",
+         help-text: "*OakRun executes compiled OakScript bytecode.\r"),
+    OakDebugInfo(min-args:1, max-args:1,
+         invalid-syntax: "Syntax: *OakDebugInfo <bytecode_file>",
+         help-text: "*OakDebugInfo displays debug information for a bytecode file.\r"),
+    OakMapDump(min-args:1, max-args:1,
+         invalid-syntax: "Syntax: *OakMapDump <debug_map_file>",
+         help-text: "*OakMapDump displays the contents of a debug map file.\r"),
+    OakSymbols(min-args:1, max-args:1,
+         invalid-syntax: "Syntax: *OakSymbols <symbol_file>",
+         help-text: "*OakSymbols lists function symbols from a symbol file.\r"),
+    OakTrace(min-args:2, max-args:2,
+         invalid-syntax: "Syntax: *OakTrace <bytecode_file> <pc_address>",
+         help-text: "*OakTrace maps a program counter to source location.\r"),
+    OakDisasm(min-args:1, max-args:3,
+         invalid-syntax: "Syntax: *OakDisasm <bytecode_file> [<start>] [<end>]",
+         help-text: "*OakDisasm disassembles bytecode with source annotations.\r"),
+    OakValidate(min-args:1, max-args:1,
+         invalid-syntax: "Syntax: *OakValidate <bytecode_file>",
+         help-text: "*OakValidate checks debug file consistency.\r")
 
 generic-veneers: tick_entry/tick_handler,
                  callback_entry/callback_handler

@@ -4,7 +4,7 @@
 #include "h.engine"
 
 /* External variable storage */
-extern Variable variables[MAX_VARS];
+extern Variable *variables;
 extern int var_count;
 
 /* Variable management functions */

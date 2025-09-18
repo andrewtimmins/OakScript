@@ -366,11 +366,17 @@ Type System:
 DEBUGGING SUPPORT
 ----------------
 
-The compiler includes debugging features:
+The compiler includes comprehensive debugging features:
+
+Debug File Generation:
+- Debug map files (.dbg) with bytecode-to-source mappings
+- Symbol table files (.sym) with function definitions
+- Support for both v1 and v2 debug map formats
+- RISC OS filetype integration (&EEA for .dbg, &EEB for .sym)
 
 Verbose Output:
 - Optional compilation progress messages
-- Bytecode disassembly capability
+- Bytecode disassembly capability (*OakDisasm command)
 - String table dumping
 - Buffer size monitoring
 
@@ -378,12 +384,21 @@ Error Diagnostics:
 - Detailed error messages with context
 - Memory usage tracking
 - Compilation statistics
+- Source line number preservation
 
-Future Debug Features:
-- Source line number tracking
-- Symbol table export
-- Debug symbol generation
-- Profiling hooks
+Debug Command Suite:
+- *OakDebugInfo: Debug information overview
+- *OakMapDump: Debug map file inspection
+- *OakSymbols: Function symbol listing
+- *OakTrace: Program counter to source mapping
+- *OakDisasm: Bytecode disassembly with annotations
+- *OakValidate: Debug file consistency validation
+
+Advanced Features:
+- Source line number tracking (implemented)
+- Symbol table export (implemented)
+- Debug symbol generation (implemented)
+- Profiling hooks (framework ready)
 
 INTEGRATION WITH RISC OS
 ------------------------
@@ -397,7 +412,17 @@ Module Integration:
 - SWI usage for file operations
 
 Command Interface:
-    *OakScriptCompile input_file output_file
+    *OakScript [<filename>]           ; Execute script directly
+    *OakCompile <source> <output>     ; Compile to bytecode  
+    *OakRun <bytecode_file>           ; Execute compiled bytecode
+    
+Debug Commands:
+    *OakDebugInfo <bytecode_file>                    ; Debug overview
+    *OakMapDump <debug_map_file>                     ; Debug map contents
+    *OakSymbols <symbol_file>                        ; Function symbols
+    *OakTrace <bytecode_file> <pc_address>           ; PC to source mapping
+    *OakDisasm <bytecode_file> [<start>] [<end>]     ; Disassembly
+    *OakValidate <bytecode_file>                     ; File validation
 
 File Handling:
 - Automatic .eef file type setting

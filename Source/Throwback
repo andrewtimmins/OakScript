@@ -1,20 +1,4 @@
-cc -c -depend !Depend -I,C: -apcs 3/32bit -Wcdp -throwback -fan c.script -o o.core
-Norcroft RISC OS Arm C vsn 5.92 [22 Feb 2024]
-"c.script", line 411: Warning: lower precision in wider context: '-'
-c.script: 1 warning, 0 errors, 0 serious errors
-cc -c -depend !Depend -I,C: -apcs 3/32bit -Wcdp -throwback -fan c.engine -o o.engine
-Norcroft RISC OS Arm C vsn 5.92 [22 Feb 2024]
-cmhg -depend !Depend -throwback cmhg.header -o o.header -d h.header
-cc -c -depend !Depend -I,C: -apcs 3/32bit -Wcdp -throwback -fan c.module -o o.module
-Norcroft RISC OS Arm C vsn 5.92 [22 Feb 2024]
-link -rmf -o <OakScript$Dir>.OakScript o.module o.header o.engine o.core o.memory o.variables o.math o.swi o.debug o.compile o.runtime o.value o.advanced o.strings o.control_flow o.functional o.exceptions o.types o.bridge C:o.stubs
-ARM Linker: (Error) Undefined symbol(s).
-ARM Linker:     mod_strchr, referred to from o.runtime.
-ARM Linker:     mod_atoi, referred to from o.runtime.
-ARM Linker:     registry_add, referred to from o.bridge.
-ARM Linker: Errors in link, no output generated.
-ARM Linker: finished,  4 informational, 0 warning and 1 error messages.
-AMU: *** exit (1) ***
-
-AMU: *** 'all' not re-made because of errors ***
-
+Processing: HostFS::HostFS.$.Projects.OakScript.Source.c.script
+Errors in : HostFS::HostFS.$.Projects.OakScript.Source.c.script
+   412 W lower precision in wider context: '-'
+  2039 E undeclared name, inventing 'extern int error()'

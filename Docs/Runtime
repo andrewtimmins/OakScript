@@ -265,33 +265,49 @@ Loop Execution Example:
 MEMORY MANAGEMENT
 ----------------
 
-The runtime uses RISC OS module-safe memory functions exclusively:
+The runtime uses RISC OS module-safe memory functions exclusively with dynamic
+allocation for optimal memory efficiency:
 
 Memory Functions Used:
 - mod_malloc(): Allocate memory blocks
-- mod_free(): Deallocate memory blocks
+- mod_free(): Deallocate memory blocks  
 - mod_strcpy(): Safe string copying
 - mod_strlen(): Safe string length
 - mod_strncmp(): Safe string comparison
 
-Allocation Strategy:
-- Variables: Allocated on first assignment
+Dynamic Allocation Strategy (Version 0.05+):
+- Variables: Dynamic array allocated during engine initialization
+- Functions: Dynamic array allocated during engine initialization  
 - Strings: Allocated and copied for safety
 - Stack: Dynamic growth with reallocation
 - Buffers: Fixed-size with bounds checking
 
+Memory Safety Improvements:
+- Eliminated large static arrays that caused module loading issues
+- All global arrays now dynamically allocated via mod_malloc()
+- Variables[MAX_VARS] and functions[MAX_VARS] moved to heap
+- Stack-allocated backup arrays replaced with dynamic allocation
+- Module initialization performs all array allocation with error handling
+
+Allocation Process:
+1. Module initialization calls init_script_engine()
+2. init_script_engine() allocates variables and functions arrays
+3. On allocation failure, module initialization fails gracefully
+4. Arrays are zero-initialized for safe operation
+
 Memory Safety Features:
 - All pointers validated before use
-- Automatic cleanup on program exit
+- Automatic cleanup on program exit or module finalization
 - Proper deallocation on variable updates
 - No use of standard C library functions
+- Dynamic allocation prevents stack overflow in function calls
 
 Cleanup Process:
 1. Free all variable names and string values
-2. Free variable table array
+2. Free dynamically allocated variables and functions arrays
 3. Free execution stack
 4. Free any temporary allocations
-5. Return memory to system
+5. Return memory to system via mod_shutdown()
 
 ERROR HANDLING
 -------------

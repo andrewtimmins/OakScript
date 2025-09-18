@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include "kernel.h"
 #include "swis.h"
 #include "h.header"
@@ -13,6 +14,14 @@
 extern int run_script_file(const char *filename);
 extern int init_script_engine(void);
 extern void cleanup_script_engine(void);
+
+// Forward declarations for debug commands
+static _kernel_oserror *cmd_oak_debug_info(const char *arg_string, int argc);
+static _kernel_oserror *cmd_oak_map_dump(const char *arg_string, int argc);
+static _kernel_oserror *cmd_oak_symbols(const char *arg_string, int argc);
+static _kernel_oserror *cmd_oak_trace(const char *arg_string, int argc);
+static _kernel_oserror *cmd_oak_disasm(const char *arg_string, int argc);
+static _kernel_oserror *cmd_oak_validate(const char *arg_string, int argc);
 
 // Module workspace structure
 typedef struct {
@@ -205,9 +214,673 @@ _kernel_oserror *module_command(const char *arg_string, int argc, int cmd_no, vo
                 }
                 return NULL;
             }
+        case 3: // *OakDebugInfo command
+            return cmd_oak_debug_info(arg_string, argc);
+        case 4: // *OakMapDump command
+            return cmd_oak_map_dump(arg_string, argc);
+        case 5: // *OakSymbols command
+            return cmd_oak_symbols(arg_string, argc);
+        case 6: // *OakTrace command
+            return cmd_oak_trace(arg_string, argc);
+        case 7: // *OakDisasm command
+            return cmd_oak_disasm(arg_string, argc);
+        case 8: // *OakValidate command
+            return cmd_oak_validate(arg_string, argc);
         default:
             return make_error(0, "Unknown command");
     }
+}
+
+/* Helper function to extract single argument from command line */
+static _kernel_oserror *extract_filename(const char *arg_string, char *buffer, size_t buffer_size) {
+    const char *p = arg_string;
+    while (*p == ' ') p++; // skip leading spaces
+    const char *start = p;
+    while (*p && *p != ' ' && *p != '\r' && *p != '\n') p++;
+    int len = (int)(p - start);
+    if (len <= 0) {
+        return make_error(0, "No filename provided");
+    }
+    if (len >= (int)buffer_size) {
+        return make_error(0, "Filename too long");
+    }
+    strncpy(buffer, start, (size_t)len);
+    buffer[len] = '\0';
+    return NULL;
+}
+
+/* Helper function to extract two arguments from command line */
+static _kernel_oserror *extract_two_args(const char *arg_string, char *arg1, size_t size1, char *arg2, size_t size2) {
+    const char *args = arg_string;
+    while (*args == ' ') args++; // Skip leading spaces
+    
+    // Find first argument
+    const char *start1 = args;
+    while (*args && *args != ' ') args++;
+    int len1 = args - start1;
+    
+    // Skip spaces between arguments
+    while (*args == ' ') args++;
+    
+    // Second argument
+    const char *start2 = args;
+    while (*args && *args != ' ' && *args != '\r' && *args != '\n') args++;
+    int len2 = args - start2;
+    
+    if (len1 == 0 || len2 == 0) {
+        return make_error(0, "Two arguments required");
+    }
+    if (len1 >= (int)size1 || len2 >= (int)size2) {
+        return make_error(0, "Argument too long");
+    }
+    
+    strncpy(arg1, start1, len1); arg1[len1] = '\0';
+    strncpy(arg2, start2, len2); arg2[len2] = '\0';
+    return NULL;
+}
+
+/* *OakDebugInfo <bytecode_file> - Display debug information overview */
+static _kernel_oserror *cmd_oak_debug_info(const char *arg_string, int argc) {
+    (void)argc;
+    char bytecode_file[256];
+    _kernel_oserror *err = extract_filename(arg_string, bytecode_file, sizeof(bytecode_file));
+    if (err) return err;
+    
+    printf("=== OakScript Debug Information ===\n");
+    printf("Bytecode file: %s\n", bytecode_file);
+    
+    // Construct debug map filename
+    char debug_file[300];
+    strcpy(debug_file, bytecode_file);
+    char *dot = strrchr(debug_file, '.');
+    if (dot) *dot = '\0';
+    strcat(debug_file, "dbg");
+    
+    // Try to open and analyze debug map
+    FILE *dbg = fopen(debug_file, "r");
+    if (dbg) {
+        printf("Debug map: %s ✓\n", debug_file);
+        
+        char line[512];
+        int line_count = 0;
+        int min_offset = INT_MAX, max_offset = 0;
+        int min_line = INT_MAX, max_line = 0;
+        
+        while (fgets(line, sizeof(line), dbg)) {
+            if (line[0] == '#') continue; // Skip comments
+            
+            int offset, src_line;
+            if (sscanf(line, "%d\t%d", &offset, &src_line) >= 2) {
+                line_count++;
+                if (offset < min_offset) min_offset = offset;
+                if (offset > max_offset) max_offset = offset;
+                if (src_line < min_line) min_line = src_line;
+                if (src_line > max_line) max_line = src_line;
+            }
+        }
+        fclose(dbg);
+        
+        printf("  Entries: %d\n", line_count);
+        printf("  Bytecode range: %d - %d\n", min_offset, max_offset);
+        printf("  Source lines: %d - %d\n", min_line, max_line);
+    } else {
+        printf("Debug map: %s ✗\n", debug_file);
+    }
+    
+    // Construct symbol filename
+    char symbol_file[300];
+    strcpy(symbol_file, bytecode_file);
+    dot = strrchr(symbol_file, '.');
+    if (dot) *dot = '\0';
+    strcat(symbol_file, "sym");
+    
+    // Try to open and analyze symbol table
+    FILE *sym = fopen(symbol_file, "r");
+    if (sym) {
+        printf("Symbol table: %s ✓\n", symbol_file);
+        
+        char line[512];
+        int func_count = 0;
+        
+        while (fgets(line, sizeof(line), sym)) {
+            if (line[0] == '#') continue; // Skip comments
+            
+            int start, end, params;
+            char name[64];
+            if (sscanf(line, "%d\t%d\t%d\t%s", &start, &end, &params, name) >= 4) {
+                func_count++;
+            }
+        }
+        fclose(sym);
+        
+        printf("  Functions: %d\n", func_count);
+    } else {
+        printf("Symbol table: %s ✗\n", symbol_file);
+    }
+    
+    return NULL;
+}
+
+/* *OakMapDump <debug_map_file> - Display debug map contents */
+static _kernel_oserror *cmd_oak_map_dump(const char *arg_string, int argc) {
+    (void)argc;
+    char map_file[256];
+    _kernel_oserror *err = extract_filename(arg_string, map_file, sizeof(map_file));
+    if (err) return err;
+    
+    FILE *f = fopen(map_file, "r");
+    if (!f) {
+        return make_error(0, "Cannot open debug map file");
+    }
+    
+    printf("=== Debug Map: %s ===\n", map_file);
+    
+    char line[512];
+    int entry_count = 0;
+    
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '#') {
+            printf("%s", line); // Print header comments
+            continue;
+        }
+        
+        int offset, src_line, col = -1, end_col = -1;
+        char snippet[256] = "";
+        
+        // Try v2 format first (with columns)
+        int fields = sscanf(line, "%d\t%d\t%d\t%d\t%255[^\n]", &offset, &src_line, &col, &end_col, snippet);
+        if (fields < 4) {
+            // Try v1 format (no columns)
+            fields = sscanf(line, "%d\t%d\t%255[^\n]", &offset, &src_line, snippet);
+            col = end_col = -1;
+        }
+        
+        if (fields >= 2) {
+            entry_count++;
+            if (col >= 0) {
+                printf("%6d: Line %3d:%d-%d  %s\n", offset, src_line, col, end_col, snippet);
+            } else {
+                printf("%6d: Line %3d      %s\n", offset, src_line, snippet);
+            }
+        }
+    }
+    
+    fclose(f);
+    printf("\nTotal entries: %d\n", entry_count);
+    return NULL;
+}
+
+/* *OakSymbols <symbol_file> - List function symbols */
+static _kernel_oserror *cmd_oak_symbols(const char *arg_string, int argc) {
+    (void)argc;
+    char symbol_file[256];
+    _kernel_oserror *err = extract_filename(arg_string, symbol_file, sizeof(symbol_file));
+    if (err) return err;
+    
+    FILE *f = fopen(symbol_file, "r");
+    if (!f) {
+        return make_error(0, "Cannot open symbol file");
+    }
+    
+    printf("=== Function Symbols: %s ===\n", symbol_file);
+    
+    char line[512];
+    int func_count = 0;
+    
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '#') {
+            printf("%s", line); // Print header comments
+            continue;
+        }
+        
+        int start, end, params;
+        char name[64], param_list[256];
+        
+        if (sscanf(line, "%d\t%d\t%d\t%63s\t%255[^\n]", &start, &end, &params, name, param_list) >= 4) {
+            func_count++;
+            printf("%s(%s)\n", name, param_list);
+            printf("  Range: %d - %d (size: %d bytes)\n", start, end, end - start);
+            printf("  Parameters: %d\n\n", params);
+        }
+    }
+    
+    fclose(f);
+    printf("Total functions: %d\n", func_count);
+    return NULL;
+}
+
+/* *OakTrace <bytecode_file> <pc_address> - Map PC to source location */
+static _kernel_oserror *cmd_oak_trace(const char *arg_string, int argc) {
+    (void)argc;
+    char bytecode_file[256], pc_str[64];
+    _kernel_oserror *err = extract_two_args(arg_string, bytecode_file, sizeof(bytecode_file), pc_str, sizeof(pc_str));
+    if (err) return err;
+    
+    int pc_addr = atoi(pc_str);
+    if (pc_addr < 0) {
+        return make_error(0, "Invalid PC address");
+    }
+    
+    // Construct debug map filename
+    char debug_file[300];
+    strcpy(debug_file, bytecode_file);
+    char *dot = strrchr(debug_file, '.');
+    if (dot) *dot = '\0';
+    strcat(debug_file, "dbg");
+    
+    FILE *f = fopen(debug_file, "r");
+    if (!f) {
+        return make_error(0, "Cannot open debug map file");
+    }
+    
+    printf("=== Trace PC %d in %s ===\n", pc_addr, bytecode_file);
+    
+    char line[512];
+    int best_offset = -1, best_line = -1, best_col = -1;
+    char best_snippet[256] = "";
+    
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '#') continue;
+        
+        int offset, src_line, col = -1;
+        char snippet[256] = "";
+        
+        // Try both formats
+        int fields = sscanf(line, "%d\t%d\t%d\t%*d\t%255[^\n]", &offset, &src_line, &col, snippet);
+        if (fields < 3) {
+            fields = sscanf(line, "%d\t%d\t%255[^\n]", &offset, &src_line, snippet);
+            col = -1;
+        }
+        
+        if (fields >= 2 && offset <= pc_addr && offset > best_offset) {
+            best_offset = offset;
+            best_line = src_line;
+            best_col = col;
+            strcpy(best_snippet, snippet);
+        }
+    }
+    
+    fclose(f);
+    
+    if (best_offset >= 0) {
+        if (best_col >= 0) {
+            printf("Location: Line %d, Column %d\n", best_line, best_col);
+        } else {
+            printf("Location: Line %d\n", best_line);
+        }
+        printf("Source: %s\n", best_snippet);
+        printf("Base offset: %d (PC offset: +%d)\n", best_offset, pc_addr - best_offset);
+    } else {
+        printf("No debug information found for PC %d\n", pc_addr);
+    }
+    
+    return NULL;
+}
+
+/* *OakDisasm <bytecode_file> [<start>] [<end>] - Disassemble with annotations */
+static _kernel_oserror *cmd_oak_disasm(const char *arg_string, int argc) {
+    char bytecode_file[256];
+    int start_addr = 0, end_addr = -1;
+    
+    if (argc == 1) {
+        _kernel_oserror *err = extract_filename(arg_string, bytecode_file, sizeof(bytecode_file));
+        if (err) return err;
+    } else if (argc >= 2) {
+        // Parse up to 3 arguments
+        const char *args = arg_string;
+        while (*args == ' ') args++;
+        
+        // First arg (filename)
+        const char *start = args;
+        while (*args && *args != ' ') args++;
+        int len = args - start;
+        if (len >= (int)sizeof(bytecode_file)) return make_error(0, "Filename too long");
+        strncpy(bytecode_file, start, len);
+        bytecode_file[len] = '\0';
+        
+        // Second arg (start address)
+        while (*args == ' ') args++;
+        start_addr = atoi(args);
+        while (*args && *args != ' ') args++;
+        
+        // Third arg (end address) if present
+        if (argc >= 3) {
+            while (*args == ' ') args++;
+            if (*args) end_addr = atoi(args);
+        }
+    }
+    
+    // Open bytecode file
+    FILE *bc = fopen(bytecode_file, "rb");
+    if (!bc) {
+        return make_error(0, "Cannot open bytecode file");
+    }
+    
+    // Read header
+    oakscode_header_t header;
+    if (fread(&header, sizeof(header), 1, bc) != 1) {
+        fclose(bc);
+        return make_error(0, "Cannot read bytecode header");
+    }
+    
+    // Validate header
+    if (strncmp(header.magic, "OAKSCODE", 8) != 0) {
+        fclose(bc);
+        return make_error(0, "Invalid bytecode file format");
+    }
+    
+    printf("=== Disassembly: %s ===\n", bytecode_file);
+    printf("Version: %u, Code: %u bytes, Data: %u bytes\n", 
+           header.version, header.code_size, header.data_size);
+    
+    // Load debug map if available
+    char debug_file[300];
+    strcpy(debug_file, bytecode_file);
+    char *dot = strrchr(debug_file, '.');
+    if (dot) *dot = '\0';
+    strcat(debug_file, "dbg");
+    
+    FILE *dbg = fopen(debug_file, "r");
+    printf("Debug info: %s\n\n", dbg ? "Available" : "None");
+    
+    // Read bytecode section
+    unsigned char *code = (unsigned char*)mod_malloc(header.code_size);
+    if (!code) {
+        fclose(bc);
+        if (dbg) fclose(dbg);
+        return make_error(0, "Memory allocation failed");
+    }
+    
+    if (fread(code, 1, header.code_size, bc) != header.code_size) {
+        mod_free(code);
+        fclose(bc);
+        if (dbg) fclose(dbg);
+        return make_error(0, "Cannot read bytecode");
+    }
+    
+    // Read data section
+    char *data = NULL;
+    if (header.data_size > 0) {
+        data = (char*)mod_malloc(header.data_size);
+        if (!data) {
+            mod_free(code);
+            fclose(bc);
+            if (dbg) fclose(dbg);
+            return make_error(0, "Memory allocation failed for data section");
+        }
+        
+        if (fread(data, 1, header.data_size, bc) != header.data_size) {
+            mod_free(code);
+            mod_free(data);
+            fclose(bc);
+            if (dbg) fclose(dbg);
+            return make_error(0, "Cannot read data section");
+        }
+    }
+    
+    fclose(bc);
+    
+    // Set address range
+    if (end_addr < 0) end_addr = (int)header.code_size;
+    if (start_addr < 0) start_addr = 0;
+    if (start_addr >= (int)header.code_size) start_addr = (int)header.code_size - 1;
+    if (end_addr > (int)header.code_size) end_addr = (int)header.code_size;
+    
+    printf("Address range: %d - %d\n\n", start_addr, end_addr - 1);
+    
+    // Disassemble
+    int pc = start_addr;
+    while (pc < end_addr && pc < (int)header.code_size) {
+        // Check for debug info at this PC
+        if (dbg) {
+            rewind(dbg);
+            char line[512];
+            int best_offset = -1, best_line = -1;
+            char best_snippet[256] = "";
+            
+            while (fgets(line, sizeof(line), dbg)) {
+                if (line[0] == '#') continue;
+                
+                int offset, src_line;
+                char snippet[256] = "";
+                
+                if (sscanf(line, "%d\t%d\t%255[^\n]", &offset, &src_line, snippet) >= 2) {
+                    if (offset == pc) {
+                        printf("        ; Line %d: %s\n", src_line, snippet);
+                        break;
+                    } else if (offset <= pc && offset > best_offset) {
+                        best_offset = offset;
+                        best_line = src_line;
+                        strcpy(best_snippet, snippet);
+                    }
+                }
+            }
+        }
+        
+        // Disassemble instruction
+        printf("%6d: ", pc);
+        
+        if (pc >= (int)header.code_size) {
+            printf("??? (beyond code section)\n");
+            break;
+        }
+        
+        unsigned char opcode = code[pc++];
+        
+        switch (opcode) {
+            case OP_NOP:
+                printf("NOP\n");
+                break;
+            case OP_LOAD_INT:
+                if (pc + 4 <= (int)header.code_size) {
+                    int value = *(int*)(code + pc);
+                    pc += 4;
+                    printf("LOAD_INT %d\n", value);
+                } else {
+                    printf("LOAD_INT <truncated>\n");
+                    pc = header.code_size;
+                }
+                break;
+            case OP_LOAD_FLOAT:
+                if (pc + 4 <= (int)header.code_size) {
+                    float value = *(float*)(code + pc);
+                    pc += 4;
+                    printf("LOAD_FLOAT %.6f\n", value);
+                } else {
+                    printf("LOAD_FLOAT <truncated>\n");
+                    pc = header.code_size;
+                }
+                break;
+            case OP_LOAD_STRING:
+                if (pc + 4 <= (int)header.code_size) {
+                    int offset = *(int*)(code + pc);
+                    pc += 4;
+                    if (data && offset >= 0 && offset < (int)header.data_size) {
+                        printf("LOAD_STRING \"%s\"\n", data + offset);
+                    } else {
+                        printf("LOAD_STRING @%d <invalid>\n", offset);
+                    }
+                } else {
+                    printf("LOAD_STRING <truncated>\n");
+                    pc = header.code_size;
+                }
+                break;
+            case OP_LOAD_VAR:
+                if (pc + 4 <= (int)header.code_size) {
+                    int offset = *(int*)(code + pc);
+                    pc += 4;
+                    if (data && offset >= 0 && offset < (int)header.data_size) {
+                        printf("LOAD_VAR %s\n", data + offset);
+                    } else {
+                        printf("LOAD_VAR @%d <invalid>\n", offset);
+                    }
+                } else {
+                    printf("LOAD_VAR <truncated>\n");
+                    pc = header.code_size;
+                }
+                break;
+            case OP_STORE_VAR:
+                if (pc + 4 <= (int)header.code_size) {
+                    int offset = *(int*)(code + pc);
+                    pc += 4;
+                    if (data && offset >= 0 && offset < (int)header.data_size) {
+                        printf("STORE_VAR %s\n", data + offset);
+                    } else {
+                        printf("STORE_VAR @%d <invalid>\n", offset);
+                    }
+                } else {
+                    printf("STORE_VAR <truncated>\n");
+                    pc = header.code_size;
+                }
+                break;
+            case OP_ADD: printf("ADD\n"); break;
+            case OP_SUB: printf("SUB\n"); break;
+            case OP_MUL: printf("MUL\n"); break;
+            case OP_DIV: printf("DIV\n"); break;
+            case OP_CMP_EQ: printf("CMP_EQ\n"); break;
+            case OP_CMP_NE: printf("CMP_NE\n"); break;
+            case OP_CMP_LT: printf("CMP_LT\n"); break;
+            case OP_CMP_LE: printf("CMP_LE\n"); break;
+            case OP_CMP_GT: printf("CMP_GT\n"); break;
+            case OP_CMP_GE: printf("CMP_GE\n"); break;
+            case OP_PRINT_INT: printf("PRINT_INT\n"); break;
+            case OP_PRINT_STRING: printf("PRINT_STRING\n"); break;
+            case OP_JUMP:
+                if (pc + 4 <= (int)header.code_size) {
+                    int addr = *(int*)(code + pc);
+                    pc += 4;
+                    printf("JUMP %d\n", addr);
+                } else {
+                    printf("JUMP <truncated>\n");
+                    pc = header.code_size;
+                }
+                break;
+            case OP_JUMP_IF_FALSE:
+                if (pc + 4 <= (int)header.code_size) {
+                    int addr = *(int*)(code + pc);
+                    pc += 4;
+                    printf("JUMP_IF_FALSE %d\n", addr);
+                } else {
+                    printf("JUMP_IF_FALSE <truncated>\n");
+                    pc = header.code_size;
+                }
+                break;
+            case OP_CALL_BUILTIN:
+                if (pc + 8 <= (int)header.code_size) {
+                    int name_offset = *(int*)(code + pc);
+                    pc += 4;
+                    int arg_count = *(int*)(code + pc);
+                    pc += 4;
+                    if (data && name_offset >= 0 && name_offset < (int)header.data_size) {
+                        printf("CALL_BUILTIN %s(%d args)\n", data + name_offset, arg_count);
+                    } else {
+                        printf("CALL_BUILTIN @%d(%d args) <invalid>\n", name_offset, arg_count);
+                    }
+                } else {
+                    printf("CALL_BUILTIN <truncated>\n");
+                    pc = header.code_size;
+                }
+                break;
+            case OP_RETURN: printf("RETURN\n"); break;
+            case OP_POP: printf("POP\n"); break;
+            case OP_EXIT: printf("EXIT\n"); break;
+            default:
+                printf("??? (opcode %d)\n", opcode);
+                break;
+        }
+    }
+    
+    // Cleanup
+    mod_free(code);
+    if (data) mod_free(data);
+    if (dbg) fclose(dbg);
+    
+    return NULL;
+}
+
+/* *OakValidate <bytecode_file> - Validate debug file consistency */
+static _kernel_oserror *cmd_oak_validate(const char *arg_string, int argc) {
+    (void)argc;
+    char bytecode_file[256];
+    _kernel_oserror *err = extract_filename(arg_string, bytecode_file, sizeof(bytecode_file));
+    if (err) return err;
+    
+    printf("=== Validating: %s ===\n", bytecode_file);
+    
+    int issues = 0;
+    
+    // Check if bytecode file exists
+    FILE *bc = fopen(bytecode_file, "rb");
+    if (!bc) {
+        printf("✗ Bytecode file not found\n");
+        issues++;
+    } else {
+        printf("✓ Bytecode file exists\n");
+        fclose(bc);
+    }
+    
+    // Check debug map
+    char debug_file[300];
+    strcpy(debug_file, bytecode_file);
+    char *dot = strrchr(debug_file, '.');
+    if (dot) *dot = '\0';
+    strcat(debug_file, "dbg");
+    
+    FILE *dbg = fopen(debug_file, "r");
+    if (!dbg) {
+        printf("⚠ Debug map file not found: %s\n", debug_file);
+    } else {
+        printf("✓ Debug map file exists: %s\n", debug_file);
+        
+        // Validate format
+        char line[512];
+        int valid_entries = 0, invalid_entries = 0;
+        
+        while (fgets(line, sizeof(line), dbg)) {
+            if (line[0] == '#') continue;
+            
+            int offset, src_line;
+            if (sscanf(line, "%d\t%d", &offset, &src_line) >= 2) {
+                if (offset >= 0 && src_line > 0) {
+                    valid_entries++;
+                } else {
+                    invalid_entries++;
+                }
+            } else {
+                invalid_entries++;
+            }
+        }
+        fclose(dbg);
+        
+        printf("  Valid entries: %d\n", valid_entries);
+        if (invalid_entries > 0) {
+            printf("  Invalid entries: %d\n", invalid_entries);
+            issues++;
+        }
+    }
+    
+    // Check symbol table
+    char symbol_file[300];
+    strcpy(symbol_file, bytecode_file);
+    dot = strrchr(symbol_file, '.');
+    if (dot) *dot = '\0';
+    strcat(symbol_file, "sym");
+    
+    FILE *sym = fopen(symbol_file, "r");
+    if (!sym) {
+        printf("⚠ Symbol file not found: %s\n", symbol_file);
+    } else {
+        printf("✓ Symbol file exists: %s\n", symbol_file);
+        fclose(sym);
+    }
+    
+    if (issues == 0) {
+        printf("\n✓ All checks passed\n");
+    } else {
+        printf("\n⚠ %d issue(s) found\n", issues);
+    }
+    
+    return NULL;
 }
 
 

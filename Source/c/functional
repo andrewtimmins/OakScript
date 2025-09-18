@@ -24,7 +24,7 @@ static int lambda_count = 0;
 extern int run_script_from_source(const char* source, const char* filename);
 extern void* get_variable_value(const char* name, VarType* type);
 extern void set_variable_value(const char* name, VarType type, void* value);
-extern Variable variables[];
+extern Variable *variables;
 extern int var_count;
 
 // Register a lambda function and return a handle

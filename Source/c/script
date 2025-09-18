@@ -2,6 +2,7 @@
 #include <stdlib.h>   // for exit, strtol, atoi
 #include <ctype.h>    // for isdigit
 #include <stdbool.h>
+#include <string.h>   // for memset
 #include <time.h>
 
 #include <kernel.h>
@@ -80,7 +81,7 @@ Token tokens[MAX_TOKENS];
 int token_count = 0;
 int current_token = 0;
 
-Function functions[MAX_VARS];
+Function *functions = NULL;
 int function_count = 0;
 static int last_exec_status = 0; // return code of last exec
 static int loop_depth = 0;             // track nested loop depth
@@ -2032,10 +2033,14 @@ int function_call(char *name) {
     
     next_token(); // Consume '('
     
-    // Save current variables
-    Variable saved_vars[MAX_VARS];
+    // Save current variables using dynamic allocation
+    Variable *saved_vars = (Variable*)mod_malloc(MAX_VARS * sizeof(Variable));
+    if (!saved_vars) {
+        printf("Error: Failed to allocate memory for variable backup\n");
+        return 0;
+    }
     int saved_var_count = var_count;
-    memcpy(saved_vars, variables, sizeof(variables));
+    memcpy(saved_vars, variables, MAX_VARS * sizeof(Variable));
     
     // Set up parameters - DON'T reset var_count, just add parameters to current scope
     for (int i = 0; i < func->param_count; i++) {
@@ -2094,7 +2099,10 @@ int function_call(char *name) {
     function_return_flag = saved_return_flag;
     function_return_value = saved_return_value;
     var_count = saved_var_count;
-    memcpy(variables, saved_vars, sizeof(variables));
+    memcpy(variables, saved_vars, MAX_VARS * sizeof(Variable));
+    
+    // Free the backup array
+    mod_free(saved_vars);
     
     return return_value;
 }
@@ -3720,11 +3728,20 @@ int swi_error_builtin(void) {
         
 // Function to reset global state (for module interface)
 void reset_script_globals(void) {
-    // Clean up existing variables
-    for (int i = 0; i < var_count; i++) {
-        if (variables[i].type == VAR_STRING && variables[i].value.string_value) {
-            mod_free(variables[i].value.string_value);
+    // Clean up existing variables only if arrays are allocated
+    if (variables) {
+        for (int i = 0; i < var_count; i++) {
+            if (variables[i].type == VAR_STRING && variables[i].value.string_value) {
+                mod_free(variables[i].value.string_value);
+            }
         }
+        
+        // Zero out the arrays
+        memset(variables, 0, MAX_VARS * sizeof(Variable));
+    }
+    
+    if (functions) {
+        memset(functions, 0, MAX_VARS * sizeof(Function));
     }
     
     // Reset counters

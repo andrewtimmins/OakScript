@@ -96,9 +96,10 @@ install: $(TARGET)
 
 
 
-o.math:	c.math
-o.math:	h.math
-o.math:	h.engine
+o.memory:	c.memory
+o.memory:	C:h.kernel
+o.memory:	C:h.swis
+o.memory:	h.memory
 o.module:	c.module
 o.module:	C:h.kernel
 o.module:	C:h.swis
@@ -136,15 +137,14 @@ o.core:	h.runtime
 o.core:	h.compile
 o.core:	h.rt_objects
 o.core:	h.bridge
-o.memory:	c.memory
-o.memory:	C:h.kernel
-o.memory:	C:h.swis
-o.memory:	h.memory
 o.variables:	c.variables
 o.variables:	h.memory
 o.variables:	h.engine
 o.variables:	h.variables
 o.variables:	h.engine
+o.math:	c.math
+o.math:	h.math
+o.math:	h.engine
 o.swi:	c.swi
 o.swi:	C:h.kernel
 o.swi:	h.memory
@@ -159,6 +159,13 @@ o.debug:	h.memory
 o.debug:	h.engine
 o.debug:	C:h.kernel
 o.debug:	C:h.swis
+o.compile:	c.compile
+o.compile:	C:h.kernel
+o.compile:	C:h.swis
+o.compile:	h.compile
+o.compile:	h.engine
+o.compile:	h.memory
+o.compile:	h.builtins
 o.runtime:	c.runtime
 o.runtime:	h.runtime
 o.runtime:	h.compile
@@ -233,10 +240,3 @@ o.bridge:	h.advanced
 o.bridge:	h.engine
 o.bridge:	h.memory
 o.bridge:	h.builtins
-o.compile:	c.compile
-o.compile:	C:h.kernel
-o.compile:	C:h.swis
-o.compile:	h.compile
-o.compile:	h.engine
-o.compile:	h.memory
-o.compile:	h.builtins

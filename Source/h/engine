@@ -174,10 +174,10 @@ extern Token tokens[];
 extern int token_count;
 extern int current_token;
 
-extern Variable variables[];
+extern Variable *variables;
 extern int var_count;
 
-extern Function functions[];
+extern Function *functions;
 extern int function_count;
 
 // Function declarations

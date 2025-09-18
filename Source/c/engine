@@ -28,6 +28,19 @@ int init_script_engine(void) {
         return 0; // Already initialized
     }
     
+    // Allocate global arrays using module-safe memory
+    variables = (Variable*)mod_malloc(MAX_VARS * sizeof(Variable));
+    if (!variables) {
+        return 1; // Allocation failed
+    }
+    
+    functions = (Function*)mod_malloc(MAX_VARS * sizeof(Function));
+    if (!functions) {
+        mod_free(variables);
+        variables = NULL;
+        return 1; // Allocation failed
+    }
+    
     // Initialize any global state here
     reset_script_globals();
     engine_initialized = 1;
@@ -41,6 +54,18 @@ void cleanup_script_engine(void) {
     }
     
     // Cleanup global state here
+    if (variables) {
+        // Clean up any string allocations in variables
+        reset_script_globals();
+        mod_free(variables);
+        variables = NULL;
+    }
+    
+    if (functions) {
+        mod_free(functions);
+        functions = NULL;
+    }
+    
     engine_initialized = 0;
 }
 

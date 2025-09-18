@@ -4,8 +4,8 @@
 #include "h.engine"
 #include "h.variables"
 
-/* Global variable storage */
-Variable variables[MAX_VARS];
+/* Global variable storage - dynamically allocated */
+Variable *variables = NULL;
 int var_count = 0;
 
 /* Find variable by name, return index or -1 if not found */

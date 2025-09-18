@@ -13,10 +13,10 @@
 
 #define Module_Title                     "OakScript"
 #define Module_Help                      "OakScript"
-#define Module_VersionString             "0.04"
-#define Module_VersionNumber             4
+#define Module_VersionString             "0.05"
+#define Module_VersionNumber             5
 #ifndef Module_Date
-#define Module_Date                      "21 Aug 2025"
+#define Module_Date                      "18 Sep 2025"
 #endif
 
 
@@ -98,8 +98,14 @@ _kernel_oserror *module_final(int fatal, int podule, void *pw);
 #define configure_TOO_MANY_PARAMS ((_kernel_oserror *) 3)
 
 #define CMD_OakScript                   0
-#define CMD_OakScriptCompile            1
-#define CMD_OakScriptRun                2
+#define CMD_OakCompile                  1
+#define CMD_OakRun                      2
+#define CMD_OakDebugInfo                3
+#define CMD_OakMapDump                  4
+#define CMD_OakSymbols                  5
+#define CMD_OakTrace                    6
+#define CMD_OakDisasm                   7
+#define CMD_OakValidate                 8
 
 _kernel_oserror *module_command(const char *arg_string, int argc, int cmd_no, void *pw);
 

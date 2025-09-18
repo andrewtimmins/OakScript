@@ -1,0 +1,282 @@
+OakScript Debug Commands Documentation
+======================================
+
+Version: 0.05
+Date: 18 Sep 2025
+
+OVERVIEW
+--------
+
+OakScript provides a comprehensive suite of debugging commands for analyzing
+compiled bytecode, debug maps, symbol tables, and runtime execution. These
+commands are essential for development, debugging, and reverse-engineering
+OakScript applications.
+
+AVAILABLE COMMANDS
+-----------------
+
+1. *OakDebugInfo - Debug information overview
+2. *OakMapDump - Debug map file inspection  
+3. *OakSymbols - Function symbol listing
+4. *OakTrace - Program counter to source mapping
+5. *OakDisasm - Bytecode disassembly with annotations
+6. *OakValidate - Debug file consistency validation
+
+DEBUG FILE FORMATS
+------------------
+
+OakScript generates several debug files alongside bytecode:
+
+Debug Map (.dbg files):
+- Maps bytecode offsets to source line numbers
+- Supports v1 (offset, line) and v2 (offset, line, col, end_col, snippet) formats
+- Used for runtime error reporting and source tracing
+- RISC OS filetype: &EEA
+
+Symbol Table (.sym files):
+- Contains function definitions with parameter information
+- Format: start_offset, end_offset, param_count, function_name, param_list
+- Used for call stack analysis and function inspection
+- RISC OS filetype: &EEB
+
+COMMAND REFERENCE
+================
+
+*OakDebugInfo <bytecode_file>
+-----------------------------
+
+Displays comprehensive debug information overview for a bytecode file.
+
+Usage:
+    *OakDebugInfo Examples.hello_world
+
+Output:
+- Bytecode file validation
+- Debug map file status and statistics
+- Symbol table analysis  
+- Coverage information (bytecode range, source lines)
+
+Example Output:
+    === OakScript Debug Information ===
+    Bytecode file: Examples.hello_world
+    Debug map: Examples.hello_worlddbg ✓
+      Entries: 25
+      Bytecode range: 0 - 156
+      Source lines: 1 - 12
+    Symbol table: Examples.hello_worldsym ✓
+      Functions: 3
+
+*OakMapDump <debug_map_file>
+---------------------------
+
+Displays the complete contents of a debug map file with formatted output.
+
+Usage:
+    *OakMapDump Examples.hello_worlddbg
+
+Output:
+- Header comments from debug map
+- All bytecode offset to source line mappings
+- Format auto-detection (v1/v2)
+- Entry count summary
+
+Example Output:
+    === Debug Map: Examples.hello_worlddbg ===
+    # OakScript Debug Map v2
+    # Generated: 18 Sep 2025
+         0: Line   1      let x = 10
+         4: Line   2      let y = 20
+        12: Line   3      print(x + y)
+    
+    Total entries: 3
+
+*OakSymbols <symbol_file>
+------------------------
+
+Lists all function symbols with their bytecode ranges and parameters.
+
+Usage:
+    *OakSymbols Examples.hello_worldsym
+
+Output:
+- Function name and parameter list
+- Bytecode address range
+- Parameter count
+- Function size in bytes
+
+Example Output:
+    === Function Symbols: Examples.hello_worldsym ===
+    # Symbol table for Examples.hello_world
+    main()
+      Range: 0 - 45 (size: 45 bytes)
+      Parameters: 0
+    
+    calculate(x, y)
+      Range: 46 - 89 (size: 43 bytes)
+      Parameters: 2
+    
+    Total functions: 2
+
+*OakTrace <bytecode_file> <pc_address>
+-------------------------------------
+
+Maps a program counter address to its corresponding source location using
+the debug map.
+
+Usage:
+    *OakTrace Examples.hello_world 24
+
+Output:
+- Source line and column (if available)
+- Source code snippet
+- Base offset and relative position
+
+Example Output:
+    === Trace PC 24 in Examples.hello_world ===
+    Location: Line 3, Column 5
+    Source: print(x + y)
+    Base offset: 20 (PC offset: +4)
+
+*OakDisasm <bytecode_file> [<start>] [<end>]
+-------------------------------------------
+
+Disassembles bytecode with source line annotations and opcode details.
+
+Usage:
+    *OakDisasm Examples.hello_world        ; Full disassembly
+    *OakDisasm Examples.hello_world 0 50   ; Range 0-50
+    *OakDisasm Examples.hello_world 20     ; From offset 20 to end
+
+Output:
+- Bytecode header information
+- Instruction-by-instruction disassembly
+- Source line annotations (when debug map available)
+- String and data section resolution
+- Address range filtering
+
+Example Output:
+    === Disassembly: Examples.hello_world ===
+    Version: 1, Code: 156 bytes, Data: 45 bytes
+    Debug info: Available
+    
+    Address range: 0 - 155
+    
+            ; Line 1: let x = 10
+         0: LOAD_INT 10
+         5: STORE_VAR x
+        10: ; Line 2: let y = 20
+        10: LOAD_INT 20
+        15: STORE_VAR y
+        20: ; Line 3: print(x + y)
+        20: LOAD_VAR x
+        25: LOAD_VAR y
+        30: ADD
+        31: PRINT_INT
+        32: EXIT
+
+Supported Opcodes:
+- Basic arithmetic: ADD, SUB, MUL, DIV
+- Comparisons: CMP_EQ, CMP_NE, CMP_LT, CMP_LE, CMP_GT, CMP_GE
+- Stack operations: LOAD_INT, LOAD_FLOAT, LOAD_STRING, LOAD_VAR, STORE_VAR
+- Control flow: JUMP, JUMP_IF_FALSE, RETURN
+- Function calls: CALL_BUILTIN
+- I/O: PRINT_INT, PRINT_STRING
+- Program control: NOP, POP, EXIT
+
+*OakValidate <bytecode_file>
+---------------------------
+
+Validates the consistency and integrity of debug files associated with a
+bytecode file.
+
+Usage:
+    *OakValidate Examples.hello_world
+
+Output:
+- Bytecode file existence check
+- Debug map validation (format, entry consistency)
+- Symbol table verification
+- Cross-reference validation
+- Issue summary
+
+Example Output:
+    === Validating: Examples.hello_world ===
+    ✓ Bytecode file exists
+    ✓ Debug map file exists: Examples.hello_worlddbg
+      Valid entries: 25
+    ✓ Symbol file exists: Examples.hello_worldsym
+    
+    ✓ All checks passed
+
+Error Indicators:
+- ✓ Success/Found
+- ✗ Critical error
+- ⚠ Warning/Missing optional file
+
+DEBUGGING WORKFLOW
+=================
+
+Typical debugging workflow using these commands:
+
+1. Compile with debug information:
+   *OakCompile source.oak program
+
+2. Verify debug files were created:
+   *OakDebugInfo program
+
+3. Validate file consistency:
+   *OakValidate program
+
+4. Examine source mappings:
+   *OakMapDump programdbg
+
+5. Review function structure:
+   *OakSymbols programsym
+
+6. Disassemble for analysis:
+   *OakDisasm program
+
+7. Trace specific runtime issues:
+   *OakTrace program <error_pc>
+
+INTEGRATION WITH DEVELOPMENT
+===========================
+
+Command Line Usage:
+- All commands work from RISC OS command line
+- Support wildcards in RISC OS file specifications
+- Proper error reporting for missing files
+- Module-safe operation (no crashes)
+
+Error Handling:
+- Graceful handling of corrupted debug files
+- Clear error messages for missing dependencies
+- Automatic format detection and adaptation
+- Memory-safe operation with automatic cleanup
+
+File Conventions:
+- Bytecode files: Usually no extension or .oak
+- Debug maps: <basename>dbg (filetype &EEA)
+- Symbol tables: <basename>sym (filetype &EEB)
+- Source files: <basename>.oak or similar
+
+TECHNICAL NOTES
+==============
+
+Memory Management:
+- All commands use module-safe memory allocation
+- Automatic cleanup on completion or error
+- No memory leaks or module workspace corruption
+- Safe for use in module context
+
+Performance:
+- Efficient bytecode parsing with minimal memory overhead
+- Streaming approach for large files
+- Selective loading based on command requirements
+- Address range filtering to limit output size
+
+Compatibility:
+- Supports all OakScript bytecode versions
+- Backward compatible with v1 debug maps
+- Forward compatible design for future extensions
+- RISC OS specific file handling and conventions

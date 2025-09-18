@@ -166,7 +166,7 @@ int bridge_dispatch(const char *name, int argc, bridge_value_t *args, bridge_val
         LambdaFunc *lf = lambda_create(tokens, pc, body);
         if (!lf) { mod_free(tmp); return BRIDGE_ERROR; }
         /* Naive closure capture: scan body for variable names present in global variables and not params. */
-        extern Variable variables[]; extern int var_count; /* from engine */
+        extern Variable *variables; extern int var_count; /* from engine */
         int captured = 0;
         for (int vi=0; vi<var_count; vi++) {
             if (captured >= 32) break; /* safety */

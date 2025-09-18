@@ -11,6 +11,6 @@ Set File$Type_EEE OSC
 Set File$Type_EEF OXF
 
 Set Alias$@RunType_EEE "OakScript %%*0"
-Set Alias$@RunType_EEF "OakScriptRun %%*0"
+Set Alias$@RunType_EEF "OakRun %%*0"
 
 Set OakScript$Debug 1

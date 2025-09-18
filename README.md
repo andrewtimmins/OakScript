@@ -1,6 +1,6 @@
 # OakScript
 
-**Version 0.04** • A lightweight scripting language for RISC OS
+**Version 0.05** • A lightweight scripting language for RISC OS
 
 OakScript is a simple, intuitive scripting language designed for rapid prototyping, automation, and educational purposes on the RISC OS platform. With its clear syntax and straightforward commands, OakScript enables users to quickly write scripts for a variety of tasks, from basic calculations to more complex logic and data manipulation.
 
@@ -41,16 +41,27 @@ Complete execution environment with comprehensive error handling:
 
 ## File Types
 
-- OakScript source files (Type &EEE)
-- Compiled bytecode files (Type &EEF)
+- **OakScript source files** (Type &EEE) - Human-readable source code
+- **Compiled bytecode files** (Type &EEF) - Executable bytecode
+- **Debug map files** (Type &EEA) - Bytecode-to-source line mappings
+- **Symbol table files** (Type &EEB) - Function definitions and parameters
 
 ## Commands
 
-Once the module is loaded, OakScript provides three main commands:
+Once the module is loaded, OakScript provides a comprehensive command suite:
 
+### Core Commands
 - **`*OakScript [filename]`** - Run an OakScript source file directly
-- **`*OakScriptCompile <source> <output>`** - Compile source to bytecode
-- **`*OakScriptRun <bytecode>`** - Execute compiled bytecode
+- **`*OakCompile <source> <output>`** - Compile source to bytecode
+- **`*OakRun <bytecode>`** - Execute compiled bytecode
+
+### Debug Commands
+- **`*OakDebugInfo <bytecode_file>`** - Display debug information overview
+- **`*OakMapDump <debug_map_file>`** - Show debug map contents
+- **`*OakSymbols <symbol_file>`** - List function symbols
+- **`*OakTrace <bytecode_file> <pc_address>`** - Map PC to source location
+- **`*OakDisasm <bytecode_file> [<start>] [<end>]`** - Disassemble bytecode with annotations
+- **`*OakValidate <bytecode_file>`** - Validate debug file consistency
 
 ## Example Usage
 
