@@ -1,0 +1,63 @@
+#ifndef OAK_BRIDGE_H
+#define OAK_BRIDGE_H
+
+/* Unified built-in dispatch bridge between interpreter and bytecode runtime.
+ * All allocations must use mod_* routines for memory safety inside module DA.
+ */
+
+#include "h.memory"  /* for mod_* allocators */
+#include "h.strings"
+#include "h.runtime" /* for runtime object types/creation helpers */
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef enum {
+    BRIDGE_VAL_INT,
+    BRIDGE_VAL_FLOAT,
+    BRIDGE_VAL_STRING,
+    BRIDGE_VAL_HANDLE,
+    BRIDGE_VAL_NULL
+} bridge_val_type_t;
+
+typedef struct bridge_value {
+    bridge_val_type_t type;
+    union {
+        int i;
+        float f;
+        char *s;      /* mod_malloc'd string or alias - ownership per flags */
+        void *handle; /* runtime/interpreter object pointer */
+    } data;
+    int owns; /* for strings: 1 = free with mod_free when releasing */
+} bridge_value_t;
+
+/* Result codes from dispatcher */
+#define BRIDGE_OK 0
+#define BRIDGE_UNKNOWN 1
+#define BRIDGE_ERROR 2
+
+/* Initialize any shared state (idempotent) */
+int bridge_init(void);
+
+/* Free any shared caches (optional) */
+void bridge_shutdown(void);
+
+/* Generic dispatcher for built-in functions.
+ * name: builtin name (null terminated)
+ * argc: number of args
+ * args: array of argc bridge_value_t
+ * out: result value (must be zeroed by caller before). On success BRIDGE_OK sets its type.
+ * Returns BRIDGE_OK, BRIDGE_UNKNOWN, or BRIDGE_ERROR.
+ */
+int bridge_dispatch(const char *name, int argc, bridge_value_t *args, bridge_value_t *out);
+
+/* Utility helpers */
+void bridge_value_init(bridge_value_t *v);
+void bridge_value_free(bridge_value_t *v);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* OAK_BRIDGE_H */

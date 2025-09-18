@@ -7,5 +7,11 @@
 // Function prototype for bytecode execution
 extern int run_bytecode_file(const char *bytecode_file);
 
+/* Expose limited object inquiry helpers for bridge without leaking full internals */
+int runtime_list_size(void *handle);
+int runtime_dict_size(void *handle);
+int runtime_set_size(void *handle);
+int runtime_dict_has(void *handle, const char *key);
+
 #endif // OAKSCRIPT_RUNTIME_H
 

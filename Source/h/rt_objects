@@ -1,0 +1,92 @@
+#ifndef OAK_RT_OBJECTS_H
+#define OAK_RT_OBJECTS_H
+
+/* Opaque runtime object manipulation API for bridge.
+ * Provides creation and basic operations for list, dict, and set without
+ * exposing internal struct layouts. All allocations use mod_* inside runtime.
+ */
+
+#include "h.bridge" /* for bridge_value_t */
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* LIST */
+void *rt_list_create(int initial_cap); /* initial_cap<=0 => default */
+int rt_list_append(void *list_handle, const bridge_value_t *val); /* returns 1 on success */
+int rt_list_get(void *list_handle, int index, bridge_value_t *out); /* returns 1 if element copied */
+
+/* DICT */
+void *rt_dict_create(int initial_cap);
+int rt_dict_set(void *dict_handle, const char *key, const bridge_value_t *val); /* 1 success */
+int rt_dict_get(void *dict_handle, const char *key, bridge_value_t *out); /* 1 if found */
+int rt_dict_remove(void *dict_handle, const char *key); /* 1 if removed */
+void *rt_dict_keys(void *dict_handle); /* returns list handle of keys or NULL */
+
+/* SET */
+void *rt_set_create(int initial_cap);
+int rt_set_add(void *set_handle, const bridge_value_t *val); /* 1 if added (or already present? we choose 1 success, 0 error) */
+int rt_set_contains(void *set_handle, const bridge_value_t *val); /* 1 if present */
+
+/* REGEX */
+void *rt_regex_create(const char *pattern, int flags); /* returns handle or NULL */
+int rt_regex_match(void *regex_handle, const char *text); /* 1 if match */
+char *rt_regex_replace(void *regex_handle, const char *text, const char *replacement); /* mod_malloc'd result or NULL */
+
+/* INTERPOLATION / MULTILINE (simplified) */
+char *rt_interpolate_template(const char *template_str); /* returns new mod_malloc'd string */
+char *rt_multiline_process(const char *raw_str); /* returns processed or copy */
+
+/* OPTIONAL */
+void *rt_optional_create(const bridge_value_t *maybe_val); /* returns handle */
+int rt_optional_has_value(void *opt_handle); /* 1/0 */
+int rt_optional_get(void *opt_handle, bridge_value_t *out); /* 1 if has value */
+
+/* UNION */
+void *rt_union_create(const char *tag, const bridge_value_t *val); /* returns handle */
+int rt_union_set(void *union_handle, const char *tag, const bridge_value_t *val); /* 1 success */
+int rt_union_get(void *union_handle, bridge_value_t *out); /* copy current value (may be null) */
+const char *rt_union_tag(void *union_handle); /* tag string or NULL */
+
+/* TYPE HELPERS */
+const char *rt_typeof_value(const bridge_value_t *v); /* returns static string */
+int rt_is_type(const bridge_value_t *v, const char *type_name); /* 1/0 */
+int rt_is_null(const bridge_value_t *v); /* 1/0 */
+int rt_cast_value(const bridge_value_t *src, const char *target_type, bridge_value_t *out); /* 1 success */
+
+/* FUNCTIONAL (Batch5) */
+void *rt_compose_create(void *f1, void *f2); /* returns composed callable handle */
+void *rt_partial_create(void *base, int argc, const bridge_value_t *argv); /* returns partial handle */
+void *rt_memoize_create(void *base); /* returns memoizing wrapper */
+int rt_callable_invoke(void *callable, int argc, bridge_value_t *argv, bridge_value_t *result); /* 1 success */
+void *rt_map(void *list_handle, void *callable); /* new list or NULL */
+void *rt_filter(void *list_handle, void *callable); /* new list or NULL */
+int rt_reduce(void *list_handle, void *callable, const bridge_value_t *init, bridge_value_t *out); /* 1 success */
+
+/* EXCEPTIONS (Bridge) */
+void *rt_exception_create(const char *type, const char *message, const char *file, int line); /* returns handle */
+const char *rt_exception_type(void *exc_handle); /* NULL on error */
+const char *rt_exception_message(void *exc_handle); /* NULL on error */
+const char *rt_exception_description(void *exc_handle); /* NULL on error */
+const char *rt_exception_description_for_type(const char *type_name); /* NULL on error */
+int rt_exception_throw(void *exc_handle); /* marks as current thrown exception; returns 1 success */
+void *rt_exception_current(void); /* returns current thrown exception (handle) */
+int rt_exception_define(const char *type, const char *parent, const char *description); /* 1 success */
+int rt_exception_is_a(void *exc_handle, const char *type_name); /* inheritance test */
+char *rt_exception_stack_trace(void *exc_handle); /* dup of stack trace or empty string */
+void rt_exception_add_frame(void *exc_handle, const char *function, const char *file, int line); /* append frame */
+void rt_exception_clear_current(void);
+const char *rt_exception_file(void *exc_handle);
+int rt_exception_line(void *exc_handle);
+int rt_object_count_total(void);
+int rt_object_count_by_type(int type);
+
+/* TRY/CATCH helper (bridge oriented) */
+int rt_try_call(void *try_callable, void *catch_callable, void *finally_callable, bridge_value_t *result);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* OAK_RT_OBJECTS_H */

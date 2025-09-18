@@ -94,19 +94,32 @@ _kernel_oserror *module_command(const char *arg_string, int argc, int cmd_no, vo
     switch (cmd_no) {
     case 0: // *OakScrpt command
             if (argc == 0) {
+                // No parameters: nothing to do (could print help here)
                 return NULL;
             } else {
-                // Extract filename from arg_string
-                const char *filename = arg_string;
-                // Skip any leading spaces
-                while (*filename == ' ') filename++;
-                
+                // Extract first argument (control-terminated) and create a C string
+                const char *p = arg_string;
+                while (*p == ' ') p++; // skip leading spaces
+                const char *start = p;
+                while (*p && *p != ' ' && *p != '\r' && *p != '\n') p++;
+                int len = (int)(p - start);
+                if (len <= 0) {
+                    return make_error(0, "No filename provided");
+                }
+
+                if (len >= 256) {
+                    return make_error(0, "Filename too long");
+                }
+                char script_file[256];
+                strncpy(script_file, start, (size_t)len);
+                script_file[len] = '\0';
+
                 if (!workspace || !workspace->initialized) {
                     return make_error(0, "OakScript module not properly initialized");
                 }
-                
+
                 // Run the script
-                int result = run_script_file(filename);
+                int result = run_script_file(script_file);
                 if (result != 0) {
                     return make_error(result, "Script execution failed");
                 }

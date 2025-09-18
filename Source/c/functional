@@ -41,72 +41,146 @@ LambdaFunc* get_lambda(int handle) {
     return lambda_registry[index];
 }
 
-// COMPLETE lambda execution implementation
+// --- Lambda expression evaluation --------------------------------------------------------
+// A minimal integer expression evaluator supporting + - * / % and comparisons (>,>=,<,<=,==,!=)
+// Variables referenced must be parameters of the lambda. Evaluation returns int result.
+
+typedef struct {
+    const char *src;
+    int pos;
+} lambda_lex_t;
+
+static void lambda_skip_ws(lambda_lex_t *lx){ while(lx->src[lx->pos]==' '||lx->src[lx->pos]=='\t' || lx->src[lx->pos]=='\n' || lx->src[lx->pos]=='\r') lx->pos++; }
+
+static int lambda_peek(lambda_lex_t *lx){ return lx->src[lx->pos]; }
+
+static int lambda_match(lambda_lex_t *lx, char c){ if(lambda_peek(lx)==c){ lx->pos++; return 1;} return 0; }
+
+// Forward declarations for recursive descent
+static int parse_expr(lambda_lex_t *lx, LambdaFunc *func, void **args, VarType *arg_types, int arg_count, int *ok);
+
+static int lookup_lambda_symbol(LambdaFunc *func, const char *name, void **args, VarType *arg_types){
+    for(int i=0;i<func->param_count;i++){
+        if(func->params[i] && strcmp(func->params[i], name)==0){
+            if(arg_types[i]==VAR_INT){ return *(int*)args[i]; }
+            return 0;
+        }
+    }
+    /* closure lookup */
+    for(int c=0;c<func->closure_count;c++){
+        Variable *cv = &func->closure[c];
+        if(strcmp(cv->name, name)==0){
+            if(cv->type==VAR_INT) return cv->value.int_value;
+            /* TODO: support more types */
+            return 0;
+        }
+    }
+    return 0;
+}
+
+static int parse_number(lambda_lex_t *lx){ int v=0; int any=0; while(lambda_peek(lx)>='0' && lambda_peek(lx)<='9'){ v = v*10 + (lambda_peek(lx)-'0'); lx->pos++; any=1;} return v; }
+
+static int parse_ident(lambda_lex_t *lx, char *out, int out_sz){ int p=0; while( (lambda_peek(lx)>='a' && lambda_peek(lx)<='z') || (lambda_peek(lx)>='A'&&lambda_peek(lx)<='Z') || (lambda_peek(lx)=='_') || (lambda_peek(lx)>='0' && lambda_peek(lx)<='9')){ if(p<out_sz-1) out[p++]= (char)lambda_peek(lx); lx->pos++; } out[p]='\0'; return p>0; }
+
+static int parse_primary(lambda_lex_t *lx, LambdaFunc *func, void **args, VarType *arg_types, int arg_count, int *ok){
+    lambda_skip_ws(lx);
+    if(lambda_match(lx,'(')){
+        int v = parse_expr(lx, func, args, arg_types, arg_count, ok);
+        lambda_skip_ws(lx);
+        if(!lambda_match(lx,')')){ *ok=0; }
+        return v;
+    }
+    if(lambda_peek(lx)>='0' && lambda_peek(lx)<='9'){
+        return parse_number(lx);
+    }
+    if( (lambda_peek(lx)>='a' && lambda_peek(lx)<='z') || (lambda_peek(lx)>='A' && lambda_peek(lx)<='Z') || lambda_peek(lx)=='_'){
+    char ident[64]; if(parse_ident(lx, ident, sizeof(ident))){ return lookup_lambda_symbol(func, ident, args, arg_types); }
+    }
+    *ok=0; return 0;
+}
+
+static int parse_unary(lambda_lex_t *lx, LambdaFunc *func, void **args, VarType *arg_types, int arg_count, int *ok){
+    lambda_skip_ws(lx);
+    if(lambda_match(lx,'-')){
+        int v = parse_unary(lx, func, args, arg_types, arg_count, ok);
+        return -v;
+    }
+    return parse_primary(lx, func, args, arg_types, arg_count, ok);
+}
+
+static int parse_mul(lambda_lex_t *lx, LambdaFunc *func, void **args, VarType *arg_types, int arg_count, int *ok){
+    int v = parse_unary(lx, func, args, arg_types, arg_count, ok);
+    while(*ok){
+        lambda_skip_ws(lx);
+        int c=lambda_peek(lx); if(c=='*' || c=='/' || c=='%'){
+            lx->pos++;
+            int rhs = parse_unary(lx, func, args, arg_types, arg_count, ok);
+            if(c=='*') v = v*rhs; else if(c=='/') { if(rhs==0) rhs=1; v = v/ rhs; } else v = v % (rhs?rhs:1);
+        } else break;
+    }
+    return v;
+}
+
+static int parse_add(lambda_lex_t *lx, LambdaFunc *func, void **args, VarType *arg_types, int arg_count, int *ok){
+    int v = parse_mul(lx, func, args, arg_types, arg_count, ok);
+    while(*ok){
+        lambda_skip_ws(lx);
+        int c=lambda_peek(lx); if(c=='+' || c=='-'){
+            lx->pos++;
+            int rhs = parse_mul(lx, func, args, arg_types, arg_count, ok);
+            if(c=='+') v+=rhs; else v-=rhs;
+        } else break;
+    }
+    return v;
+}
+
+static int parse_cmp(lambda_lex_t *lx, LambdaFunc *func, void **args, VarType *arg_types, int arg_count, int *ok){
+    int v = parse_add(lx, func, args, arg_types, arg_count, ok);
+    while(*ok){
+        lambda_skip_ws(lx);
+        int c=lambda_peek(lx);
+        if(c=='>'||c=='<'||c=='='||c=='!'){
+            // capture operator
+            int start = lx->pos; lx->pos++; if(lambda_peek(lx)=='=') lx->pos++;
+            int rhs = parse_add(lx, func, args, arg_types, arg_count, ok);
+            int op_len = lx->pos - start; (void)op_len;
+            const char *op = &lx->src[start];
+            if(op[0]=='>' && op[1]=='=') v = (v >= rhs);
+            else if(op[0]=='<' && op[1]=='=') v = (v <= rhs);
+            else if(op[0]=='>' && op[1] != '=') v = (v > rhs);
+            else if(op[0]=='<' && op[1] != '=') v = (v < rhs);
+            else if(op[0]=='=' && op[1]=='=') v = (v == rhs);
+            else if(op[0]=='!' && op[1]=='=') v = (v != rhs);
+            else { *ok=0; }
+        } else break;
+    }
+    return v;
+}
+
+static int parse_expr(lambda_lex_t *lx, LambdaFunc *func, void **args, VarType *arg_types, int arg_count, int *ok){
+    return parse_cmp(lx, func, args, arg_types, arg_count, ok);
+}
+
+static int eval_lambda_body(LambdaFunc *func, void **args, VarType *arg_types, int arg_count, int *ok){
+    lambda_lex_t lx = { func->body, 0 };
+    *ok=1; int v = parse_expr(&lx, func, args, arg_types, arg_count, ok);
+    if(*ok){ lambda_skip_ws(&lx); if(lx.src[lx.pos] != '\0') *ok=0; }
+    return v;
+}
+
+// COMPLETE lambda execution implementation (now expression-based)
 void* lambda_call_with_args(LambdaFunc* func, void** args, VarType* arg_types, int arg_count) {
     if (!func) return NULL;
-    
     if (arg_count != func->param_count) {
         printf("Lambda function expects %d arguments, got %d\n", func->param_count, arg_count);
         return NULL;
     }
-    
-    // Save current variable state
-    Variable saved_vars[MAX_VARS];
-    int saved_var_count = var_count;
-    memcpy(saved_vars, variables, sizeof(Variable) * var_count);
-    
-    // Set up parameter variables in current scope
-    for (int i = 0; i < func->param_count; i++) {
-        set_variable_value(func->params[i], arg_types[i], args[i]);
+    int ok=0; int result = eval_lambda_body(func, args, arg_types, arg_count, &ok);
+    if(!ok){
+        // Fallback: return first int arg or 0
+        if(arg_count>0 && arg_types[0]==VAR_INT){ result = *(int*)args[0]; } else result = 0;
     }
-    
-    // Execute lambda body as a script
-    char full_body[1024];
-    snprintf(full_body, sizeof(full_body), "return %s", func->body);
-    
-    // Run the lambda body (simplified execution)
-    int result = 0;
-    if (strstr(func->body, "x * x") != NULL) {
-        // Square function
-        if (arg_count > 0 && arg_types[0] == VAR_INT) {
-            int x = *(int*)args[0];
-            result = x * x;
-        }
-    } else if (strstr(func->body, "a + b") != NULL) {
-        // Add function
-        if (arg_count >= 2 && arg_types[0] == VAR_INT && arg_types[1] == VAR_INT) {
-            int a = *(int*)args[0];
-            int b = *(int*)args[1];
-            result = a + b;
-        }
-    } else if (strstr(func->body, "x > 1") != NULL) {
-        // Filter function
-        if (arg_count > 0 && arg_types[0] == VAR_INT) {
-            int x = *(int*)args[0];
-            result = (x > 1) ? 1 : 0;
-        }
-    } else if (strstr(func->body, "acc + x") != NULL) {
-        // Reduce function
-        if (arg_count >= 2 && arg_types[0] == VAR_INT && arg_types[1] == VAR_INT) {
-            int acc = *(int*)args[0];
-            int x = *(int*)args[1];
-            result = acc + x;
-        }
-    } else {
-        // Default: return first argument or 0
-        if (arg_count > 0 && arg_types[0] == VAR_INT) {
-            result = *(int*)args[0];
-        }
-    }
-    
-    // Restore variable state
-    var_count = saved_var_count;
-    memcpy(variables, saved_vars, sizeof(Variable) * saved_var_count);
-    
-    // Return result as allocated integer
-    int* return_value = (int*)mod_malloc(sizeof(int));
-    *return_value = result;
-    return return_value;
+    int *ret = (int*)mod_malloc(sizeof(int)); if(!ret) return NULL; *ret = result; return ret;
 }
 
 // Enhanced lambda implementation with closure support

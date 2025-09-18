@@ -68,7 +68,7 @@ typedef enum {
     OP_SET_CONTAINS,    // Check set membership
     
     // Functional programming
-    OP_LAMBDA_CREATE,   // Create lambda function
+    OP_LAMBDA_CREATE,   // (Deprecated) legacy placeholder for lambda; use OP_CALL_BUILTIN "lambda"
     OP_LAMBDA_CALL,     // Call lambda function
     OP_MAP,             // Map operation
     OP_FILTER,          // Filter operation
@@ -98,6 +98,20 @@ typedef enum {
     
     OP_EXIT             // End program
 } opcode_t;
+
+/*
+ * OP_CALL_BUILTIN calling convention (updated for unified bridge model):
+ *   Encoding: [OP_CALL_BUILTIN][string_ref builtin_name][int arg_count]
+ *   Stack before execution: arg1, arg2, ..., argN  (pushed in left-to-right order)
+ *   Execution:
+ *     - VM pops N values into a temporary array preserving original order.
+ *     - Converts them to bridge_value_t and calls bridge_dispatch(builtin_name,...).
+ *     - On success: pushes exactly one result value (or a null placeholder if builtin returns void).
+ *     - On bridge error: creates/throws BuiltinError (current exception set) and pushes null (or implementation-defined) so control flow may continue if caught.
+ *   Notes:
+ *     - Adding a new builtin requires no opcode changes; only runtime bridge support + compiler name table entry.
+ *     - Some legacy specialized opcodes remain for performance (e.g., arithmetic, comparisons, LOAD/STORE); advanced features converge here.
+ */
 
 // Function prototypes
 extern int compile_script_to_bytecode(const char *source_file, const char *output_file);

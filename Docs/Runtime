@@ -484,6 +484,59 @@ Bytecode Validation:
 - Corrupted headers
 - Invalid jump targets
 
+RANDOM NUMBER GENERATION (DETERMINISTIC)
+---------------------------------------
+
+The runtime LCG provides deterministic 15-bit outputs (0..32767) via rand().
+
+Seeding Rules:
+- Default seed = 1.
+- Environment overrides (first match wins): OakScript$Seed, then OAKS_SEED.
+- srand(seed) explicitly sets the internal 32-bit state (zero allowed) without advancing it.
+- rand(lo, hi) returns inclusive range; parameters swapped if reversed.
+- rand_seed() (debug) exposes current internal state for tests.
+
+Determinism Guidance:
+- Use fixed seed (env or initial srand) for reproducible tests.
+- Verbose sampling utilities snapshot/restore state to avoid perturbing sequences.
+
+NUMERIC SEMANTICS & PARITY
+--------------------------
+
+Arithmetic Parity:
+- VM opcodes ADD/SUB/MUL/DIV operate on ints/floats; mixed types promote to float.
+- Division by zero triggers a runtime error; builtins divide()/mod() now mirror this (error instead of prior silent 0).
+- pow(base, exp) with negative exp returns 0 (int exponent policy) pending future float exponent support.
+- isqrt(n) returns 0 for n <= 0; clamp swaps bounds if lo > hi.
+
+Planned Improvements:
+- More specific BuiltinError messages (e.g., "division by zero").
+- Float exponent support for pow.
+- Configurable epsilon for float equality (currently 1e-6 absolute).
+
+MEMORY / OBJECT AUDIT FACILITIES
+--------------------------------
+
+Diagnostics Builtins:
+- debug_object_counts(): returns { total, type_#... } for non-zero categories.
+- debug_object_audit(): returns { total, bad, zero_ref, neg_ref, null_hdr } summarizing anomalies.
+
+Enumerator:
+- Internal rt_object_enumerate walks registry O(N); intended for debugging, not production hot paths.
+
+Usage Example:
+```
+let counts = debug_object_counts();
+print(counts.total);
+let audit = debug_object_audit();
+if (audit.bad > 0) { print("Potential leaks or ownership issues detected"); }
+```
+
+Future Audit Enhancements:
+- Allocation site tagging
+- Peak usage snapshots
+- Leak persistence tracking across runs
+
 CONCLUSION
 ----------
 

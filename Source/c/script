@@ -14,6 +14,8 @@
 #include "h.debug"
 #include "h.advanced"
 #include "h.value"
+#include "h.bridge"
+#include "h.rt_objects" /* for rt_exception_current and exception frame APIs */
 #ifndef __uintptr_t_defined
 typedef unsigned int uintptr_t;
 #define __uintptr_t_defined
@@ -60,10 +62,7 @@ extern int builtin_optional_has_value(void);
 extern int builtin_optional_get(void);
 extern int builtin_union_create(void);
 extern int builtin_union_set(void);
-extern int builtin_throw(void);
-extern int builtin_define_exception(void);
-extern int builtin_exception_type(void);
-extern int builtin_exception_message(void);
+/* Legacy exception builtins removed: now use bridge for all exception operations. */
 extern int builtin_range(void);
 
 // Forward declarations
@@ -111,6 +110,69 @@ void set_error(const char* message) {
         printf("Error: %s\n", message);
         exit(1);
     }
+}
+
+/* Removed unused parse_int_literal (was static and unused causing warning). */
+
+/* New bridge call returning a Value (expression-compatible) */
+static Value builtin_bridge_call(const char *name) {
+    bridge_value_t args_local[16]; int argc = 0; /* expanded capacity */
+    bridge_value_t result; bridge_value_init(&result);
+    /* Parse argument expressions: we evaluate each into a Value, then convert to bridge_value_t */
+    while (peek_token()->type != TOKEN_RPAREN && peek_token()->type != TOKEN_EOF) {
+        if (argc >= 16) { printf("Too many arguments to %s (max 16)\n", name); break; }
+        Value ev = value_expression(); /* recursively parse full expression */
+        if (ev.type == VALUE_ERROR) {
+            /* Map to runtime exception later: for now print and return error Value */
+            char *msg = value_to_string(&ev); printf("Bridge arg error: %s\n", msg); mod_free(msg); value_destroy(&ev); break; }
+        bridge_value_init(&args_local[argc]);
+        switch (ev.type) {
+            case VALUE_INT: args_local[argc].type = BRIDGE_VAL_INT; args_local[argc].data.i = ev.data.int_val; break;
+            case VALUE_FLOAT: args_local[argc].type = BRIDGE_VAL_FLOAT; args_local[argc].data.f = ev.data.float_val; break;
+            case VALUE_STRING: args_local[argc].type = BRIDGE_VAL_STRING; args_local[argc].data.s = mod_strdup(ev.data.string_val); args_local[argc].owns = 1; break;
+            case VALUE_NULL: args_local[argc].type = BRIDGE_VAL_NULL; break;
+            case VALUE_HANDLE: args_local[argc].type = BRIDGE_VAL_HANDLE; args_local[argc].data.handle = (void*)(uintptr_t)ev.data.int_val; break;
+            default: /* fallback convert to string */ {
+                char *s = value_to_string(&ev); args_local[argc].type = BRIDGE_VAL_STRING; args_local[argc].data.s = s; args_local[argc].owns=1; }
+        }
+        value_destroy(&ev);
+        argc++;
+        if (peek_token()->type == TOKEN_COMMA) { next_token(); }
+    }
+    if (peek_token()->type == TOKEN_RPAREN) next_token(); else { printf("Expected ')' to close call to %s\n", name); }
+    int status = bridge_dispatch(name, argc, args_local, &result);
+    for (int i=0;i<argc;i++) bridge_value_free(&args_local[i]);
+    if (status != BRIDGE_OK) {
+        /* Automatic BuiltinError creation via exception registry if defined.
+           Duplicate strings to avoid qualifier-loss casts and ensure uniform ownership. */
+        bridge_value_t eargs[3]; for(int i=0;i<3;i++) bridge_value_init(&eargs[i]); bridge_value_t eres; bridge_value_init(&eres);
+        eargs[0].type = BRIDGE_VAL_STRING; eargs[0].data.s = mod_strdup("BuiltinError"); eargs[0].owns = 1;
+        eargs[1].type = BRIDGE_VAL_STRING; eargs[1].data.s = mod_strdup(name); eargs[1].owns = 1;
+        eargs[2].type = BRIDGE_VAL_STRING; eargs[2].data.s = mod_strdup("bridge call failed"); eargs[2].owns = 1;
+        if (bridge_dispatch("create_exception", 3, eargs, &eres) == BRIDGE_OK) {
+            if (eres.type == BRIDGE_VAL_HANDLE) {
+                bridge_value_t throw_res; bridge_value_init(&throw_res);
+                bridge_value_t targs[1]; bridge_value_init(&targs[0]); targs[0].type=BRIDGE_VAL_HANDLE; targs[0].data.handle = eres.data.handle;
+                bridge_dispatch("throw",1,targs,&throw_res);
+                bridge_value_free(&throw_res);
+            }
+            bridge_value_free(&eres);
+        }
+        for(int i=0;i<3;i++) bridge_value_free(&eargs[i]);
+        return value_error("bridge call failed");
+    }
+    /* Convert bridge result to Value */
+    Value outv = value_null();
+    switch (result.type) {
+        case BRIDGE_VAL_INT: outv = value_int(result.data.i); break;
+        case BRIDGE_VAL_FLOAT: outv = value_float(result.data.f); break;
+        case BRIDGE_VAL_STRING: outv = value_string(result.data.s ? result.data.s : ""); break;
+        case BRIDGE_VAL_NULL: outv = value_null(); break;
+        case BRIDGE_VAL_HANDLE: outv = value_handle((int)(uintptr_t)result.data.handle); break;
+        default: outv = value_null(); break;
+    }
+    bridge_value_free(&result);
+    return outv;
 }
 
 void print_tokens(void) {
@@ -302,9 +364,10 @@ void tokenize_with_includes(char *source, const char *source_filename) {
                 p++;
                 while ((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F')) {
                     int d = 0;
-                    if (*p >= '0' && *p <= '9') d = *p - '0';
-                    else if (*p >= 'a' && *p <= 'f') d = 10 + (*p - 'a');
-                    else d = 10 + (*p - 'A');
+                    unsigned char ch = (unsigned char)*p;
+                    if (ch >= '0' && ch <= '9') d = (int)(ch - '0');
+                    else if (ch >= 'a' && ch <= 'f') d = 10 + (int)(ch - 'a');
+                    else d = 10 + (int)(ch - 'A');
                     value = (value << 4) + d;
                     if (li < (int)sizeof(lexbuf) - 1) lexbuf[li++] = *p;
                     p++;
@@ -316,9 +379,10 @@ void tokenize_with_includes(char *source, const char *source_filename) {
                 p++;
                 while ((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F')) {
                     int d = 0;
-                    if (*p >= '0' && *p <= '9') d = *p - '0';
-                    else if (*p >= 'a' && *p <= 'f') d = 10 + (*p - 'a');
-                    else d = 10 + (*p - 'A');
+                    unsigned char ch2 = (unsigned char)*p;
+                    if (ch2 >= '0' && ch2 <= '9') d = (int)(ch2 - '0');
+                    else if (ch2 >= 'a' && ch2 <= 'f') d = 10 + (int)(ch2 - 'a');
+                    else d = 10 + (int)(ch2 - 'A');
                     value = (value << 4) + d;
                     if (li < (int)sizeof(lexbuf) - 1) lexbuf[li++] = *p;
                     p++;
@@ -327,7 +391,9 @@ void tokenize_with_includes(char *source, const char *source_filename) {
             } else {
                 // Parse integer part (decimal)
                 while (ascii_isdigit(*p)) {
-                    value = value * 10 + (*p - '0');
+                    int digit = (int)(unsigned char)(*p) - 48; /* '0' */
+                    if (digit < 0) digit = 0; if (digit > 9) digit = 9; /* clamp just in case */
+                    value = value * 10 + digit;
                     if (li < (int)sizeof(lexbuf) - 1) lexbuf[li++] = *p;
                     p++;
                 }
@@ -342,7 +408,7 @@ void tokenize_with_includes(char *source, const char *source_filename) {
                 
                 // Parse fractional part
                 while (ascii_isdigit(*p)) {
-                    float_value += (float)(*p - '0') * decimal_place;
+                    float_value += (float)((unsigned char)*p - '0') * decimal_place;
                     decimal_place *= 0.1f;
                     if (li < (int)sizeof(lexbuf) - 1) lexbuf[li++] = *p;
                     p++;
@@ -848,7 +914,7 @@ int factor(void) {
         
         // Count elements first
         int element_count = 0;
-        int saved_token = current_token;
+        int saved_token = current_token; /* save tokenizer position for second pass */
         
         while (peek_token()->type != TOKEN_RBRACKET && peek_token()->type != TOKEN_EOF) {
             expression(); // Parse but don't use the value
@@ -861,8 +927,8 @@ int factor(void) {
             }
         }
         
-        // Reset to parse again and store values
-        current_token = saved_token;
+    // Reset to parse again and store values
+    current_token = saved_token;
         
         // Create the array variable
         create_array_variable(array_name, element_count);
@@ -1932,19 +1998,24 @@ int function_call(char *name) {
             if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after union_set\n"); exit(1); }
             return builtin_union_set();
             
-        // Exception Handling Functions
-        } else if (mod_strcmp(name, "throw") == 0) {
-            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after throw\n"); exit(1); }
-            return builtin_throw();
-        } else if (mod_strcmp(name, "define_exception") == 0) {
-            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after define_exception\n"); exit(1); }
-            return builtin_define_exception();
-        } else if (mod_strcmp(name, "exception_type") == 0) {
-            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after exception_type\n"); exit(1); }
-            return builtin_exception_type();
-        } else if (mod_strcmp(name, "exception_message") == 0) {
-            if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after exception_message\n"); exit(1); }
-            return builtin_exception_message();
+        // Exception Handling Functions now routed via bridge dispatcher
+        } else if (mod_strcmp(name, "throw") == 0 ||
+                   mod_strcmp(name, "define_exception") == 0 ||
+                   mod_strcmp(name, "exception_type") == 0 ||
+                   mod_strcmp(name, "exception_message") == 0 ||
+                   mod_strcmp(name, "exception_is_a") == 0 ||
+                   mod_strcmp(name, "exception_stack_trace") == 0 ||
+                   mod_strcmp(name, "create_exception") == 0 ||
+                   mod_strcmp(name, "current_exception") == 0 ||
+             mod_strcmp(name, "try_call") == 0) {
+         if (next_token()->type != TOKEN_LPAREN) { printf("Expected '(' after %s\n", name); exit(1); }
+         Value bv = builtin_bridge_call(name);
+         if (bv.type == VALUE_ERROR) { char *msg = value_to_string(&bv); printf("Bridge error: %s\n", msg); mod_free(msg); value_destroy(&bv); return 0; }
+         int iv = 0;
+         if (bv.type == VALUE_INT) iv = bv.data.int_val;
+         else if (bv.type == VALUE_HANDLE) iv = bv.data.int_val; /* pass through */
+         value_destroy(&bv);
+         return iv;
             
         // Control Flow Functions
         } else if (mod_strcmp(name, "range") == 0) {
@@ -1955,6 +2026,7 @@ int function_call(char *name) {
         printf("Undefined function: %s\n", name);
         exit(1);
     }
+    /* Future: when executing user-defined function body we could wrap calls and push stack trace frames using exception_add_frame. */
     
     Function *func = &functions[func_index];
     
@@ -1992,6 +2064,23 @@ int function_call(char *name) {
     is_executing_function = true;
     function_return_flag = false;
     function_return_value = 0;
+
+    /* Automatic frame injection for diagnostics: always add a frame referencing this function. */
+    {
+        bridge_value_t bargs[4]; bridge_value_t bres; bridge_value_init(&bres);
+        for(int i=0;i<4;i++) bridge_value_init(&bargs[i]);
+        bargs[0].type = BRIDGE_VAL_HANDLE; /* current exception if any */
+        void *curr_exc = rt_exception_current();
+        if (curr_exc) bargs[0].data.handle = curr_exc; else bargs[0].type = BRIDGE_VAL_NULL;
+        bargs[1].type = BRIDGE_VAL_STRING; bargs[1].data.s = functions[func_index].name; bargs[1].owns = 0;
+        bargs[2].type = BRIDGE_VAL_STRING; bargs[2].data.s = "<script>"; bargs[2].owns = 0; /* TODO: real file */
+        bargs[3].type = BRIDGE_VAL_INT; bargs[3].data.i = 0; /* line not tracked here */
+        /* Only call if we have an exception to augment */
+        if (curr_exc) {
+            bridge_dispatch("exception_add_frame", 4, bargs, &bres);
+            bridge_value_free(&bres);
+        }
+    }
 
     current_token = func->body_start;
     while (current_token < func->body_end && !function_return_flag) {
@@ -3497,7 +3586,7 @@ static void for_statement(void) {
         
         // Check if this is a range (next token is an expression followed by ..)
         // or a collection (next token is an identifier/expression that's a handle)
-        int saved_token = current_token;
+    /* removed unused saved_token (not required for collection/range differentiation) */
         int first_expr = expression();
         
         if (peek_token()->type == TOKEN_RANGE) {

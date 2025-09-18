@@ -8,12 +8,40 @@
 #include "h.engine"
 #include "h.memory"
 
+/* Debug line map scratch (not thread-safe; single compilation at a time). */
+static void *g_last_line_map_entries = NULL; static int g_last_line_map_count = 0; static int g_last_line_map_stride = 0;
+void oaks_set_last_line_map(void *entries, int count, int stride) { g_last_line_map_entries = entries; g_last_line_map_count = count; g_last_line_map_stride = stride; }
+
+/* Unified builtin name table for bridge-dispatched features (generated via X-macro list). */
+#define OAK_BUILTIN(name) #name,
+static const char *g_builtin_names[] = {
+#include "h.builtins"
+};
+#undef OAK_BUILTIN
+static int g_builtin_name_count = 0; /* will be computed at startup */
+
+/* Precompute builtin count (avoids relying on header changes requiring recompile order) */
+static void init_builtin_table_once(void) {
+    if (g_builtin_name_count) return;
+    int c = 0; while (g_builtin_names[c]) { c++; }
+    g_builtin_name_count = c;
+}
+
+static int is_unified_builtin(const char *name) {
+    init_builtin_table_once();
+    for (int i=0;i<g_builtin_name_count;i++) {
+        if (mod_strcmp(g_builtin_names[i], name)==0) return 1;
+    }
+    return 0;
+}
+
 /* Simple tokenizer for bytecode compilation */
 typedef struct {
     const char *source;
     int pos;
     int length;
 } simple_tokenizer_t;
+
 
 /* Error reporting helpers */
 static int g_last_error_line = -1;
@@ -146,6 +174,27 @@ typedef struct {
     int data_capacity;
     int data_size;
 } bytecode_buffer_t;
+
+/* Forward parser prototypes (moved here after bytecode_buffer_t definition) */
+static int match_keyword(simple_tokenizer_t *tok, const char *kw);
+static int parse_expression(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
+static int parse_logical_or(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
+static int parse_comparison(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
+static int parse_term(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
+static int parse_factor(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
+static int parse_unary(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
+static int parse_primary(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
+static int parse_function_call(simple_tokenizer_t *tok, bytecode_buffer_t *buf, const char *func_name);
+static int parse_assignment(simple_tokenizer_t *tok, bytecode_buffer_t *buf, const char *var_name);
+static int parse_function_definition(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
+static int parse_if_statement(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
+static int parse_while_statement(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
+static int parse_for_statement(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
+static int parse_switch_statement(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
+static int parse_return_statement(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
+static int parse_break_continue(simple_tokenizer_t *tok, bytecode_buffer_t *buf, const char *keyword);
+static int parse_block(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
+static int parse_statement(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
 
 /* Simple function table for user-defined functions */
 #define COMP_MAX_FUNCTIONS 64
@@ -395,70 +444,32 @@ static float parse_float_literal(simple_tokenizer_t *tok)
 /* Forward declarations for recursive descent parser */
 static int parse_expression(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
 static int parse_logical_or(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
-static int parse_logical_and(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
-static int parse_equality(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
-static int parse_comparison(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
-static int parse_term(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
-static int parse_factor(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
-static int parse_unary(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
-static int parse_primary(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
-static int parse_function_call(simple_tokenizer_t *tok, bytecode_buffer_t *buf, const char *func_name);
-static int parse_lambda_expression(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
 
-/* Parse expression with proper precedence: logical_or */
-static int parse_expression(simple_tokenizer_t *tok, bytecode_buffer_t *buf) {
-    return parse_logical_or(tok, buf);
-}
+/* Expression grammar (precedence descending):
+   logical_or -> comparison ( ( '==' | '!=' ) comparison )*
+   comparison -> term ( ( '<' | '<=' | '>' | '>=' ) term )*
+   term       -> factor ( ( '+' | '-' ) factor )*
+   factor     -> unary ( ( '*' | '/' | '%' ) unary )*
+   unary      -> ( '!' | '-' ) unary | primary
+   primary    -> number | string | identifier | '(' expression ')' | function_call | lambda_expression
+ */
 
-/* Parse logical OR expressions */
-static int parse_logical_or(simple_tokenizer_t *tok, bytecode_buffer_t *buf) {
-    if (parse_logical_and(tok, buf) < 0) return -1;
-    
-    while (tok->pos + 1 < tok->length && 
-           tok->source[tok->pos] == '|' && tok->source[tok->pos + 1] == '|') {
-        tok->pos += 2;
-        skip_whitespace(tok);
-        if (parse_logical_and(tok, buf) < 0) return -1;
-        if (emit_opcode(buf, OP_OR) < 0) return -1;
-    }
-    return 0;
-}
+static int parse_expression(simple_tokenizer_t *tok, bytecode_buffer_t *buf) { return parse_logical_or(tok, buf); }
 
-/* Parse logical AND expressions */
-static int parse_logical_and(simple_tokenizer_t *tok, bytecode_buffer_t *buf) {
-    if (parse_equality(tok, buf) < 0) return -1;
-    
-    while (tok->pos + 1 < tok->length && 
-           tok->source[tok->pos] == '&' && tok->source[tok->pos + 1] == '&') {
-        tok->pos += 2;
-        skip_whitespace(tok);
-        if (parse_equality(tok, buf) < 0) return -1;
-        if (emit_opcode(buf, OP_AND) < 0) return -1;
-    }
-    return 0;
-}
-
-/* Parse equality expressions (== !=) */
-static int parse_equality(simple_tokenizer_t *tok, bytecode_buffer_t *buf) {
+/* Parse equality chain (==, !=) atop comparison */
+static int parse_logical_or(simple_tokenizer_t *tok, bytecode_buffer_t *buf)
+{
     if (parse_comparison(tok, buf) < 0) return -1;
-    
     while (tok->pos + 1 < tok->length) {
         char op1 = tok->source[tok->pos];
         char op2 = tok->source[tok->pos + 1];
-        
         if ((op1 == '=' && op2 == '=') || (op1 == '!' && op2 == '=')) {
             tok->pos += 2;
             skip_whitespace(tok);
             if (parse_comparison(tok, buf) < 0) return -1;
-            
-            if (op1 == '=' && op2 == '=') {
-                if (emit_opcode(buf, OP_CMP_EQ) < 0) return -1;
-            } else {
-                if (emit_opcode(buf, OP_CMP_NE) < 0) return -1;
-            }
-        } else {
-            break;
-        }
+            if (op1 == '=' && op2 == '=') { if (emit_opcode(buf, OP_CMP_EQ) < 0) return -1; }
+            else { if (emit_opcode(buf, OP_CMP_NE) < 0) return -1; }
+        } else break;
     }
     return 0;
 }
@@ -654,9 +665,7 @@ static int parse_primary(simple_tokenizer_t *tok, bytecode_buffer_t *buf) {
         skip_whitespace(tok);
         
         // Lambda expression
-        if (mod_strcmp(var_name, "lambda") == 0) {
-            return parse_lambda_expression(tok, buf);
-        }
+        // 'lambda' no longer has a special parser; falls through to generic function call handling
         
         // Check for function call
         if (tok->pos < tok->length && tok->source[tok->pos] == '(') {
@@ -673,12 +682,35 @@ static int parse_primary(simple_tokenizer_t *tok, bytecode_buffer_t *buf) {
     return report_error(tok, "Unexpected character '%c' in expression", c);
 }
 
+/* Match a specific keyword at current tokenizer position (not followed by ident char) */
+static int match_keyword(simple_tokenizer_t *tok, const char *kw) {
+    int klen = (int)mod_strlen(kw);
+    if (tok->pos + klen > tok->length) return 0;
+    if (mod_strncmp(tok->source + tok->pos, kw, (size_t)klen) != 0) return 0;
+    char next = tok->pos + klen < tok->length ? tok->source[tok->pos + klen] : '\0';
+    if ((next >= 'a' && next <= 'z') || (next >= 'A' && next <= 'Z') || (next >= '0' && next <= '9') || next=='_') return 0; /* ensure whole word */
+    return 1;
+}
+
+/* Parse a block: '{' ... '}' containing zero or more statements */
+static int parse_block(simple_tokenizer_t *tok, bytecode_buffer_t *buf) {
+    if (tok->pos >= tok->length || tok->source[tok->pos] != '{') return report_error(tok, "Expected '{' to start block");
+    tok->pos++; // consume '{'
+    skip_whitespace(tok);
+    while (tok->pos < tok->length && tok->source[tok->pos] != '}') {
+        if (parse_statement(tok, buf) < 0) return -1;
+        skip_whitespace(tok);
+    }
+    if (tok->pos >= tok->length || tok->source[tok->pos] != '}') return report_error(tok, "Unterminated block, expected '}'");
+    tok->pos++; // consume '}'
+    return 0;
+}
+
 /* Parse function call with arguments */
 static int parse_function_call(simple_tokenizer_t *tok, bytecode_buffer_t *buf, const char *func_name) {
     if (tok->pos >= tok->length || tok->source[tok->pos] != '(') {
         return report_error(tok, "Expected '(' for function call");
     }
-    
     tok->pos++; // consume '('
     skip_whitespace(tok);
     
@@ -705,9 +737,17 @@ static int parse_function_call(simple_tokenizer_t *tok, bytecode_buffer_t *buf, 
     }
     tok->pos++; // consume ')'
     
-    // Check if it's a user-defined function
-    int fi = find_function_index(func_name);
-    if (fi >= 0) {
+    // Unified builtin path first (bridge-dispatched names always go via OP_CALL_BUILTIN)
+    if (is_unified_builtin(func_name)) {
+        if (emit_opcode(buf, OP_CALL_BUILTIN) < 0 ||
+            emit_string_ref(buf, func_name) < 0 ||
+            emit_int(buf, arg_count) < 0) {
+            return report_error(tok, "Failed to emit unified builtin call");
+        }
+    } else {
+        // Check if it's a user-defined function
+        int fi = find_function_index(func_name);
+        if (fi >= 0) {
         // User-defined function
         if (emit_opcode(buf, OP_CALL_USER) < 0) return -1;
         
@@ -729,109 +769,23 @@ static int parse_function_call(simple_tokenizer_t *tok, bytecode_buffer_t *buf, 
                 return report_error(tok, "Too many pending function calls");
             }
         }
-    } else {
-        // Built-in function
-        if (emit_opcode(buf, OP_CALL_BUILTIN) < 0 || 
-            emit_string_ref(buf, func_name) < 0 || 
-            emit_int(buf, arg_count) < 0) {
-            return report_error(tok, "Failed to emit built-in function call");
+        } else {
+            // Fallback: treat as builtin (legacy path) so older builtins still work
+            if (emit_opcode(buf, OP_CALL_BUILTIN) < 0 ||
+                emit_string_ref(buf, func_name) < 0 ||
+                emit_int(buf, arg_count) < 0) {
+                return report_error(tok, "Failed to emit built-in function call");
+            }
         }
     }
     
     return 0;
 }
 
-/* Parse lambda expression: lambda(params) => body */
-static int parse_lambda_expression(simple_tokenizer_t *tok, bytecode_buffer_t *buf) {
-    if (tok->pos >= tok->length || tok->source[tok->pos] != '(') {
-        return report_error(tok, "Expected '(' after lambda");
-    }
-    
-    tok->pos++; // consume '('
-    skip_whitespace(tok);
-    
-    // Skip parameters for now (simplified implementation)
-    int paren_depth = 1;
-    while (tok->pos < tok->length && paren_depth > 0) {
-        char c = tok->source[tok->pos++];
-        if (c == '(') paren_depth++;
-        else if (c == ')') paren_depth--;
-    }
-    
-    skip_whitespace(tok);
-    if (tok->pos + 1 >= tok->length || 
-        tok->source[tok->pos] != '=' || tok->source[tok->pos + 1] != '>') {
-        return report_error(tok, "Expected '=>' after lambda parameters");
-    }
-    
-    tok->pos += 2; // consume '=>'
-    skip_whitespace(tok);
-    
-    // For now, emit a placeholder lambda object
-    if (emit_opcode(buf, OP_LAMBDA_CREATE) < 0 || emit_int(buf, 0) < 0) {
-        return report_error(tok, "Failed to emit lambda creation");
-    }
-    
-    // Skip lambda body (simplified for now)
-    while (tok->pos < tok->length) {
-        char c = tok->source[tok->pos];
-        if (c == '\n' || c == ',' || c == ')' || c == '}' || c == ';') break;
-        tok->pos++;
-    }
-    
-    return 0;
-}
-
-/* Forward declarations for statement parsing */
-static int parse_statement(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
-static int parse_assignment(simple_tokenizer_t *tok, bytecode_buffer_t *buf, const char *var_name);
-static int parse_function_definition(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
-static int parse_if_statement(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
-static int parse_while_statement(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
-static int parse_for_statement(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
-static int parse_switch_statement(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
-static int parse_return_statement(simple_tokenizer_t *tok, bytecode_buffer_t *buf);
-static int parse_break_continue(simple_tokenizer_t *tok, bytecode_buffer_t *buf, const char *keyword);
-
-/* Helper to match exact keyword */
-static int match_keyword(simple_tokenizer_t *tok, const char *keyword) {
-    int len = mod_strlen(keyword);
-    if (tok->pos + len <= tok->length && 
-        mod_strncmp(tok->source + tok->pos, keyword, len) == 0) {
-        // Check that next character is not alphanumeric (proper word boundary)
-        if (tok->pos + len < tok->length && is_identifier_char(tok->source[tok->pos + len])) {
-            return 0;
-        }
-        return 1;
-    }
-    return 0;
-}
-
-/* Parse a block of statements enclosed in braces */
-static int parse_block(simple_tokenizer_t *tok, bytecode_buffer_t *buf) {
-    if (tok->pos >= tok->length || tok->source[tok->pos] != '{') {
-        return report_error(tok, "Expected '{' to start block");
-    }
-    
-    tok->pos++; // consume '{'
-    skip_whitespace(tok);
-    
-    while (tok->pos < tok->length && tok->source[tok->pos] != '}') {
-        if (parse_statement(tok, buf) < 0) return -1;
-        skip_whitespace(tok);
-    }
-    
-    if (tok->pos >= tok->length || tok->source[tok->pos] != '}') {
-        return report_error(tok, "Expected '}' to end block");
-    }
-    
-    tok->pos++; // consume '}'
-    return 0;
-}
-
-/* Parse a single statement */
+/* Parse a single statement (dispatcher) */
 static int parse_statement(simple_tokenizer_t *tok, bytecode_buffer_t *buf) {
-    skip_whitespace(tok);
+/* Forward declarations for statement parsing */
+/* 'lambda' literal handled through unified builtin path earlier (no special literal syntax retained). */
     if (tok->pos >= tok->length) return 0;
     
     // Check for keywords
@@ -868,7 +822,7 @@ static int parse_statement(simple_tokenizer_t *tok, bytecode_buffer_t *buf) {
         
         // Reset and parse as expression statement
         tok->pos = start_pos;
-        if (parse_expression(tok, buf) < 0) return -1;
+    if (parse_expression(tok, buf) < 0) return -1;
         
         // Emit POP to discard expression result
         if (emit_opcode(buf, OP_POP) < 0) return -1;
@@ -1653,11 +1607,38 @@ static int compile_to_bytecode(const char *source, bytecode_buffer_t *buf)
     }
     
     printf("Compiling OakScript to bytecode...\n");
+
+    /* Debug line mapping: collect (code_offset,line_number,col,start-end,snippet)
+       Backward compatible: writer detects stride to decide if columns are present. */
+    typedef struct { int offset; int line; int col; int end_col; char snippet[64]; } line_map_entry_t;
+    line_map_entry_t *line_map = NULL; int line_map_cap = 0; int line_map_count = 0;
+    #define ADD_LINE_MAP(lineno, off, srcptr) do { \
+        if (line_map_count + 1 > line_map_cap) { int nc = line_map_cap? line_map_cap*2:128; \
+            line_map_entry_t *tmp = (line_map_entry_t*)mod_realloc(line_map, (size_t)nc * sizeof(line_map_entry_t)); \
+            if (tmp) { line_map = tmp; line_map_cap = nc; } } \
+        if (line_map_count < line_map_cap) { \
+            line_map[line_map_count].offset = (off); line_map[line_map_count].line = (lineno); \
+            /* derive column by recomputing from start of source */ \
+            int _l=0,_c=0,_ll=0; const char *_ls=NULL; \
+            compute_location(source, (int)((srcptr) - source), &_l, &_c, &_ls, &_ll); \
+            line_map[line_map_count].col = _c; \
+            int cp=0; const char *sp=(srcptr); while (sp && *sp && *sp!='\n' && cp<63) { line_map[line_map_count].snippet[cp++]=*sp++; } \
+            line_map[line_map_count].snippet[cp]='\0'; \
+            line_map[line_map_count].end_col = line_map[line_map_count].col + (cp?cp-1:0); \
+            line_map_count++; } } while(0)
+
+    int last_recorded_line = -1;
     
     while (tok.pos < tok.length) {
         maybe_print_progress(&tok);
         skip_whitespace(&tok);
         if (tok.pos >= tok.length) break;
+        /* simple_tokenizer_t has no persistent line field; derive it on-demand */
+        {
+            int _cl=0,_cc=0,_llen=0; const char *_ls=NULL; 
+            compute_location(tok.source, tok.pos, &_cl, &_cc, &_ls, &_llen);
+            if (_cl != last_recorded_line) { ADD_LINE_MAP(_cl, buf->size, tok.source + tok.pos); last_recorded_line = _cl; }
+        }
 
         // Function definition: function name(param1, param2, ...)
         if (mod_strncmp(tok.source + tok.pos, "function", 8) == 0 &&
@@ -2658,6 +2639,10 @@ static int compile_to_bytecode(const char *source, bytecode_buffer_t *buf)
     // Emit exit instruction
     emit_opcode(buf, OP_EXIT);
 
+    /* Persist mapping via global scratch (inelegant but avoids header changes). We'll serialize in outer wrapper. */
+    extern void oaks_set_last_line_map(void *entries, int count, int stride);
+    oaks_set_last_line_map(line_map, line_map_count, sizeof(line_map_entry_t));
+
     printf("Generated %d bytes of bytecode, %d bytes of data\n", buf->size, buf->data_size);
     return 0;
 }
@@ -2808,5 +2793,81 @@ int compile_script_to_bytecode(const char *source_file, const char *output_file)
     
     printf("Successfully compiled to bytecode file '%s'\n", output_file);
     printf("File type set to &EEF (OakScript Bytecode)\n");
+
+    /* Emit optional debug sidecar if line map present */
+    if (g_last_line_map_entries && g_last_line_map_count > 0) {
+        char dbg_name[260];
+        int olen = (int)mod_strlen(output_file);
+        if (olen > 240) olen = 240; /* safety */
+        mod_strncpy(dbg_name, output_file, olen); dbg_name[olen] = '\0';
+        /* Remove any extension and append debug map suffix without extension */
+        char *dot = mod_strchr(dbg_name, '.');
+        if (dot) *dot = '\0';
+        mod_strcat(dbg_name, "dbg");
+        FILE *dbg = fopen(dbg_name, "w");
+        if (dbg) {
+            /* Determine if columns are present by stride (legacy stride=4+4+64=72) */
+            int legacy_stride = 4 + 4 + 64;
+            int has_cols = (g_last_line_map_stride > legacy_stride);
+            if (has_cols) {
+                fprintf(dbg, "# OakScript debug line map v2\n# offset\tline\tcol\tend_col\tsnippet\n");
+                unsigned char *p = (unsigned char*)g_last_line_map_entries;
+                for (int i=0;i<g_last_line_map_count;i++) {
+                    int off = *(int*)(p + i * g_last_line_map_stride + 0);
+                    int line = *(int*)(p + i * g_last_line_map_stride + 4);
+                    int col = *(int*)(p + i * g_last_line_map_stride + 8);
+                    int end_col = *(int*)(p + i * g_last_line_map_stride + 12);
+                    const char *snip = (const char*)(p + i * g_last_line_map_stride + 16);
+                    fprintf(dbg, "%d\t%d\t%d\t%d\t%s\n", off, line, col, end_col, snip);
+                }
+            } else {
+                fprintf(dbg, "# OakScript debug line map\n# offset\tline\tsnippet\n");
+                unsigned char *p = (unsigned char*)g_last_line_map_entries;
+                for (int i=0;i<g_last_line_map_count;i++) {
+                    int off = *(int*)(p + i * g_last_line_map_stride + 0);
+                    int line = *(int*)(p + i * g_last_line_map_stride + 4);
+                    const char *snip = (const char*)(p + i * g_last_line_map_stride + 8);
+                    fprintf(dbg, "%d\t%d\t%s\n", off, line, snip);
+                }
+            }
+            fclose(dbg);
+            /* Set debug map file type to &EEA */
+            _swix(OS_File, _INR(0,2), 18, dbg_name, 0xEEA);
+            printf("Wrote debug map '%s' (%d entries)\n", dbg_name, g_last_line_map_count);
+        } else {
+            printf("Warning: Could not write debug map '%s'\n", dbg_name);
+        }
+        /* Free the temporary map memory */
+        mod_free(g_last_line_map_entries); g_last_line_map_entries = NULL; g_last_line_map_count = 0; g_last_line_map_stride = 0;
+    }
+
+    /* Emit function symbol table sidecar for runtime stack traces */
+    if (comp_function_count > 0) {
+        char sym_name[260];
+        int olen = (int)mod_strlen(output_file); if (olen > 240) olen = 240;
+        mod_strncpy(sym_name, output_file, olen); sym_name[olen]='\0';
+        /* Remove any extension and append symbol map suffix without extension */
+        char *dot = mod_strchr(sym_name, '.');
+        if (dot) *dot = '\0';
+        mod_strcat(sym_name, "sym");
+        FILE *sym = fopen(sym_name, "w");
+        if (sym) {
+            fprintf(sym, "# OakScript function symbols\n# start\tend\tparams\tname\tparam_list\n");
+            for (int i=0;i<comp_function_count;i++) {
+                if (!comp_function_table[i].is_used || comp_function_table[i].start_addr < 0) continue;
+                fprintf(sym, "%d\t%d\t%d\t%s\t", comp_function_table[i].start_addr, comp_function_table[i].end_addr, comp_function_table[i].param_count, comp_function_table[i].name);
+                for (int p=0;p<comp_function_table[i].param_count;p++) {
+                    fprintf(sym, "%s%s", comp_function_table[i].params[p], (p+1<comp_function_table[i].param_count)?",":"");
+                }
+                fprintf(sym, "\n");
+            }
+            fclose(sym);
+            /* Set symbol table file type to &EEB */
+            _swix(OS_File, _INR(0,2), 18, sym_name, 0xEEB);
+            printf("Wrote symbol table '%s'\n", sym_name);
+        } else {
+            printf("Warning: Could not write symbol table '%s'\n", sym_name);
+        }
+    }
     return 0;
 }

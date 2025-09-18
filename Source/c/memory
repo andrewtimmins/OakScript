@@ -1,6 +1,7 @@
 // Dynamic area-backed heap
 #include <stddef.h>
 #include <string.h>
+#include <stdarg.h>
 #include "kernel.h"
 #include "swis.h"
 #include "h.memory"
@@ -258,6 +259,30 @@ char *mod_strstr(const char *haystack, const char *needle) {
     return NULL;
 }
 
+/* Minimal formatting function: supports %s %d %i %u %x %X %c and %% .
+ * This avoids dependency on stdlib snprintf for Norcroft. */
+int mod_snprintf(char *str, size_t size, const char *format, ...) {
+    if(!str || size==0){ return 0; }
+    if(!format){ str[0]='\0'; return 0; }
+    size_t idx=0; int written=0; va_list ap; va_start(ap, format);
+    for(const char *p=format; *p && idx+1 < size; ++p){
+        if(*p!='%'){ str[idx++] = *p; written++; continue; }
+        ++p; if(!*p) break; /* trailing % */
+        if(*p=='%'){ str[idx++]='%'; written++; continue; }
+        switch(*p){
+            case 's': { const char *s = va_arg(ap,const char*); if(!s) s="(null)"; while(*s && idx+1<size){ str[idx++]=*s++; written++; } break; }
+            case 'd': case 'i': { int v=va_arg(ap,int); unsigned int uv = (v<0)? (unsigned int)(-v):(unsigned int)v; char tmp[32]; int ti=0; do { tmp[ti++] = (char)('0'+(uv%10)); uv/=10; } while(uv && ti<(int)sizeof(tmp)); if(v<0 && ti<(int)sizeof(tmp)) tmp[ti++]='-'; int copy=ti; while(ti>0 && idx+1<size) str[idx++]=tmp[--ti]; written+=copy; break; }
+            case 'u': { unsigned int uv=va_arg(ap,unsigned int); char tmp[32]; int ti=0; do { tmp[ti++] = (char)('0'+(uv%10)); uv/=10; } while(uv && ti<(int)sizeof(tmp)); int copy=ti; while(ti>0 && idx+1<size) str[idx++]=tmp[--ti]; written+=copy; break; }
+            case 'x': case 'X': { unsigned int v=va_arg(ap,unsigned int); const char *hex = (*p=='x')?"0123456789abcdef":"0123456789ABCDEF"; char tmp[32]; int ti=0; do { tmp[ti++] = hex[v & 0xF]; v >>=4; } while(v && ti<(int)sizeof(tmp)); int copy=ti; while(ti>0 && idx+1<size) str[idx++]=tmp[--ti]; written+=copy; break; }
+            case 'c': { int ch = va_arg(ap,int); if(idx+1<size){ str[idx++]=(char)ch; written++; } break; }
+            default: /* unsupported specifier: ignore */ break;
+        }
+    }
+    va_end(ap);
+    str[idx]='\0';
+    return (int)written;
+}
+
 void mod_itoa(int value, char *str) {
     if (!str) return;
     
@@ -339,4 +364,30 @@ int mod_ptr_valid(void *ptr) {
     if (!ptr || da_number < 0 || !da_base) return 0;
     char *p = (char*)ptr;
     return (p >= da_base && p < da_base + da_size);
+}
+
+/* Simple ASCII atoi (no locale, ignores leading whitespace, handles optional +/-) */
+int mod_atoi(const char *s) {
+    if (!s) return 0;
+    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++;
+    int sign = 1;
+    if (*s == '+') { s++; }
+    else if (*s == '-') { sign = -1; s++; }
+    int v = 0;
+    while (*s >= '0' && *s <= '9') {
+        v = v * 10 + (*s - '0');
+        s++;
+    }
+    return sign * v;
+}
+
+/* strchr equivalent using module-safe assumptions */
+char *mod_strchr(const char *s, int c) {
+    if (!s) return NULL;
+    char ch = (char)c;
+    while (*s) {
+        if (*s == ch) return (char*)s;
+        s++;
+    }
+    return (ch == '\0') ? (char*)s : NULL;
 }

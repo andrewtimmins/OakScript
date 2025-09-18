@@ -6,6 +6,7 @@ IconSprites <Obey$Dir>.!Sprites
 Set OakScript$Dir <Obey$Dir>
 Set OakScript$Path <OakScript$Dir>.
 
+Set File$Type_EEA OSD
 Set File$Type_EEE OSC
 Set File$Type_EEF OXF
 

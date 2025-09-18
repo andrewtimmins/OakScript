@@ -1,0 +1,106 @@
+*oakscriptcompile interpreted compiled
+Compiling 'interpreted' to bytecode 'compiled'...
+[compile] Verbose mode enabled (OakScript$Debug)
+Compiling OakScript to bytecode...
+[compile] line 1: 
+[compile] line 2: print "=== Testing Basic Operations ==="
+[compile] line 4: print "1. String literals and OP_LOAD_STRING/OP_PRINT_STRING:"
+[compile] line 5: print "Hello World"
+[compile] line 7: print "2. Integer literals and OP_LOAD_INT/OP_PRINT_INT:"
+[compile] line 10: print "3. Variable assignment and OP_STORE_VAR:"
+[compile] line 10: print "3. Variable assignment and OP_STORE_VAR:"
+[compile] line 12: y = 5
+[compile] line 13: name = "OakScript"
+[compile] line 13: name = "OakScript"
+[compile] line 15: print "4. Variable loading and OP_LOAD_VAR:"
+[compile] line 17: print y
+[compile] line 18: print name
+[compile] line 20: print "=== Testing Arithmetic Operations ==="
+[compile] line 20: print "=== Testing Arithmetic Operations ==="
+[compile] line 22: print "5. Addition (OP_ADD):"
+[compile] line 25: print "6. Subtraction (OP_SUB):"
+[compile] line 25: print "6. Subtraction (OP_SUB):"
+[compile] line 28: print "7. Multiplication (OP_MUL):"
+[compile] line 28: print "7. Multiplication (OP_MUL):"
+[compile] line 31: print "8. Division (OP_DIV):"
+[compile] line 31: print "8. Division (OP_DIV):"
+[compile] line 34: print "9. Complex arithmetic expressions:"
+[compile] line 34: print "9. Complex arithmetic expressions:"
+[compile] line 36: print result
+[compile] line 38: print "=== Testing Comparison Operations ==="
+[compile] line 38: print "=== Testing Comparison Operations ==="
+[compile] line 40: print "10. Equal comparison (OP_CMP_EQ):"
+[compile] line 41: if x == 10 then
+[compile] line 42:     print "x equals 10"
+[compile] line 45: print "11. Not equal comparison (OP_CMP_NE):"
+[compile] line 46: if x != 5 then
+[compile] line 47:     print "x does not equal 5"
+[compile] line 50: print "12. Less than comparison (OP_CMP_LT):"
+[compile] line 51: if y < x then
+[compile] line 52:     print "y is less than x"
+[compile] line 55: print "13. Less than or equal comparison (OP_CMP_LE):"
+[compile] line 56: if y <= x then
+[compile] line 57:     print "y is less than or equal to x"
+[compile] line 60: print "14. Greater than comparison (OP_CMP_GT):"
+[compile] line 61: if x > y then
+[compile] line 62:     print "x is greater than y"
+[compile] line 65: print "15. Greater than or equal comparison (OP_CMP_GE):"
+[compile] line 66: if x >= y then
+[compile] line 67:     print "x is greater than or equal to y"
+[compile] line 70: print "=== Testing Control Flow ==="
+[compile] line 72: print "16. If statement with OP_JUMP_IF_FALSE:"
+[compile] line 73: if x > 0 then
+[compile] line 74:     print "x is positive"
+[compile] line 77: print "17. While loop with OP_JUMP and OP_JUMP_IF_FALSE:"
+[compile] line 79: while counter < 3 do
+[compile] line 79: while counter < 3 do
+[compile] line 81:     counter = counter + 1
+[compile] line 82: end
+[compile] line 84: print "18. Nested control flow:"
+[compile] line 86: while i <= 2 do
+[compile] line 86: while i <= 2 do
+[compile] line 87:     if i == 1 then
+[compile] line 88:         print "First iteration"
+[compile] line 90:     if i == 2 then
+[compile] line 91:         print "Second iteration"
+[compile] line 93:     i = i + 1
+[compile] line 96: print "=== Testing Mixed Operations ==="
+[compile] line 98: print "19. Variables in expressions:"
+[compile] line 100: b = 3
+[compile] line 101: sum = a + b
+[compile] line 102: diff = a - b
+[compile] line 103: product = a * b
+[compile] line 104: quotient = a / b
+[compile] line 105: print sum
+[compile] line 106: print diff
+[compile] line 107: print product
+[compile] line 108: print quotient
+[compile] line 110: print "20. Comparison results in conditionals:"
+[compile] line 110: print "20. Comparison results in conditionals:"
+[compile] line 111: if a == 7 then
+[compile] line 112:     print "a equals 7: true"
+[compile] line 114:     print "a equals 7: false"
+[compile] line 116: if a > b then
+[compile] line 117:     print "a > b: true"
+[compile] line 119:     print "a > b: false"
+[compile] line 122: print "=== Testing Function Calls ==="
+[compile] line 124: print "21. Built-in function calls (OP_CALL_BUILTIN):"
+[compile] line 126: num2 = 23
+[compile] line 127: positive_num = 42
+[compile] line 129: print "Testing abs() function with literal:"
+[compile] line 129: print "Testing abs() function with literal:"
+Error at line 132, col 1: Expected ')' to close function call
+    print "Testing abs() function with variable:"
+Error at line 132, col 1: Bytecode compilation failed
+
+    print "Testing abs() function with variable:"
+Error at line 132, col 1: Last error at line 132, col 1: Bytecode compilation failed
+
+
+    print "Testing abs() function with variable:"
+Context (current):
+    print "Testing abs() function with literal:"
+Context (previous line 129):
+    print "Testing abs() function with literal:"
+Script compilation failed
+*

@@ -1,9 +1,27 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <stdint.h>
+
+/* Fallback for uintptr_t if stdint does not provide it (Norcroft compatibility) */
+#ifndef UINTPTR_MAX
+typedef unsigned int uintptr_t;
+#endif
 #include "h.runtime"
 #include "h.memory"
 #include "h.strings"
+#include "h.bridge"
+#include "h.rt_objects"
+#include "h.engine" /* for VarType, LambdaFunc */
+
+/* ---- Debug line map & symbol table structures (file-scope) ---- */
+typedef struct { int offset; int line; int col; int end_col; char snippet[64]; } dbg_line_entry_t;
+typedef struct { int start; int end; int params; char name[64]; char param_list[128]; } sym_func_entry_t;
+static dbg_line_entry_t *g_dbg_map = NULL; static int g_dbg_count = 0; static int g_dbg_cap = 0;
+static sym_func_entry_t *g_sym_funcs = NULL; static int g_sym_count = 0; static int g_sym_cap = 0;
+static const char* sym_lookup(int pc){ for(int i=0;i<g_sym_count;i++){ if(pc>=g_sym_funcs[i].start && pc<g_sym_funcs[i].end) return g_sym_funcs[i].name; } return NULL; }
+static int dbg_lookup_line(int offset){ int lo=0, hi=g_dbg_count-1, best=0; while(lo<=hi){ int mid=(lo+hi)/2; int mo=g_dbg_map[mid].offset; if(mo==offset){ return g_dbg_map[mid].line; } if(mo<offset){ best=mid; lo=mid+1; } else hi=mid-1; } return g_dbg_count? g_dbg_map[best].line : 0; }
+static void dbg_lookup_line_cols(int offset,int *out_line,int *out_col,int *out_end_col){ int lo=0, hi=g_dbg_count-1, best=0; while(lo<=hi){ int mid=(lo+hi)/2; int mo=g_dbg_map[mid].offset; if(mo==offset){ if(out_line) *out_line=g_dbg_map[mid].line; if(out_col) *out_col=g_dbg_map[mid].col; if(out_end_col) *out_end_col=g_dbg_map[mid].end_col; return; } if(mo<offset){ best=mid; lo=mid+1; } else hi=mid-1; } if(g_dbg_count){ if(out_line) *out_line=g_dbg_map[best].line; if(out_col) *out_col=g_dbg_map[best].col; if(out_end_col) *out_end_col=g_dbg_map[best].end_col; } }
 
 /* Runtime variable storage */
 #define MAX_RUNTIME_VARS 100
@@ -50,13 +68,46 @@ typedef enum {
     OBJ_SET,
     OBJ_REGEX,
     OBJ_OPTIONAL,
-    OBJ_UNION
+    OBJ_UNION,
+    OBJ_COMPOSED,
+    OBJ_PARTIAL,
+    OBJ_MEMOIZE,
+    OBJ_LAMBDA, /* interpreter lambda */
+    OBJ_EXCEPTION
 } rt_object_type_t;
 
 typedef struct rt_object_header {
     int refcount;
     rt_object_type_t type;
+    int freeing; /* sentinel to break recursive free cycles */
 } rt_object_header_t;
+
+/* Helper macro to initialize a newly allocated runtime object header */
+#define INIT_OBJ_HDR(ptr, objtype) \
+    do { \
+        (ptr)->hdr.refcount = 1; \
+        (ptr)->hdr.type = (objtype); \
+        (ptr)->hdr.freeing = 0; \
+    } while (0)
+
+/* Optional runtime debug: define OAK_RT_DEBUG to get verbose leak diagnostics */
+#ifdef OAK_RT_DEBUG
+static void runtime_dump_registry(const char *label) {
+    printf("[RTDBG] %s: object_count=%d\n", label, object_count);
+    for (int i = 0; i < object_count; i++) {
+        rt_object_header_t *h = (rt_object_header_t *)object_registry[i];
+        const char *tn = "?";
+        switch (h->type) {
+            case OBJ_DICT: tn = "dict"; break; case OBJ_LIST: tn = "list"; break;
+            case OBJ_SET: tn = "set"; break; case OBJ_REGEX: tn = "regex"; break;
+            case OBJ_OPTIONAL: tn = "optional"; break; case OBJ_UNION: tn = "union"; break;
+        }
+        printf("[RTDBG] idx=%d ptr=%p type=%s ref=%d freeing=%d\n", i, (void*)h, tn, h->refcount, h->freeing);
+    }
+}
+#else
+#define runtime_dump_registry(label) do{}while(0)
+#endif
 
 typedef struct {
     char *key;
@@ -102,6 +153,45 @@ typedef struct {
     stack_value_t value;
 } rt_union_t;
 
+typedef struct {
+    rt_object_header_t hdr;
+    char *type_name;
+    char *message;
+    char *file_name;
+    int line_number;
+    char *stack_trace;
+} rt_exception_t;
+
+/* Functional composition / partial / memoize runtime objects */
+typedef struct {
+    rt_object_header_t hdr;
+    void *f1; /* retained callable */
+    void *f2; /* retained callable */
+} rt_composed_t;
+
+#define RT_PARTIAL_MAX 8
+typedef struct {
+    rt_object_header_t hdr;
+    void *base; /* retained callable */
+    int fixed_count;
+    stack_value_t fixed[RT_PARTIAL_MAX];
+} rt_partial_t;
+
+typedef struct rt_memo_entry {
+    unsigned int hash;
+    int argc;
+    stack_value_t *args; /* array length argc */
+    stack_value_t result;
+    struct rt_memo_entry *next;
+} rt_memo_entry_t;
+
+typedef struct {
+    rt_object_header_t hdr;
+    void *base; /* retained callable */
+    int bucket_count;
+    rt_memo_entry_t **buckets;
+} rt_memoize_t;
+
 /* Global runtime stack and variables */
 static stack_value_t runtime_stack[MAX_STACK_SIZE];
 static int stack_top = -1;
@@ -130,11 +220,20 @@ static inline int is_valid_cstring(const char *data_base, int data_size, int off
     return 0; // no terminator within data section
 }
 
-static void registry_add(void *obj) {
+void registry_add(void *obj) {
     if (!obj) return;
     if (object_count < MAX_OBJECTS) {
         object_registry[object_count++] = obj;
     }
+}
+int rt_object_count_total(void) { return object_count; }
+int rt_object_count_by_type(int type) {
+    int c = 0;
+    for (int i = 0; i < object_count; i++) {
+        rt_object_header_t *h = (rt_object_header_t *)object_registry[i];
+        if (h && h->type == type) c++;
+    }
+    return c;
 }
 
 static void registry_remove(void *obj) {
@@ -147,6 +246,11 @@ static void registry_remove(void *obj) {
         }
     }
 }
+
+/* Enumerate all registered runtime objects for diagnostics/auditing.
+   Callback returns non-zero to continue, 0 to stop early. */
+int rt_object_enumerate(int (*cb)(void *obj, int type, int refcount, void *ud), void *ud){
+    if(!cb) return 0; for(int i=0;i<object_count;i++){ rt_object_header_t *h=(rt_object_header_t*)object_registry[i]; int cont = cb(object_registry[i], h? h->type : -1, h? h->refcount : -1, ud); if(!cont) break; } return object_count; }
 
 static void retain_obj(void *obj) {
     if (!obj) return;
@@ -162,6 +266,8 @@ static void release_obj(void *obj) {
     rt_object_header_t *h = (rt_object_header_t *)obj;
     h->refcount--;
     if (h->refcount > 0) return;
+    if (h->freeing) return; /* already in free path */
+    h->freeing = 1;
     // remove from registry
     registry_remove(obj);
     switch (h->type) {
@@ -207,6 +313,47 @@ static void release_obj(void *obj) {
             if (u->tag) mod_free(u->tag);
             free_value_deep(u->value);
             mod_free(u);
+            break;
+        }
+        case OBJ_EXCEPTION: {
+            rt_exception_t *e = (rt_exception_t *)obj;
+            if (e->type_name) mod_free(e->type_name);
+            if (e->message) mod_free(e->message);
+            if (e->file_name) mod_free(e->file_name);
+            if (e->stack_trace) mod_free(e->stack_trace);
+            mod_free(e);
+            break;
+        }
+        case OBJ_COMPOSED: {
+            rt_composed_t *c = (rt_composed_t *)obj;
+            if (c->f1) release_obj(c->f1);
+            if (c->f2) release_obj(c->f2);
+            mod_free(c);
+            break;
+        }
+        case OBJ_PARTIAL: {
+            rt_partial_t *p = (rt_partial_t *)obj;
+            if (p->base) release_obj(p->base);
+            for (int i=0;i<p->fixed_count;i++) free_value_deep(p->fixed[i]);
+            mod_free(p);
+            break;
+        }
+        case OBJ_MEMOIZE: {
+            rt_memoize_t *m = (rt_memoize_t *)obj;
+            if (m->base) release_obj(m->base);
+            if (m->buckets) {
+                for (int bi=0; bi<m->bucket_count; bi++) {
+                    rt_memo_entry_t *e = m->buckets[bi];
+                    while (e) { rt_memo_entry_t *n = e->next; for (int ai=0; ai<e->argc; ai++) free_value_deep(e->args[ai]); if (e->args) mod_free(e->args); free_value_deep(e->result); mod_free(e); e = n; }
+                }
+                mod_free(m->buckets);
+            }
+            mod_free(m);
+            break;
+        }
+        case OBJ_LAMBDA: {
+            extern void lambda_destroy(struct LambdaFunc* func);
+            lambda_destroy((struct LambdaFunc*)obj);
             break;
         }
         default:
@@ -265,6 +412,486 @@ static void push_handle(void *obj) {
         runtime_stack[stack_top].type = RT_VAR_HANDLE;
         runtime_stack[stack_top].value.handle_ptr = obj;
     }
+}
+
+/* Forward declarations for internal conversion helpers (defined earlier in file) */
+static stack_value_t bridge_to_stack_value(const bridge_value_t *bv);
+static void stack_value_to_bridge(stack_value_t sv, bridge_value_t *out);
+
+/* ================= Functional (Batch5) ================= */
+static unsigned int rt_hash_args(int argc, stack_value_t *args) {
+    unsigned int h=5381; for (int i=0;i<argc;i++){ h = ((h<<5)+h) + args[i].type; switch(args[i].type){ case RT_VAR_INT: h=((h<<5)+h)+ (unsigned int)args[i].value.int_value; break; case RT_VAR_STRING: if(args[i].value.string_value){ const char *p=args[i].value.string_value; while(*p){ h=((h<<5)+h)+ (unsigned char)(*p++); } } break; default: h=((h<<5)+h)+ (unsigned int)(uintptr_t)args[i].value.handle_ptr; break; } } return h; }
+
+void *rt_compose_create(void *f1, void *f2) {
+    if (!f1 || !f2) return NULL; rt_composed_t *c = (rt_composed_t*)mod_malloc(sizeof(rt_composed_t)); if(!c) return NULL; INIT_OBJ_HDR(c, OBJ_COMPOSED); c->f1=f1; c->f2=f2; retain_obj(f1); retain_obj(f2); registry_add(c); return c; }
+
+void *rt_partial_create(void *base, int argc, const bridge_value_t *argv) {
+    if(!base) return NULL; if (argc < 0) argc=0; if (argc>RT_PARTIAL_MAX) argc = RT_PARTIAL_MAX; rt_partial_t *p = (rt_partial_t*)mod_malloc(sizeof(rt_partial_t)); if(!p) return NULL; INIT_OBJ_HDR(p, OBJ_PARTIAL); p->base=base; retain_obj(base); p->fixed_count=0; for(int i=0;i<argc;i++){ p->fixed[i] = bridge_to_stack_value(&argv[i]); p->fixed_count++; } registry_add(p); return p; }
+
+void *rt_memoize_create(void *base) {
+    if(!base) return NULL; rt_memoize_t *m = (rt_memoize_t*)mod_malloc(sizeof(rt_memoize_t)); if(!m) return NULL; INIT_OBJ_HDR(m, OBJ_MEMOIZE); m->base=base; retain_obj(base); m->bucket_count = 32; m->buckets = (rt_memo_entry_t**)mod_calloc(m->bucket_count, sizeof(rt_memo_entry_t*)); if(!m->buckets){ release_obj(base); mod_free(m); return NULL; } registry_add(m); return m; }
+
+static int rt_callable_invoke_internal(void *callable, int argc, stack_value_t *sv_args, stack_value_t *sv_result);
+
+int rt_callable_invoke(void *callable, int argc, bridge_value_t *argv, bridge_value_t *result) {
+    if(!result) return 0; stack_value_t sv_args_local[16]; stack_value_t *sv_args = sv_args_local; if (argc>16){ sv_args = (stack_value_t*)mod_malloc(sizeof(stack_value_t)*argc); if(!sv_args) return 0; }
+    for(int i=0;i<argc;i++){ sv_args[i] = bridge_to_stack_value(&argv[i]); }
+    stack_value_t sv_out; sv_out.type = RT_VAR_NULL; if(!rt_callable_invoke_internal(callable, argc, sv_args, &sv_out)){ for(int i=0;i<argc;i++) free_value_deep(sv_args[i]); if(sv_args!=sv_args_local) mod_free(sv_args); return 0; }
+    for(int i=0;i<argc;i++) free_value_deep(sv_args[i]); if(sv_args!=sv_args_local) mod_free(sv_args);
+    stack_value_to_bridge(sv_out, result); free_value_deep(sv_out); return 1; }
+
+/* Placeholder lambda execution: currently we cannot evaluate source body; treat lambda as identity of first arg */
+/* Actual lambda invocation hook: integrate with advanced lambda implementation.
+   We detect legacy lambda objects (OBJ_LAMBDA) produced by compiler/interpreter side
+   and call into lambda_call_with_args. Fallback still identity if integration fails. */
+extern void* lambda_call_with_args(struct LambdaFunc* func, void** args, VarType* arg_types, int arg_count); /* from c.functional */
+extern struct LambdaFunc* get_lambda(int handle); /* if handles are used, optional */
+
+static int invoke_lambda_identity(int argc, stack_value_t *args, stack_value_t *out){ if(argc>0){ *out = copy_value(args[0]); } else { out->type=RT_VAR_NULL; } return 1; }
+
+static int invoke_lambda_object(rt_object_header_t *h, int argc, stack_value_t *sv_args, stack_value_t *sv_result) {
+    if(!h) return invoke_lambda_identity(argc, sv_args, sv_result);
+    if(h->type != OBJ_LAMBDA) return invoke_lambda_identity(argc, sv_args, sv_result);
+    /* Layout assumption: h actually points to LambdaFunc since legacy system registers OBJ_LAMBDA with LambdaFunc* */
+    struct LambdaFunc *lf = (struct LambdaFunc*)h; /* reinterpret */
+    if(!lf) return invoke_lambda_identity(argc, sv_args, sv_result);
+    if(argc > 16) argc = 16; /* safety clamp */
+    void *arg_ptrs[16]; VarType arg_types[16];
+    for(int i=0;i<argc;i++) {
+        switch(sv_args[i].type){
+            case RT_VAR_INT: arg_types[i]=VAR_INT; arg_ptrs[i]=&sv_args[i].value.int_value; break;
+            case RT_VAR_FLOAT: arg_types[i]=VAR_FLOAT; arg_ptrs[i]=&sv_args[i].value.float_value; break;
+            case RT_VAR_STRING: arg_types[i]=VAR_STRING; arg_ptrs[i]=sv_args[i].value.string_value; break;
+            case RT_VAR_NULL: arg_types[i]=VAR_NULL; arg_ptrs[i]=NULL; break;
+            case RT_VAR_HANDLE: arg_types[i]=VAR_POINTER; arg_ptrs[i]=sv_args[i].value.handle_ptr; break;
+            default: arg_types[i]=VAR_NULL; arg_ptrs[i]=NULL; break;
+        }
+    }
+    void *ret = lambda_call_with_args(lf, arg_ptrs, arg_types, argc);
+    if(!ret){ sv_result->type = RT_VAR_NULL; return 1; }
+    /* For now we assume integer return (improve when LambdaFunc stores return type) */
+    sv_result->type = RT_VAR_INT; sv_result->value.int_value = *((int*)ret);
+    mod_free(ret);
+    return 1;
+}
+
+static rt_memo_entry_t *memo_lookup(rt_memoize_t *m, unsigned int hash, int argc, stack_value_t *args){ int bucket = hash % m->bucket_count; rt_memo_entry_t *e = m->buckets[bucket]; while(e){ if(e->hash==hash && e->argc==argc){ int match=1; for(int i=0;i<argc && match;i++){ if(!equals_value(e->args[i], args[i])) match=0; } if(match) return e; } e=e->next; } return NULL; }
+
+static void memo_store(rt_memoize_t *m, unsigned int hash, int argc, stack_value_t *args, stack_value_t result){ int bucket = hash % m->bucket_count; rt_memo_entry_t *e = (rt_memo_entry_t*)mod_malloc(sizeof(rt_memo_entry_t)); if(!e) return; e->hash=hash; e->argc=argc; e->args=(stack_value_t*)mod_malloc(sizeof(stack_value_t)*argc); if(!e->args){ mod_free(e); return; } for(int i=0;i<argc;i++) e->args[i]=copy_value(args[i]); e->result = copy_value(result); e->next = m->buckets[bucket]; m->buckets[bucket]=e; }
+
+static int rt_callable_invoke_internal(void *callable, int argc, stack_value_t *sv_args, stack_value_t *sv_result) {
+    if(!callable){ sv_result->type=RT_VAR_NULL; return 1; }
+    rt_object_header_t *h = (rt_object_header_t*)callable;
+    switch(h->type){
+        case OBJ_COMPOSED: {
+            rt_composed_t *c = (rt_composed_t*)callable; stack_value_t mid; mid.type=RT_VAR_NULL; if(!rt_callable_invoke_internal(c->f2, argc, sv_args, &mid)) return 0; stack_value_t mid_args[1]; mid_args[0]=mid; int ok = rt_callable_invoke_internal(c->f1, 1, mid_args, sv_result); free_value_deep(mid); return ok; }
+        case OBJ_PARTIAL: {
+            rt_partial_t *p = (rt_partial_t*)callable; int total = p->fixed_count + argc; stack_value_t local[16]; stack_value_t *all = (total<=16)?local:(stack_value_t*)mod_malloc(sizeof(stack_value_t)*total); if(!all) return 0; int idx=0; for(int i=0;i<p->fixed_count;i++) all[idx++]=copy_value(p->fixed[i]); for(int j=0;j<argc;j++) all[idx++]=copy_value(sv_args[j]); int ok = rt_callable_invoke_internal(p->base, total, all, sv_result); for(int k=0;k<idx;k++) free_value_deep(all[k]); if(all!=local) mod_free(all); return ok; }
+        case OBJ_MEMOIZE: {
+            rt_memoize_t *m = (rt_memoize_t*)callable; unsigned int hash = rt_hash_args(argc, sv_args); rt_memo_entry_t *found = memo_lookup(m, hash, argc, sv_args); if(found){ *sv_result = copy_value(found->result); return 1; } int ok = rt_callable_invoke_internal(m->base, argc, sv_args, sv_result); if(ok) memo_store(m, hash, argc, sv_args, *sv_result); return ok; }
+        case OBJ_LAMBDA: {
+            return invoke_lambda_object(h, argc, sv_args, sv_result);
+        }
+        default: /* unknown callable type: treat as identity */ return invoke_lambda_identity(argc, sv_args, sv_result);
+    }
+}
+
+void *rt_map(void *list_handle, void *callable) {
+    if(!list_handle) return NULL; rt_object_header_t *h=(rt_object_header_t*)list_handle; if(h->type!=OBJ_LIST) return NULL; rt_list_t *in=(rt_list_t*)list_handle; rt_list_t *out=(rt_list_t*)rt_list_create(in->size); if(!out) return NULL; for(int i=0;i<in->size;i++){ stack_value_t sv = in->items[i]; stack_value_t arg = copy_value(sv); stack_value_t res; res.type=RT_VAR_NULL; if(!rt_callable_invoke_internal(callable, 1, &arg, &res)){ free_value_deep(arg); free_value_deep(res); continue; } free_value_deep(arg); /* add result */ bridge_value_t bv; stack_value_to_bridge(res,&bv); free_value_deep(res); rt_list_append(out,&bv); if(bv.type==BRIDGE_VAL_STRING && bv.data.s) mod_free(bv.data.s); }
+    return out; }
+
+void *rt_filter(void *list_handle, void *callable) {
+    if(!list_handle) return NULL; rt_object_header_t *h=(rt_object_header_t*)list_handle; if(h->type!=OBJ_LIST) return NULL; rt_list_t *in=(rt_list_t*)list_handle; rt_list_t *out=(rt_list_t*)rt_list_create(in->size); if(!out) return NULL; for(int i=0;i<in->size;i++){ stack_value_t sv = in->items[i]; stack_value_t arg = copy_value(sv); stack_value_t res; res.type=RT_VAR_NULL; if(!rt_callable_invoke_internal(callable, 1, &arg, &res)){ free_value_deep(arg); free_value_deep(res); continue; } free_value_deep(arg); int truthy=0; if(res.type==RT_VAR_INT) truthy = (res.value.int_value!=0); else if(res.type==RT_VAR_FLOAT) truthy = (fabsf(res.value.float_value) > 1e-6f); else if(res.type==RT_VAR_STRING) truthy = (res.value.string_value && res.value.string_value[0]); else if(res.type==RT_VAR_HANDLE) truthy = (res.value.handle_ptr!=NULL); if(truthy){ bridge_value_t bv; stack_value_to_bridge(sv,&bv); rt_list_append(out,&bv); if(bv.type==BRIDGE_VAL_STRING && bv.data.s) mod_free(bv.data.s); } free_value_deep(res); }
+    return out; }
+
+int rt_reduce(void *list_handle, void *callable, const bridge_value_t *init, bridge_value_t *out){ if(out) { out->type=BRIDGE_VAL_NULL; out->owns=0; } if(!list_handle||!callable) return 0; rt_object_header_t *h=(rt_object_header_t*)list_handle; if(h->type!=OBJ_LIST) return 0; rt_list_t *in=(rt_list_t*)list_handle; stack_value_t acc; if(init){ acc = bridge_to_stack_value(init); } else { if(in->size==0){ return 1; } acc = copy_value(in->items[0]); }
+    int start_index = (init)?0:1; for(int i=start_index;i<in->size;i++){ stack_value_t args[2]; args[0]=acc; args[1]=copy_value(in->items[i]); stack_value_t res; res.type=RT_VAR_NULL; if(!rt_callable_invoke_internal(callable,2,args,&res)){ free_value_deep(args[0]); free_value_deep(args[1]); free_value_deep(res); return 0; } free_value_deep(args[0]); free_value_deep(args[1]); acc = res; }
+    if(out){ stack_value_to_bridge(acc,out); free_value_deep(acc); } else { free_value_deep(acc); }
+    return 1; }
+
+/* Minimal helper exposed to bridge for list_size (opaque outside) */
+static void *current_exception_handle = NULL; /* rt_exception_t* retained while current */
+/* Exception type registry */
+typedef struct rt_exception_type_info {
+    char *name;
+    char *description;
+    struct rt_exception_type_info *parent;
+    struct rt_exception_type_info *next;
+} rt_exception_type_info_t;
+static rt_exception_type_info_t *rt_exception_types = NULL;
+
+static rt_exception_type_info_t *rt_find_exc_type(const char *name){ rt_exception_type_info_t *c=rt_exception_types; while(c){ if(c->name && name && mod_strcmp(c->name,name)==0) return c; c=c->next; } return NULL; }
+
+const char *rt_exception_description_for_type(const char *type){ rt_exception_type_info_t *t = rt_find_exc_type(type); return (t && t->description)? t->description : ""; }
+
+int rt_exception_define(const char *type, const char *parent, const char *description){ if(!type) return 0; if(rt_find_exc_type(type)) return 1; rt_exception_type_info_t *info=(rt_exception_type_info_t*)mod_malloc(sizeof(rt_exception_type_info_t)); if(!info) return 0; info->name = mod_strdup(type); info->description = description?mod_strdup(description):mod_strdup(""); info->parent = parent? rt_find_exc_type(parent): NULL; info->next = rt_exception_types; rt_exception_types = info; return 1; }
+
+int rt_exception_is_a(void *exc_handle, const char *type_name){ if(!exc_handle||!type_name) return 0; rt_object_header_t *h=(rt_object_header_t*)exc_handle; if(h->type!=OBJ_EXCEPTION) return 0; rt_exception_t *e=(rt_exception_t*)exc_handle; rt_exception_type_info_t *exc_t = rt_find_exc_type(e->type_name); rt_exception_type_info_t *target = rt_find_exc_type(type_name); if(!exc_t||!target) return 0; for(rt_exception_type_info_t *cur=exc_t; cur; cur=cur->parent){ if(cur==target) return 1; } return 0; }
+
+static void rt_exc_init_builtin_types(void){
+    static int inited=0; if(inited) return; inited=1;
+    rt_exception_define("Exception", NULL, "Base exception");
+    rt_exception_define("RuntimeError", "Exception", "Runtime error");
+    rt_exception_define("BuiltinError", "RuntimeError", "Builtin call failure");
+    rt_exception_define("TypeError", "Exception", "Type error");
+    rt_exception_define("ValueError", "Exception", "Value error");
+    rt_exception_define("IndexError", "Exception", "Index out of range");
+    rt_exception_define("KeyError", "Exception", "Key not found");
+    rt_exception_define("FileError", "Exception", "File error");
+    rt_exception_define("NetworkError", "Exception", "Network error");
+    rt_exception_define("ParseError", "Exception", "Parse error");
+    rt_exception_define("MemoryError", "Exception", "Memory error");
+    rt_exception_define("DivisionByZero", "RuntimeError", "Division by zero");
+    rt_exception_define("NullPointer", "RuntimeError", "Null pointer");
+}
+
+void *rt_exception_create(const char *type, const char *message, const char *file, int line) {
+    rt_exc_init_builtin_types();
+    if (!type) type = "Exception";
+    rt_exception_t *e = (rt_exception_t*)mod_malloc(sizeof(rt_exception_t));
+    if (!e) return NULL;
+    INIT_OBJ_HDR(e, OBJ_EXCEPTION);
+    e->type_name = mod_strdup(type);
+    e->message = message ? mod_strdup(message) : mod_strdup("");
+    e->file_name = file ? mod_strdup(file) : NULL;
+    e->line_number = line;
+    e->stack_trace = NULL;
+    /* allocate empty stack trace (lazy) */
+    /* We add stack_trace char* now: modify struct definition earlier? Already present? If not, we add at top of file. */
+    registry_add(e);
+    return e;
+}
+
+const char *rt_exception_type(void *exc_handle) {
+    if(!exc_handle) return NULL; rt_object_header_t *h=(rt_object_header_t*)exc_handle; if(h->type!=OBJ_EXCEPTION) return NULL; rt_exception_t *e=(rt_exception_t*)exc_handle; return e->type_name ? e->type_name : ""; }
+
+const char *rt_exception_message(void *exc_handle) {
+    if(!exc_handle) return NULL; rt_object_header_t *h=(rt_object_header_t*)exc_handle; if(h->type!=OBJ_EXCEPTION) return NULL; rt_exception_t *e=(rt_exception_t*)exc_handle; return e->message ? e->message : ""; }
+
+const char *rt_exception_description(void *exc_handle){ if(!exc_handle) return ""; rt_object_header_t *h=(rt_object_header_t*)exc_handle; if(h->type!=OBJ_EXCEPTION) return ""; rt_exception_t *e=(rt_exception_t*)exc_handle; return rt_exception_description_for_type(e->type_name); }
+
+int rt_exception_throw(void *exc_handle) {
+    if(!exc_handle) return 0; rt_object_header_t *h=(rt_object_header_t*)exc_handle; if(h->type!=OBJ_EXCEPTION) return 0; if(current_exception_handle) release_obj(current_exception_handle); retain_obj(exc_handle); current_exception_handle = exc_handle; /* Append initial frame with file:line if available */ rt_exception_t *e=(rt_exception_t*)exc_handle; if(e->file_name){ char frame[160]; int n = mod_snprintf(frame,sizeof(frame),"at %s:%d\n", e->file_name, e->line_number); if(n>0){ if(!e->stack_trace){ e->stack_trace = mod_strdup(frame); } else { int old_len = mod_strlen(e->stack_trace); int add_len = mod_strlen(frame); char *nt = (char*)mod_malloc(old_len+add_len+1); if(nt){ mod_strcpy(nt,e->stack_trace); mod_strcpy(nt+old_len, frame); mod_free(e->stack_trace); e->stack_trace=nt; } } } } return 1; }
+
+void *rt_exception_current(void) { return current_exception_handle; }
+char *rt_exception_stack_trace(void *exc_handle){ if(!exc_handle) return mod_strdup(""); rt_object_header_t *h=(rt_object_header_t*)exc_handle; if(h->type!=OBJ_EXCEPTION) return mod_strdup(""); rt_exception_t *e=(rt_exception_t*)exc_handle; if(e->stack_trace) return mod_strdup(e->stack_trace); /* fallback */ if(e->file_name){ char buf[256]; int n = mod_snprintf(buf,sizeof(buf),"at %s:%d", e->file_name, e->line_number); if(n>0) return mod_strdup(buf); } return mod_strdup(""); }
+void rt_exception_add_frame(void *exc_handle, const char *function, const char *file, int line){ if(!exc_handle) return; rt_object_header_t *h=(rt_object_header_t*)exc_handle; if(h->type!=OBJ_EXCEPTION) return; rt_exception_t *e=(rt_exception_t*)exc_handle; char frame[192]; if(function && file && line>0) { mod_snprintf(frame,sizeof(frame),"at %s (%s:%d)\n", function, file, line); }
+ else if(function){ mod_snprintf(frame,sizeof(frame),"at %s\n", function); }
+ else if(file && line>0){ mod_snprintf(frame,sizeof(frame),"at %s:%d\n", file, line); }
+ else { return; }
+ int add_len = mod_strlen(frame); if(add_len<=0) return; if(!e->stack_trace){ e->stack_trace = mod_strdup(frame); return; } int old_len = mod_strlen(e->stack_trace); char *nt = (char*)mod_malloc(old_len+add_len+1); if(!nt) return; mod_strcpy(nt,e->stack_trace); mod_strcpy(nt+old_len, frame); mod_free(e->stack_trace); e->stack_trace=nt; }
+void rt_exception_add_frame_col(void *exc_handle, const char *function, const char *file, int line, int col, int end_col){ if(!exc_handle) return; rt_object_header_t *h=(rt_object_header_t*)exc_handle; if(h->type!=OBJ_EXCEPTION) return; rt_exception_t *e=(rt_exception_t*)exc_handle; char frame[192]; if(function && file && line>0){ if(col>0){ if(end_col>col){ mod_snprintf(frame,sizeof(frame),"at %s (%s:%d:%d-%d)\n", function,file,line,col,end_col); } else { mod_snprintf(frame,sizeof(frame),"at %s (%s:%d:%d)\n", function,file,line,col); } } else { mod_snprintf(frame,sizeof(frame),"at %s (%s:%d)\n", function,file,line); } } else if(function && file){ mod_snprintf(frame,sizeof(frame),"at %s (%s)\n", function,file); } else if(function){ mod_snprintf(frame,sizeof(frame),"at %s\n", function); } else { return; } int add_len = mod_strlen(frame); if(add_len<=0) return; if(!e->stack_trace){ e->stack_trace = mod_strdup(frame); return; } int old_len = mod_strlen(e->stack_trace); char *nt=(char*)mod_malloc(old_len+add_len+1); if(!nt) return; mod_strcpy(nt,e->stack_trace); mod_strcpy(nt+old_len, frame); mod_free(e->stack_trace); e->stack_trace=nt; }
+void rt_exception_clear_current(void){ if(current_exception_handle){ release_obj(current_exception_handle); current_exception_handle=NULL; } }
+const char *rt_exception_file(void *exc_handle){ if(!exc_handle) return NULL; rt_object_header_t *h=(rt_object_header_t*)exc_handle; if(h->type!=OBJ_EXCEPTION) return NULL; rt_exception_t *e=(rt_exception_t*)exc_handle; return e->file_name; }
+int rt_exception_line(void *exc_handle){ if(!exc_handle) return 0; rt_object_header_t *h=(rt_object_header_t*)exc_handle; if(h->type!=OBJ_EXCEPTION) return 0; rt_exception_t *e=(rt_exception_t*)exc_handle; return e->line_number; }
+
+int rt_try_call(void *try_callable, void *catch_callable, void *finally_callable, bridge_value_t *result){ if(result){ result->type=BRIDGE_VAL_NULL; result->owns=0; } if(!try_callable) return 0; bridge_value_t tmp_res; bridge_value_init(&tmp_res); int ok = rt_callable_invoke(try_callable, 0, NULL, &tmp_res); void *thrown = rt_exception_current(); if(thrown && catch_callable){ /* invoke catch with exception handle */ bridge_value_t arg; bridge_value_init(&arg); arg.type = BRIDGE_VAL_HANDLE; arg.data.handle = thrown; bridge_value_t catch_res; bridge_value_init(&catch_res); rt_callable_invoke(catch_callable, 1, &arg, &catch_res); bridge_value_free(&arg); if(result) *result = catch_res; else bridge_value_free(&catch_res); rt_exception_clear_current(); } else { if(result) *result = tmp_res; else bridge_value_free(&tmp_res); }
+ if(finally_callable){ bridge_value_t fin_res; bridge_value_init(&fin_res); rt_callable_invoke(finally_callable,0,NULL,&fin_res); bridge_value_free(&fin_res); }
+ return ok?1:0; }
+int runtime_list_size(void *handle) {
+    if (!handle) return 0;
+    rt_object_header_t *h = (rt_object_header_t *)handle;
+    if (h->type != OBJ_LIST) return 0;
+    rt_list_t *l = (rt_list_t *)handle;
+    return l->size;
+}
+
+int runtime_dict_size(void *handle) {
+    if (!handle) return 0;
+    rt_object_header_t *h = (rt_object_header_t *)handle;
+    if (h->type != OBJ_DICT) return 0;
+    rt_dict_t *d = (rt_dict_t *)handle;
+    return d->size;
+}
+
+int runtime_set_size(void *handle) {
+    if (!handle) return 0;
+    rt_object_header_t *h = (rt_object_header_t *)handle;
+    if (h->type != OBJ_SET) return 0;
+    rt_set_t *s = (rt_set_t *)handle;
+    return s->size;
+}
+
+int runtime_dict_has(void *handle, const char *key) {
+    if (!handle || !key) return 0;
+    rt_object_header_t *h = (rt_object_header_t *)handle;
+    if (h->type != OBJ_DICT) return 0;
+    rt_dict_t *d = (rt_dict_t *)handle;
+    for (int i = 0; i < d->size; i++) {
+        if (d->items[i].key && mod_strcmp(d->items[i].key, key) == 0) return 1;
+    }
+    return 0;
+}
+
+/* ================= rt_objects wrapper layer ================= */
+static stack_value_t bridge_to_stack_value(const bridge_value_t *bv) {
+    stack_value_t v; v.type = RT_VAR_NULL; v.value.int_value = 0;
+    if (!bv) return v;
+    switch (bv->type) {
+        case BRIDGE_VAL_INT: v.type = RT_VAR_INT; v.value.int_value = bv->data.i; break;
+        case BRIDGE_VAL_FLOAT: v.type = RT_VAR_FLOAT; v.value.float_value = bv->data.f; break;
+        case BRIDGE_VAL_STRING: v.type = RT_VAR_STRING; v.value.string_value = bv->data.s ? mod_strdup(bv->data.s) : NULL; break;
+        case BRIDGE_VAL_HANDLE: v.type = RT_VAR_HANDLE; v.value.handle_ptr = bv->data.handle; if (bv->data.handle) retain_obj(bv->data.handle); break;
+        case BRIDGE_VAL_NULL: default: v.type = RT_VAR_NULL; break;
+    }
+    return v;
+}
+
+static void stack_value_to_bridge(stack_value_t sv, bridge_value_t *out) {
+    if (!out) return; out->type = BRIDGE_VAL_NULL; out->owns = 0; out->data.i = 0;
+    switch (sv.type) {
+        case RT_VAR_INT: out->type = BRIDGE_VAL_INT; out->data.i = sv.value.int_value; break;
+        case RT_VAR_FLOAT: out->type = BRIDGE_VAL_FLOAT; out->data.f = sv.value.float_value; break;
+        case RT_VAR_STRING: out->type = BRIDGE_VAL_STRING; out->data.s = sv.value.string_value ? mod_strdup(sv.value.string_value) : NULL; out->owns = (out->data.s != NULL); break;
+        case RT_VAR_HANDLE: out->type = BRIDGE_VAL_HANDLE; out->data.handle = sv.value.handle_ptr; if (sv.value.handle_ptr) retain_obj(sv.value.handle_ptr); break;
+        case RT_VAR_NULL: default: out->type = BRIDGE_VAL_NULL; break;
+    }
+}
+
+void *rt_list_create(int initial_cap) {
+    if (initial_cap <= 0) initial_cap = 8;
+    rt_list_t *l = (rt_list_t *)mod_malloc(sizeof(rt_list_t));
+    if (!l) return NULL; INIT_OBJ_HDR(l, OBJ_LIST);
+    l->size = 0; l->cap = initial_cap;
+    l->items = (stack_value_t *)mod_malloc(sizeof(stack_value_t) * l->cap);
+    if (!l->items) { mod_free(l); return NULL; }
+    registry_add(l);
+    return l;
+}
+
+int rt_list_append(void *list_handle, const bridge_value_t *val) {
+    if (!list_handle || !val) return 0; rt_list_t *l = (rt_list_t *)list_handle;
+    if (l->hdr.type != OBJ_LIST) return 0;
+    if (l->size >= l->cap) {
+        int new_cap = l->cap * 2;
+        stack_value_t *ni = (stack_value_t *)mod_realloc(l->items, sizeof(stack_value_t) * new_cap);
+        if (!ni) return 0; l->items = ni; l->cap = new_cap;
+    }
+    stack_value_t sv = bridge_to_stack_value(val);
+    l->items[l->size++] = sv;
+    return 1;
+}
+
+int rt_list_get(void *list_handle, int index, bridge_value_t *out) {
+    if (!list_handle || !out) return 0; rt_list_t *l = (rt_list_t *)list_handle;
+    if (l->hdr.type != OBJ_LIST) return 0;
+    if (index < 0 || index >= l->size) return 0;
+    stack_value_to_bridge(l->items[index], out);
+    return 1;
+}
+
+void *rt_dict_create(int initial_cap) {
+    if (initial_cap <= 0) initial_cap = 8;
+    rt_dict_t *d = (rt_dict_t *)mod_malloc(sizeof(rt_dict_t));
+    if (!d) return NULL; INIT_OBJ_HDR(d, OBJ_DICT);
+    d->size = 0; d->cap = initial_cap;
+    d->items = (rt_kv_t *)mod_malloc(sizeof(rt_kv_t) * d->cap);
+    if (!d->items) { mod_free(d); return NULL; }
+    registry_add(d);
+    return d;
+}
+
+static int dict_expand(rt_dict_t *d) {
+    int new_cap = d->cap * 2;
+    rt_kv_t *ni = (rt_kv_t *)mod_realloc(d->items, sizeof(rt_kv_t) * new_cap);
+    if (!ni) return 0; d->items = ni; d->cap = new_cap; return 1;
+}
+
+int rt_dict_set(void *dict_handle, const char *key, const bridge_value_t *val) {
+    if (!dict_handle || !key || !val) return 0; rt_dict_t *d = (rt_dict_t *)dict_handle;
+    if (d->hdr.type != OBJ_DICT) return 0;
+    for (int i = 0; i < d->size; i++) {
+        if (d->items[i].key && mod_strcmp(d->items[i].key, key) == 0) {
+            free_value_deep(d->items[i].value);
+            d->items[i].value = bridge_to_stack_value(val);
+            return 1;
+        }
+    }
+    if (d->size >= d->cap) { if (!dict_expand(d)) return 0; }
+    d->items[d->size].key = mod_strdup(key);
+    d->items[d->size].value = bridge_to_stack_value(val);
+    d->size++;
+    return 1;
+}
+
+int rt_dict_get(void *dict_handle, const char *key, bridge_value_t *out) {
+    if (!dict_handle || !key || !out) return 0; rt_dict_t *d = (rt_dict_t *)dict_handle;
+    if (d->hdr.type != OBJ_DICT) return 0;
+    for (int i = 0; i < d->size; i++) {
+        if (d->items[i].key && mod_strcmp(d->items[i].key, key) == 0) {
+            stack_value_to_bridge(d->items[i].value, out); return 1;
+        }
+    }
+    return 0;
+}
+
+int rt_dict_remove(void *dict_handle, const char *key) {
+    if (!dict_handle || !key) return 0; rt_dict_t *d = (rt_dict_t *)dict_handle;
+    if (d->hdr.type != OBJ_DICT) return 0;
+    for (int i = 0; i < d->size; i++) {
+        if (d->items[i].key && mod_strcmp(d->items[i].key, key) == 0) {
+            if (d->items[i].key) mod_free(d->items[i].key);
+            free_value_deep(d->items[i].value);
+            d->items[i] = d->items[d->size - 1];
+            d->size--;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+void *rt_dict_keys(void *dict_handle) {
+    if (!dict_handle) return NULL; rt_dict_t *d = (rt_dict_t *)dict_handle;
+    if (d->hdr.type != OBJ_DICT) return NULL;
+    rt_list_t *l = (rt_list_t *)rt_list_create(d->size > 0 ? d->size : 1);
+    if (!l) return NULL;
+    for (int i = 0; i < d->size; i++) {
+        bridge_value_t tmp; bridge_value_init(&tmp); tmp.type = BRIDGE_VAL_STRING; tmp.data.s = d->items[i].key; tmp.owns = 0; /* alias */
+        rt_list_append(l, &tmp);
+    }
+    return l;
+}
+
+void *rt_set_create(int initial_cap) {
+    if (initial_cap <= 0) initial_cap = 8;
+    rt_set_t *s = (rt_set_t *)mod_malloc(sizeof(rt_set_t));
+    if (!s) return NULL; INIT_OBJ_HDR(s, OBJ_SET);
+    s->size = 0; s->cap = initial_cap;
+    s->items = (stack_value_t *)mod_malloc(sizeof(stack_value_t) * s->cap);
+    if (!s->items) { mod_free(s); return NULL; }
+    registry_add(s);
+    return s;
+}
+
+int rt_set_add(void *set_handle, const bridge_value_t *val) {
+    if (!set_handle || !val) return 0; rt_set_t *s = (rt_set_t *)set_handle;
+    if (s->hdr.type != OBJ_SET) return 0;
+    stack_value_t sv = bridge_to_stack_value(val);
+    // Check duplicates (basic equality)
+    for (int i = 0; i < s->size; i++) {
+        if (equals_value(s->items[i], sv)) { free_value_shallow(sv); return 1; }
+    }
+    if (s->size >= s->cap) {
+        int new_cap = s->cap * 2;
+        stack_value_t *ni = (stack_value_t *)mod_realloc(s->items, sizeof(stack_value_t) * new_cap);
+        if (!ni) { free_value_deep(sv); return 0; }
+        s->items = ni; s->cap = new_cap;
+    }
+    s->items[s->size++] = sv;
+    return 1;
+}
+
+int rt_set_contains(void *set_handle, const bridge_value_t *val) {
+    if (!set_handle || !val) return 0; rt_set_t *s = (rt_set_t *)set_handle;
+    if (s->hdr.type != OBJ_SET) return 0;
+    bridge_value_t tmpbv; bridge_value_init(&tmpbv); /* convert for comparison */
+    stack_value_t sv = bridge_to_stack_value(val);
+    int found = 0;
+    for (int i = 0; i < s->size && !found; i++) {
+        if (equals_value(s->items[i], sv)) found = 1;
+    }
+    free_value_deep(sv);
+    return found;
+}
+
+/* ================= Regex / Interpolation wrappers ================= */
+void *rt_regex_create(const char *pattern, int flags) {
+    (void)flags; /* flags unused in current simplified engine */
+    if (!pattern) return NULL;
+    rt_regex_t *r = (rt_regex_t *)mod_malloc(sizeof(rt_regex_t));
+    if (!r) return NULL; INIT_OBJ_HDR(r, OBJ_REGEX);
+    r->pattern = mod_strdup(pattern);
+    r->rx = regex_compile(pattern, 0);
+    if (!r->pattern || !r->rx) { if (r->pattern) mod_free(r->pattern); if (r->rx) regex_destroy(r->rx); mod_free(r); return NULL; }
+    registry_add(r); return r;
+}
+
+int rt_regex_match(void *regex_handle, const char *text) {
+    if (!regex_handle || !text) return 0; rt_regex_t *r = (rt_regex_t *)regex_handle;
+    if (r->hdr.type != OBJ_REGEX || !r->rx) return 0; return regex_match(r->rx, text) ? 1 : 0;
+}
+
+char *rt_regex_replace(void *regex_handle, const char *text, const char *replacement) {
+    if (!regex_handle || !text || !replacement) return NULL; rt_regex_t *r = (rt_regex_t *)regex_handle;
+    if (r->hdr.type != OBJ_REGEX || !r->rx) return NULL; return regex_replace(r->rx, text, replacement);
+}
+
+char *rt_interpolate_template(const char *template_str) {
+    if (!template_str) return NULL; InterpolatedString *istr = parse_interpolated_string(template_str);
+    if (!istr) return NULL; char *res = evaluate_interpolated_string(istr); interpolated_string_destroy(istr); return res; }
+
+char *rt_multiline_process(const char *raw_str) {
+    if (!raw_str) return NULL; MultilineString *m = multiline_create(raw_str); if (!m) return mod_strdup(raw_str);
+    char *out = multiline_to_string(m); multiline_destroy(m); return out; }
+
+/* ================= Optional / Union / Type wrappers ================= */
+void *rt_optional_create(const bridge_value_t *maybe_val) {
+    rt_optional_t *o = (rt_optional_t *)mod_malloc(sizeof(rt_optional_t)); if (!o) return NULL; INIT_OBJ_HDR(o, OBJ_OPTIONAL);
+    if (maybe_val && maybe_val->type != BRIDGE_VAL_NULL) {
+        o->has_value = 1; bridge_value_t bv = *maybe_val; /* copy through conversion */
+        stack_value_t sv = bridge_to_stack_value(&bv);
+        o->value = sv;
+    } else { o->has_value = 0; o->value.type = RT_VAR_NULL; }
+    registry_add(o); return o; }
+
+int rt_optional_has_value(void *opt_handle) {
+    if (!opt_handle) return 0; rt_optional_t *o = (rt_optional_t*)opt_handle; if (o->hdr.type != OBJ_OPTIONAL) return 0; return o->has_value ? 1 : 0; }
+
+int rt_optional_get(void *opt_handle, bridge_value_t *out) {
+    if (!opt_handle || !out) return 0; rt_optional_t *o = (rt_optional_t*)opt_handle; if (o->hdr.type != OBJ_OPTIONAL || !o->has_value) return 0; stack_value_to_bridge(o->value, out); return 1; }
+
+void *rt_union_create(const char *tag, const bridge_value_t *val) {
+    if (!tag) return NULL; rt_union_t *u = (rt_union_t *)mod_malloc(sizeof(rt_union_t)); if (!u) return NULL; INIT_OBJ_HDR(u, OBJ_UNION);
+    u->tag = mod_strdup(tag);
+    if (val) { stack_value_t sv = bridge_to_stack_value(val); u->value = sv; } else { u->value.type = RT_VAR_NULL; }
+    registry_add(u); return u; }
+
+int rt_union_set(void *union_handle, const char *tag, const bridge_value_t *val) {
+    if (!union_handle || !tag) return 0; rt_union_t *u = (rt_union_t*)union_handle; if (u->hdr.type != OBJ_UNION) return 0;
+    if (u->tag) mod_free(u->tag); u->tag = mod_strdup(tag);
+    free_value_deep(u->value); if (val) { u->value = bridge_to_stack_value(val); } else { u->value.type = RT_VAR_NULL; }
+    return 1; }
+
+int rt_union_get(void *union_handle, bridge_value_t *out) {
+    if (!union_handle || !out) return 0; rt_union_t *u = (rt_union_t*)union_handle; if (u->hdr.type != OBJ_UNION) return 0; stack_value_to_bridge(u->value, out); return 1; }
+
+const char *rt_union_tag(void *union_handle) {
+    if (!union_handle) return NULL; rt_union_t *u = (rt_union_t*)union_handle; if (u->hdr.type != OBJ_UNION) return NULL; return u->tag; }
+
+/* runtime_typeof_stack removed (unused) */
+
+const char *rt_typeof_value(const bridge_value_t *v) {
+    if (!v) return "unknown"; switch (v->type) {
+        case BRIDGE_VAL_INT: return "int"; case BRIDGE_VAL_FLOAT: return "float"; case BRIDGE_VAL_STRING: return "string"; case BRIDGE_VAL_NULL: return "null"; case BRIDGE_VAL_HANDLE: default: {
+            if (!v->data.handle) return "handle"; rt_object_header_t *h = (rt_object_header_t*)v->data.handle;
+            switch (h->type) { case OBJ_DICT: return "dict"; case OBJ_LIST: return "list"; case OBJ_SET: return "set"; case OBJ_REGEX: return "regex"; case OBJ_OPTIONAL: return "optional"; case OBJ_UNION: return "union"; default: return "handle"; }
+        } }
+}
+
+int rt_is_type(const bridge_value_t *v, const char *type_name) {
+    if (!v || !type_name) return 0; const char *tn = rt_typeof_value(v); return mod_strcmp(tn, type_name) == 0 ? 1 : 0; }
+
+int rt_is_null(const bridge_value_t *v) { return (!v || v->type == BRIDGE_VAL_NULL) ? 1 : 0; }
+
+int rt_cast_value(const bridge_value_t *src, const char *target_type, bridge_value_t *out) {
+    if (!src || !target_type || !out) return 0; bridge_value_init(out);
+    if (mod_strcmp(target_type, "int") == 0) {
+        if (src->type == BRIDGE_VAL_INT) { out->type = BRIDGE_VAL_INT; out->data.i = src->data.i; return 1; }
+        if (src->type == BRIDGE_VAL_FLOAT) { out->type = BRIDGE_VAL_INT; out->data.i = (int)src->data.f; return 1; }
+        if (src->type == BRIDGE_VAL_STRING && src->data.s) { /* naive parse */ int val = 0; const char *p = src->data.s; int sign=1; if (*p=='-'){sign=-1;p++;} while (*p && *p>='0'&&*p<='9'){ val = val*10 + (*p-'0'); p++; } out->type=BRIDGE_VAL_INT; out->data.i = sign*val; return 1; }
+        return 0;
+    } else if (mod_strcmp(target_type, "float") == 0) {
+        if (src->type == BRIDGE_VAL_FLOAT) { out->type = BRIDGE_VAL_FLOAT; out->data.f = src->data.f; return 1; }
+        if (src->type == BRIDGE_VAL_INT) { out->type = BRIDGE_VAL_FLOAT; out->data.f = (float)src->data.i; return 1; }
+        return 0;
+    } else if (mod_strcmp(target_type, "string") == 0) {
+        char buf[64]; buf[0]='\0';
+        if (src->type == BRIDGE_VAL_STRING) { out->type = BRIDGE_VAL_STRING; out->data.s = src->data.s ? mod_strdup(src->data.s) : mod_strdup(""); out->owns = 1; return 1; }
+    if (src->type == BRIDGE_VAL_INT) { mod_itoa(src->data.i, buf); out->type=BRIDGE_VAL_STRING; out->data.s = mod_strdup(buf); out->owns=1; return 1; }
+    if (src->type == BRIDGE_VAL_FLOAT) { mod_ftoa(src->data.f, buf, 6); out->type=BRIDGE_VAL_STRING; out->data.s = mod_strdup(buf); out->owns=1; return 1; }
+        return 0;
+    }
+    return 0;
 }
 
 /* Call frame stack */
@@ -497,12 +1124,7 @@ void* runtime_get_variable_value(const char *name, VarType *type) {
     return NULL; // Variable not found
 }
 
-static void store_builtin_function(const char *name, rt_object_header_t *func_obj) {
-    stack_value_t value;
-    value.type = RT_VAR_HANDLE;
-    value.value.handle_ptr = func_obj;
-    store_variable(name, value);
-}
+/* Removed unused store_builtin_function (legacy helper) */
 
 static void load_variable(const char *name) {
     // Search locals from innermost frame outward
@@ -541,8 +1163,14 @@ static void cleanup_runtime_vars() {
     // Free locals in any remaining frames
     for (int f = call_top; f >= 0; f--) {
         for (int i = 0; i < call_stack[f].local_count; i++) {
-            if (call_stack[f].locals[i].is_used && call_stack[f].locals[i].type == RT_VAR_STRING && call_stack[f].locals[i].value.string_value) {
-                mod_free(call_stack[f].locals[i].value.string_value);
+            if (call_stack[f].locals[i].is_used) {
+                if (call_stack[f].locals[i].type == RT_VAR_STRING && call_stack[f].locals[i].value.string_value) {
+                    mod_free(call_stack[f].locals[i].value.string_value);
+                    call_stack[f].locals[i].value.string_value = NULL;
+                } else if (call_stack[f].locals[i].type == RT_VAR_HANDLE && call_stack[f].locals[i].value.handle_ptr) {
+                    release_obj(call_stack[f].locals[i].value.handle_ptr);
+                    call_stack[f].locals[i].value.handle_ptr = NULL;
+                }
             }
             call_stack[f].locals[i].is_used = 0;
         }
@@ -550,9 +1178,14 @@ static void cleanup_runtime_vars() {
     }
     call_top = -1;
     for (int i = 0; i < runtime_var_count; i++) {
-        if (runtime_vars[i].is_used && runtime_vars[i].type == RT_VAR_STRING && 
-            runtime_vars[i].value.string_value) {
-            mod_free(runtime_vars[i].value.string_value);
+        if (runtime_vars[i].is_used) {
+            if (runtime_vars[i].type == RT_VAR_STRING && runtime_vars[i].value.string_value) {
+                mod_free(runtime_vars[i].value.string_value);
+                runtime_vars[i].value.string_value = NULL;
+            } else if (runtime_vars[i].type == RT_VAR_HANDLE && runtime_vars[i].value.handle_ptr) {
+                release_obj(runtime_vars[i].value.handle_ptr);
+                runtime_vars[i].value.handle_ptr = NULL;
+            }
         }
         runtime_vars[i].is_used = 0;
     }
@@ -564,10 +1197,42 @@ static void cleanup_runtime_vars() {
         free_value_shallow(val);
     }
 
-    // Free any leaked objects in registry (safety net)
-    while (object_count > 0) {
-        void *obj = object_registry[object_count - 1];
-        release_obj(obj);
+    // Stable registry drain: pop-last strategy avoids index invalidation.
+    if (object_count > 0) {
+        runtime_dump_registry("pre-drain");
+        int stall_passes = 0;
+        while (object_count > 0) {
+            int before = object_count;
+            void *obj = object_registry[object_count - 1];
+            release_obj(obj);
+            if (object_count == before) {
+                // Stalled: cycle or sentinel interference. Break cycle.
+                stall_passes++;
+                if (stall_passes > 4) {
+                    // Force collapse of all remaining objects.
+                    for (int i = 0; i < object_count; i++) {
+                        rt_object_header_t *h = (rt_object_header_t *)object_registry[i];
+                        h->freeing = 0; // allow re-entry
+                        if (h->refcount < 1) h->refcount = 1;
+                        if (h->refcount > 1) h->refcount = 1; // normalize
+                    }
+                    runtime_dump_registry("forced-collapse");
+                } else {
+                    for (int i = 0; i < object_count; i++) {
+                        rt_object_header_t *h = (rt_object_header_t *)object_registry[i];
+                        if (h->freeing) h->freeing = 0; // reset partial free state
+                    }
+                }
+                if (stall_passes > 8) {
+                    runtime_dump_registry("leak-abort");
+                    printf("Runtime warning: leaked %d object(s); aborting cleanup to prevent hang\n", object_count);
+                    break;
+                }
+            } else {
+                stall_passes = 0; // progress made
+            }
+        }
+        runtime_dump_registry("post-drain");
     }
 }
 
@@ -626,6 +1291,68 @@ int run_bytecode_file(const char *bytecode_file)
     }
     
     fclose(file);
+
+     /* Load optional .dbg line map sidecar (v1: off line snippet) (v2: off line col end_col snippet)
+         Backwards compatibility: we auto-detect version by counting tab separators per line. */
+    /* Reset debug map globals for this run */
+    g_dbg_count = 0; g_dbg_cap = 0; if(g_dbg_map){ mod_free(g_dbg_map); g_dbg_map=NULL; }
+    char dbg_name[260];
+    int blen = (int)mod_strlen(bytecode_file); if (blen > 240) blen = 240;
+    mod_strncpy(dbg_name, bytecode_file, blen); dbg_name[blen]='\0'; mod_strcat(dbg_name, ".dbg");
+    FILE *dbg = fopen(dbg_name, "r");
+    if (dbg) {
+        char linebuf[256];
+        while (fgets(linebuf, sizeof(linebuf), dbg)) {
+            if (linebuf[0]=='#' || linebuf[0]=='\n' || linebuf[0]=='\0') continue;
+            /* Count tabs to distinguish versions */
+            int tabc = 0; for(char *p=linebuf; *p; p++){ if(*p=='\t') tabc++; }
+            int off=0, ln=0, col=1, end_col=1; char snip[128]; snip[0]='\0';
+            if (tabc >= 4) {
+                /* v2: off line col end_col snippet */
+                char *t1 = mod_strchr(linebuf,'\t'); if(!t1) continue; *t1='\0'; off = mod_atoi(linebuf);
+                char *t2 = mod_strchr(t1+1,'\t'); if(!t2) continue; *t2='\0'; ln = mod_atoi(t1+1);
+                char *t3 = mod_strchr(t2+1,'\t'); if(!t3) continue; *t3='\0'; col = mod_atoi(t2+1);
+                char *t4 = mod_strchr(t3+1,'\t'); if(!t4) continue; *t4='\0'; end_col = mod_atoi(t3+1);
+                char *sn = t4+1; int ll=(int)mod_strlen(sn); if(ll>0 && (sn[ll-1]=='\n'||sn[ll-1]=='\r')) sn[ll-1]='\0'; mod_strncpy(snip, sn, sizeof(snip)-1); snip[sizeof(snip)-1]='\0';
+            } else {
+                /* v1 fallback: off line snippet */
+                char *tab1 = mod_strchr(linebuf,'\t'); if(!tab1) continue; char *tab2 = mod_strchr(tab1+1,'\t');
+                if (!tab2) continue; *tab1='\0'; *tab2='\0'; off = mod_atoi(linebuf); ln = mod_atoi(tab1+1); mod_strncpy(snip, tab2+1, sizeof(snip)-1); snip[sizeof(snip)-1]='\0';
+                int sl = (int)mod_strlen(snip); if (sl>0 && (snip[sl-1]=='\n' || snip[sl-1]=='\r')) snip[sl-1]='\0';
+                col = 1; end_col = col + (int)mod_strlen(snip) - 1; if (end_col < col) end_col = col;
+            }
+            if (g_dbg_count+1 > g_dbg_cap) { int nc = g_dbg_cap? g_dbg_cap*2:128; dbg_line_entry_t *tmp=(dbg_line_entry_t*)mod_realloc(g_dbg_map, nc * sizeof(dbg_line_entry_t)); if(tmp){ g_dbg_map=tmp; g_dbg_cap=nc; } else break; }
+            if (g_dbg_count < g_dbg_cap) { g_dbg_map[g_dbg_count].offset=off; g_dbg_map[g_dbg_count].line=ln; g_dbg_map[g_dbg_count].col=col; g_dbg_map[g_dbg_count].end_col=end_col; mod_strncpy(g_dbg_map[g_dbg_count].snippet, snip, sizeof(g_dbg_map[g_dbg_count].snippet)-1); g_dbg_map[g_dbg_count].snippet[sizeof(g_dbg_map[g_dbg_count].snippet)-1]='\0'; g_dbg_count++; }
+        }
+        fclose(dbg);
+        if (g_dbg_count>0) printf("Loaded debug map (%d entries)\n", g_dbg_count);
+    }
+
+    /* Load optional .sym function symbol table sidecar */
+    /* Reset symbol table globals for this run */
+    g_sym_count = 0; g_sym_cap = 0; if(g_sym_funcs){ mod_free(g_sym_funcs); g_sym_funcs=NULL; }
+    char sym_name[260];
+    mod_strncpy(sym_name, bytecode_file, blen); sym_name[blen]='\0'; mod_strcat(sym_name, ".sym");
+    FILE *sym = fopen(sym_name, "r");
+    if (sym) {
+        char linebuf[256];
+        while (fgets(linebuf, sizeof(linebuf), sym)) {
+            if (linebuf[0]=='#' || linebuf[0]=='\n' || linebuf[0]=='\0') continue;
+            int st=0,en=0,pcnt=0; char fname[64]; char plist[128]; fname[0]='\0'; plist[0]='\0';
+            /* Format: start\tend\tparams\tname\tparam_list */
+            char *t1 = mod_strchr(linebuf,'\t'); if(!t1) continue; *t1='\0'; st = mod_atoi(linebuf);
+            char *t2 = mod_strchr(t1+1,'\t'); if(!t2) continue; *t2='\0'; en = mod_atoi(t1+1);
+            char *t3 = mod_strchr(t2+1,'\t'); if(!t3) continue; *t3='\0'; pcnt = mod_atoi(t2+1);
+            char *t4 = mod_strchr(t3+1,'\t'); if(!t4) continue; *t4='\0'; mod_strncpy(fname, t3+1, sizeof(fname)-1); fname[sizeof(fname)-1]='\0';
+            char *plist_src = t4+1; int ll = (int)mod_strlen(plist_src); if(ll>0 && (plist_src[ll-1]=='\n'||plist_src[ll-1]=='\r')) plist_src[ll-1]='\0';
+            mod_strncpy(plist, plist_src, sizeof(plist)-1); plist[sizeof(plist)-1]='\0';
+            if (g_sym_count+1 > g_sym_cap) { int nc = g_sym_cap? g_sym_cap*2:64; sym_func_entry_t *tmp=(sym_func_entry_t*)mod_realloc(g_sym_funcs, nc*sizeof(sym_func_entry_t)); if(tmp){ g_sym_funcs=tmp; g_sym_cap=nc; } else break; }
+            if (g_sym_count < g_sym_cap) { g_sym_funcs[g_sym_count].start=st; g_sym_funcs[g_sym_count].end=en; g_sym_funcs[g_sym_count].params=pcnt; mod_strncpy(g_sym_funcs[g_sym_count].name,fname,sizeof(g_sym_funcs[g_sym_count].name)-1); g_sym_funcs[g_sym_count].name[sizeof(g_sym_funcs[g_sym_count].name)-1]='\0'; mod_strncpy(g_sym_funcs[g_sym_count].param_list, plist, sizeof(g_sym_funcs[g_sym_count].param_list)-1); g_sym_funcs[g_sym_count].param_list[sizeof(g_sym_funcs[g_sym_count].param_list)-1]='\0'; g_sym_count++; }
+        }
+        fclose(sym);
+        if (g_sym_count>0) printf("Loaded symbol table (%d functions)\n", g_sym_count);
+    }
+    /* Helpers now at file scope above */
     
     // Initialize runtime state
     runtime_var_count = 0;
@@ -1309,241 +2036,67 @@ int run_bytecode_file(const char *bytecode_file)
                     } \
                 } while (0)
 
-                if (mod_strcmp(func_name, "typeof") == 0) {
-                    if (argc < 1) { printf("Runtime error: typeof(x) requires one arg\n"); FREE_ARGS(); break; }
-                    const char *tn = "unknown";
-                    if (args[0].type == RT_VAR_INT) tn = "int";
-                    else if (args[0].type == RT_VAR_FLOAT) tn = "float";
-                    else if (args[0].type == RT_VAR_STRING) tn = "string";
-                    else if (args[0].type == RT_VAR_NULL) tn = "null";
-                    else if (args[0].type == RT_VAR_HANDLE) {
-                        rt_object_header_t *h = (rt_object_header_t *)args[0].value.handle_ptr;
-                        if (h) {
-                            switch (h->type) {
-                                case OBJ_DICT: tn = "dict"; break;
-                                case OBJ_LIST: tn = "list"; break;
-                                case OBJ_SET: tn = "set"; break;
-                                case OBJ_REGEX: tn = "regex"; break;
-                                case OBJ_OPTIONAL: tn = "optional"; break;
-                                case OBJ_UNION: tn = "union"; break;
-                                default: tn = "object"; break;
-                            }
-                        } else tn = "object";
-                    }
-                    push_string(tn);
-                    FREE_ARGS();
-                } else if (mod_strcmp(func_name, "list") == 0) {
-                    // list(arg1, arg2, ...) -> creates a list from the arguments
-                    rt_list_t *l = (rt_list_t *)mod_malloc(sizeof(rt_list_t));
-                    if (!l) { push_null(); FREE_ARGS(); break; }
-                    l->hdr.refcount = 1; l->hdr.type = OBJ_LIST;
-                    l->size = argc; l->cap = (argc > 0) ? argc : 1;
-                    l->items = (stack_value_t *)mod_malloc(sizeof(stack_value_t) * l->cap);
-                    if (!l->items) { mod_free(l); push_null(); FREE_ARGS(); break; }
+                int used_bridge = 0;
+                if (argc >= 0) {
+                    // Attempt bridge dispatch first for full interpreter parity.
+                    bridge_value_t bargs[BUILTIN_MAX_ARGS];
+                    bridge_value_t bout; bridge_value_init(&bout);
+                    if (argc > BUILTIN_MAX_ARGS) argc = BUILTIN_MAX_ARGS; // clamp
+                    for (int i = 0; i < argc; i++) bridge_value_init(&bargs[i]);
+                    // Convert runtime args -> bridge args
                     for (int i = 0; i < argc; i++) {
-                        l->items[i] = copy_value(args[i]);
+                        stack_value_t *sv = &args[i];
+                        if (sv->type == RT_VAR_INT) { bargs[i].type = BRIDGE_VAL_INT; bargs[i].data.i = sv->value.int_value; }
+                        else if (sv->type == RT_VAR_FLOAT) { bargs[i].type = BRIDGE_VAL_FLOAT; bargs[i].data.f = sv->value.float_value; }
+                        else if (sv->type == RT_VAR_STRING) { bargs[i].type = BRIDGE_VAL_STRING; bargs[i].data.s = sv->value.string_value; bargs[i].owns = 0; }
+                        else if (sv->type == RT_VAR_HANDLE) { bargs[i].type = BRIDGE_VAL_HANDLE; bargs[i].data.handle = sv->value.handle_ptr; }
+                        else { bargs[i].type = BRIDGE_VAL_NULL; }
                     }
-                    registry_add(l);
-                    push_handle(l);
-                    FREE_ARGS();
-                } else if (mod_strcmp(func_name, "list_size") == 0) {
-                    if (argc < 1 || args[0].type != RT_VAR_HANDLE) { printf("Runtime error: list_size(list)\n"); push_int(0); FREE_ARGS(); break; }
-                    rt_list_t *l = (rt_list_t*)args[0].value.handle_ptr;
-                    if (!l || l->hdr.type != OBJ_LIST) { push_int(0); FREE_ARGS(); break; }
-                    push_int(l->size);
-                    FREE_ARGS();
-                } else if (mod_strcmp(func_name, "regex_match") == 0) {
-                    if (argc < 2) { printf("Runtime error: regex_match requires 2 arguments\n"); FREE_ARGS(); break; }
-                    bool match_result = false;
-                    if (args[0].type == RT_VAR_HANDLE && args[1].type == RT_VAR_STRING) {
-                        rt_regex_t* regex_obj = (rt_regex_t*)args[0].value.handle_ptr;
-                        if (regex_obj && regex_obj->hdr.type == OBJ_REGEX && regex_obj->rx) {
-                            match_result = regex_match(regex_obj->rx, args[1].value.string_value);
+                    int bd = bridge_dispatch(func_name, argc, bargs, &bout);
+                    if (bd == BRIDGE_OK) {
+                        // Free original string args we consumed if any
+                        for (int i = 0; i < argc; i++) {
+                            if (args[i].type == RT_VAR_STRING && args[i].value.string_value) {
+                                mod_free(args[i].value.string_value);
+                                args[i].value.string_value = NULL;
+                            }
                         }
-                    } else if (args[0].type == RT_VAR_STRING && args[1].type == RT_VAR_STRING) {
-                        RegexPattern* rx = regex_compile(args[0].value.string_value, 0);
-                        if (rx) {
-                            match_result = regex_match(rx, args[1].value.string_value);
-                            regex_destroy(rx);
+                        // Push bridge result
+                        switch (bout.type) {
+                            case BRIDGE_VAL_INT: push_int(bout.data.i); break;
+                            case BRIDGE_VAL_FLOAT: push_float(bout.data.f); break;
+                            case BRIDGE_VAL_STRING: push_string(bout.data.s ? bout.data.s : ""); if (bout.owns && bout.data.s) mod_free(bout.data.s); break;
+                            case BRIDGE_VAL_HANDLE: push_handle(bout.data.handle); break;
+                            case BRIDGE_VAL_NULL: default: push_null(); break;
                         }
-                    } else {
-                        printf("Runtime error: regex_match(regex_or_pattern, text)\n");
-                        push_int(0);
-                        FREE_ARGS();
-                        break;
-                    }
-                    push_int(match_result ? 1 : 0);
-                    FREE_ARGS();
-                } else if (mod_strcmp(func_name, "regex_replace") == 0) {
-                    if (argc < 3 || args[0].type != RT_VAR_STRING || args[1].type != RT_VAR_STRING || args[2].type != RT_VAR_STRING) { printf("Runtime error: regex_replace(pattern, text, repl)\n"); push_string(""); FREE_ARGS(); break; }
-                    RegexPattern* rx = regex_compile(args[0].value.string_value, 0);
-                    if (!rx) { push_string(""); FREE_ARGS(); break; }
-                    char* out = regex_replace(rx, args[1].value.string_value, args[2].value.string_value);
-                    regex_destroy(rx);
-                    if (!out) { push_string(""); FREE_ARGS(); break; }
-                    push_string(out);
-                    mod_free(out);
-                    FREE_ARGS();
-                } else if (mod_strcmp(func_name, "regex") == 0) {
-                    if (argc < 1 || args[0].type != RT_VAR_STRING) { printf("Runtime error: regex(pattern)\n"); push_null(); FREE_ARGS(); break; }
-                    rt_regex_t *r = (rt_regex_t *)mod_malloc(sizeof(rt_regex_t));
-                    if (!r) { push_null(); FREE_ARGS(); break; }
-                    r->hdr.refcount = 1; r->hdr.type = OBJ_REGEX;
-                    r->pattern = mod_strdup(args[0].value.string_value);
-                    r->rx = regex_compile(args[0].value.string_value, 0);
-                    registry_add(r);
-                    push_handle(r);
-                    FREE_ARGS();
-                } else if (mod_strcmp(func_name, "range") == 0) {
-                    int start = 0, end = 0;
-                    if (argc == 1 && args[0].type == RT_VAR_INT) { start = 0; end = args[0].value.int_value; }
-                    else if (argc >= 2 && args[0].type == RT_VAR_INT && args[1].type == RT_VAR_INT) { start = args[0].value.int_value; end = args[1].value.int_value; }
-                    else { printf("Runtime error: range(n) or range(start, end)\n"); push_handle(NULL); FREE_ARGS(); break; }
-                    if (end < start) { int tmp = start; start = end; end = tmp; }
-                    int n = (end > start) ? (end - start) : 0;
-                    rt_list_t *l = (rt_list_t *)mod_malloc(sizeof(rt_list_t));
-                    if (!l) { push_null(); FREE_ARGS(); break; }
-                    l->hdr.refcount = 1; l->hdr.type = OBJ_LIST;
-                    l->size = n; l->cap = (n > 0) ? n : 1;
-                    l->items = (stack_value_t *)mod_malloc(sizeof(stack_value_t) * l->cap);
-                    if (!l->items) { mod_free(l); push_null(); FREE_ARGS(); break; }
-                    for (int i = 0; i < n; i++) { l->items[i].type = RT_VAR_INT; l->items[i].value.int_value = start + i; }
-                    registry_add(l);
-                    push_handle(l);
-                    FREE_ARGS();
-                } else if (mod_strcmp(func_name, "cast") == 0) {
-                    if (argc >= 2 && args[1].type == RT_VAR_STRING) {
-                        const char* target_type = args[1].value.string_value;
-                        if (mod_strcmp(target_type, "int") == 0) {
-                            if (args[0].type == RT_VAR_FLOAT) push_int((int)args[0].value.float_value);
-                            else if (args[0].type == RT_VAR_INT) push_int(args[0].value.int_value);
-                            else push_int(0);
-                        } else if (mod_strcmp(target_type, "float") == 0) {
-                            if (args[0].type == RT_VAR_INT) push_float((float)args[0].value.int_value);
-                            else if (args[0].type == RT_VAR_FLOAT) push_float(args[0].value.float_value);
-                            else push_float(0.0f);
-                        } else if (mod_strcmp(target_type, "string") == 0) {
-                            if (args[0].type == RT_VAR_INT) { char buf[32]; sprintf(buf, "%d", args[0].value.int_value); push_string(mod_strdup(buf)); }
-                            else if (args[0].type == RT_VAR_FLOAT) { char buf[32]; sprintf(buf, "%.6f", args[0].value.float_value); push_string(mod_strdup(buf)); }
-                            else if (args[0].type == RT_VAR_STRING) { push_string(args[0].value.string_value); }
-                            else { push_string(mod_strdup("")); }
+                        bridge_value_free(&bout);
+                        used_bridge = 1;
+                    } else if (bd == BRIDGE_ERROR) {
+                                /* Bridge failure parity: create BuiltinError. */
+                                char msg[128]; mod_snprintf(msg,sizeof(msg),"Builtin %s failed", func_name?func_name:"?");
+                                void *exc = rt_exception_create("BuiltinError", msg, bytecode_file, 0);
+                        if (exc) {
+                            /* Attempt a debug line lookup using next instruction pointer (pc still points after call header). */
+                            int approx_line = 0, approx_col = 0, approx_end = 0; if (g_dbg_count>0) { dbg_lookup_line_cols(pc, &approx_line, &approx_col, &approx_end); }
+                            const char *fname = func_name?func_name:"<builtin>";
+                            if (approx_col>0) rt_exception_add_frame_col(exc, fname, bytecode_file, approx_line, approx_col, approx_end);
+                            else rt_exception_add_frame(exc, fname, bytecode_file, approx_line);
+                            push_handle(exc);
                         } else {
                             push_null();
                         }
-                    } else {
-                        push_null();
+                        bridge_value_free(&bout);
+                        FREE_ARGS();
+                        break; /* Continue execution */
                     }
-                    FREE_ARGS();
-                } else if (mod_strcmp(func_name, "is_null") == 0) {
-                    push_int((argc >= 1 && args[0].type == RT_VAR_NULL) ? 1 : 0);
-                    FREE_ARGS();
-                } else if (mod_strcmp(func_name, "is_type") == 0) {
-                    int matches = 0;
-                    if (argc >= 2 && args[1].type == RT_VAR_STRING) {
-                        const char* check_type = args[1].value.string_value;
-                        if (mod_strcmp(check_type, "int") == 0 && args[0].type == RT_VAR_INT) matches = 1;
-                        else if (mod_strcmp(check_type, "float") == 0 && args[0].type == RT_VAR_FLOAT) matches = 1;
-                        else if (mod_strcmp(check_type, "string") == 0 && args[0].type == RT_VAR_STRING) matches = 1;
-                        else if (mod_strcmp(check_type, "null") == 0 && args[0].type == RT_VAR_NULL) matches = 1;
-                        else if (mod_strcmp(check_type, "handle") == 0 && args[0].type == RT_VAR_HANDLE) matches = 1;
-                    }
-                    push_int(matches);
-                    FREE_ARGS();
-                } else if (mod_strcmp(func_name, "optional_create") == 0) {
-                    rt_optional_t *o = (rt_optional_t *)mod_malloc(sizeof(rt_optional_t));
-                    if (!o) { push_null(); FREE_ARGS(); break; }
-                    o->hdr.refcount = 1; o->hdr.type = OBJ_OPTIONAL;
-                    if (argc >= 1) { o->has_value = 1; o->value = copy_value(args[0]); }
-                    else { o->has_value = 0; o->value.type = RT_VAR_NULL; o->value.value.int_value = 0; }
-                    registry_add(o);
-                    push_handle(o);
-                    FREE_ARGS();
-                } else if (mod_strcmp(func_name, "optional_has_value") == 0) {
-                    if (argc < 1 || args[0].type != RT_VAR_HANDLE) { push_int(0); FREE_ARGS(); break; }
-                    rt_optional_t *o = (rt_optional_t*)args[0].value.handle_ptr;
-                    push_int((o && o->hdr.type == OBJ_OPTIONAL && o->has_value) ? 1 : 0);
-                    FREE_ARGS();
-                } else if (mod_strcmp(func_name, "optional_get") == 0) {
-                    if (argc < 1 || args[0].type != RT_VAR_HANDLE) { push_null(); FREE_ARGS(); break; }
-                    rt_optional_t *o = (rt_optional_t*)args[0].value.handle_ptr;
-                    if (o && o->hdr.type == OBJ_OPTIONAL && o->has_value) {
-                        stack_value_t cv = copy_value(o->value);
-                        if (cv.type == RT_VAR_INT) push_int(cv.value.int_value);
-                        else if (cv.type == RT_VAR_FLOAT) push_float(cv.value.float_value);
-                        else if (cv.type == RT_VAR_STRING) push_string(cv.value.string_value);
-                        else if (cv.type == RT_VAR_HANDLE) push_handle(cv.value.handle_ptr);
-                        else push_null();
-                        free_value_shallow(cv);
-                    } else {
-                        push_null();
-                    }
-                    FREE_ARGS();
-                } else if (mod_strcmp(func_name, "union_create") == 0) {
-                    if (argc < 1 || args[0].type != RT_VAR_STRING) { push_null(); FREE_ARGS(); break; }
-                    rt_union_t *u = (rt_union_t *)mod_malloc(sizeof(rt_union_t));
-                    if (!u) { push_null(); FREE_ARGS(); break; }
-                    u->hdr.refcount = 1; u->hdr.type = OBJ_UNION;
-                    u->tag = mod_strdup(args[0].value.string_value);
-                    if (argc >= 2) { u->value = copy_value(args[1]); }
-                    else { u->value.type = RT_VAR_NULL; u->value.value.int_value = 0; }
-                    registry_add(u);
-                    push_handle(u);
-                    FREE_ARGS();
-                } else if (mod_strcmp(func_name, "map") == 0) {
-                    // map(list, lambda) -> for now, copy list (placeholder)
-                    if (argc < 2 || args[0].type != RT_VAR_HANDLE) { printf("Runtime error: map(list, lambda)\n"); push_null(); FREE_ARGS(); break; }
-                    rt_list_t *input = (rt_list_t*)args[0].value.handle_ptr;
-                    if (!input || input->hdr.type != OBJ_LIST) { push_null(); FREE_ARGS(); break; }
-                    rt_list_t *result = (rt_list_t *)mod_malloc(sizeof(rt_list_t));
-                    if (!result) { push_null(); FREE_ARGS(); break; }
-                    result->hdr.refcount = 1; result->hdr.type = OBJ_LIST;
-                    result->size = input->size; result->cap = input->size > 0 ? input->size : 1;
-                    result->items = (stack_value_t*)mod_malloc(sizeof(stack_value_t) * result->cap);
-                    if (!result->items) { mod_free(result); push_null(); FREE_ARGS(); break; }
-                    for (int i = 0; i < input->size; i++) result->items[i] = copy_value(input->items[i]);
-                    registry_add(result); push_handle(result); FREE_ARGS();
-                } else if (mod_strcmp(func_name, "filter") == 0) {
-                    // filter(list, predicate) -> for now, return shallow copy (placeholder)
-                    if (argc < 2 || args[0].type != RT_VAR_HANDLE) { printf("Runtime error: filter(list, predicate)\n"); push_null(); FREE_ARGS(); break; }
-                    rt_list_t *input = (rt_list_t*)args[0].value.handle_ptr;
-                    if (!input || input->hdr.type != OBJ_LIST) { push_null(); FREE_ARGS(); break; }
-                    rt_list_t *result = (rt_list_t *)mod_malloc(sizeof(rt_list_t));
-                    if (!result) { push_null(); FREE_ARGS(); break; }
-                    result->hdr.refcount = 1; result->hdr.type = OBJ_LIST;
-                    result->size = input->size; result->cap = input->size > 0 ? input->size : 1;
-                    result->items = (stack_value_t*)mod_malloc(sizeof(stack_value_t) * result->cap);
-                    if (!result->items) { mod_free(result); push_null(); FREE_ARGS(); break; }
-                    for (int i = 0; i < input->size; i++) result->items[i] = copy_value(input->items[i]);
-                    registry_add(result); push_handle(result); FREE_ARGS();
-                } else if (mod_strcmp(func_name, "reduce") == 0) {
-                    // reduce(list, lambda, init) -> placeholder returns init unchanged
-                    if (argc >= 3) {
-                        stack_value_t init = args[2];
-                        if (init.type == RT_VAR_INT) push_int(init.value.int_value);
-                        else if (init.type == RT_VAR_FLOAT) push_float(init.value.float_value);
-                        else if (init.type == RT_VAR_STRING) push_string(init.value.string_value);
-                        else if (init.type == RT_VAR_HANDLE) push_handle(init.value.handle_ptr);
-                        else push_null();
-                    } else {
-                        push_null();
-                    }
-                    FREE_ARGS();
-                } else if (mod_strcmp(func_name, "compose") == 0) {
-                    // Return a placeholder function object for composed function
-                    rt_object_header_t *fn = (rt_object_header_t *)mod_malloc(sizeof(rt_object_header_t));
-                    if (!fn) { push_null(); FREE_ARGS(); break; }
-                    fn->refcount = 1; fn->type = OBJ_DICT; // placeholder
-                    registry_add(fn); push_handle(fn); FREE_ARGS();
-                } else if (mod_strcmp(func_name, "curry") == 0) {
-                    rt_object_header_t *fn = (rt_object_header_t *)mod_malloc(sizeof(rt_object_header_t));
-                    if (!fn) { push_null(); FREE_ARGS(); break; }
-                    fn->refcount = 1; fn->type = OBJ_DICT; // placeholder
-                    registry_add(fn); push_handle(fn); FREE_ARGS();
-                } else {
-                    printf("Runtime warning: Unknown built-in '%s' - returning null\n", func_name);
-                    push_null();
-                    FREE_ARGS();
                 }
+                if (used_bridge) { FREE_ARGS(); break; }
+
+                // All known built-ins are now handled exclusively via bridge_dispatch above.
+                // If we reached here, the bridge did not recognize the function name.
+                printf("Runtime warning: Unknown built-in '%s' - returning null (bridge fallback)\n", func_name);
+                push_null();
+                FREE_ARGS();
                 break;
             }
             
@@ -1572,9 +2125,19 @@ int run_bytecode_file(const char *bytecode_file)
                 call_stack[call_top].return_pc = pc;
                 call_stack[call_top].stack_marker = stack_top - argc + 1; // position of first arg on stack
                 call_stack[call_top].local_count = 0;
-
                 // Jump to function body
                 pc = target_addr;
+                /* Automatic frame injection: append frame for active exception (deferred stack building).
+                   If no current exception, we defer until an exception arises (future improvement: maintain shadow call trace). */
+                void *cur_exc = rt_exception_current();
+                if (cur_exc) {
+                    int line_no = dbg_lookup_line(target_addr); int col_no=0, end_col=0; if(g_dbg_count>0){ dbg_lookup_line_cols(target_addr,&line_no,&col_no,&end_col); }
+                    const char *sname = sym_lookup(target_addr);
+                    char fname[64];
+                    if (sname) { mod_strncpy(fname, sname, sizeof(fname)-1); fname[sizeof(fname)-1]='\0'; }
+                    else { mod_snprintf(fname,sizeof(fname),"<fn@%d>", target_addr); }
+                    if(col_no>0) rt_exception_add_frame_col(cur_exc, fname, bytecode_file, line_no, col_no, end_col); else rt_exception_add_frame(cur_exc, fname, bytecode_file, line_no);
+                }
                 break;
             }
             
@@ -1615,11 +2178,14 @@ int run_bytecode_file(const char *bytecode_file)
                 pc = call_stack[call_top].return_pc;
                 // Free any string/handle locals
                 for (int i = 0; i < call_stack[call_top].local_count; i++) {
-                    if (call_stack[call_top].locals[i].is_used && call_stack[call_top].locals[i].type == RT_VAR_STRING && call_stack[call_top].locals[i].value.string_value) {
-                        mod_free(call_stack[call_top].locals[i].value.string_value);
-                    }
-                    if (call_stack[call_top].locals[i].is_used && call_stack[call_top].locals[i].type == RT_VAR_HANDLE && call_stack[call_top].locals[i].value.handle_ptr) {
-                        release_obj(call_stack[call_top].locals[i].value.handle_ptr);
+                    if (call_stack[call_top].locals[i].is_used) {
+                        if (call_stack[call_top].locals[i].type == RT_VAR_STRING && call_stack[call_top].locals[i].value.string_value) {
+                            mod_free(call_stack[call_top].locals[i].value.string_value);
+                            call_stack[call_top].locals[i].value.string_value = NULL;
+                        } else if (call_stack[call_top].locals[i].type == RT_VAR_HANDLE && call_stack[call_top].locals[i].value.handle_ptr) {
+                            release_obj(call_stack[call_top].locals[i].value.handle_ptr);
+                            call_stack[call_top].locals[i].value.handle_ptr = NULL;
+                        }
                     }
                     call_stack[call_top].locals[i].is_used = 0;
                 }
@@ -1664,6 +2230,7 @@ int run_bytecode_file(const char *bytecode_file)
                 
                 lambda_obj->refcount = 1;
                 lambda_obj->type = OBJ_DICT; // Use DICT type as placeholder for lambda
+                lambda_obj->freeing = 0;
                 
                 // Store parameter count after the header
                 *((int*)(lambda_obj + 1)) = param_count;
@@ -1696,8 +2263,7 @@ int run_bytecode_file(const char *bytecode_file)
                     printf("Runtime error: Failed to allocate dictionary\n");
                     goto cleanup;
                 }
-                d->hdr.refcount = 1;
-                d->hdr.type = OBJ_DICT;
+                INIT_OBJ_HDR(d, OBJ_DICT);
                 d->size = 0;
                 d->cap = 8;
                 d->items = (rt_kv_t *)mod_malloc(sizeof(rt_kv_t) * d->cap);
@@ -1718,8 +2284,7 @@ int run_bytecode_file(const char *bytecode_file)
                     printf("Runtime error: Failed to allocate list\n");
                     goto cleanup;
                 }
-                l->hdr.refcount = 1;
-                l->hdr.type = OBJ_LIST;
+                INIT_OBJ_HDR(l, OBJ_LIST);
                 l->size = 0;
                 l->cap = 8;
                 l->items = (stack_value_t *)mod_malloc(sizeof(stack_value_t) * l->cap);
@@ -1740,8 +2305,7 @@ int run_bytecode_file(const char *bytecode_file)
                     printf("Runtime error: Failed to allocate set\n");
                     goto cleanup;
                 }
-                s->hdr.refcount = 1;
-                s->hdr.type = OBJ_SET;
+                INIT_OBJ_HDR(s, OBJ_SET);
                 s->size = 0;
                 s->cap = 8;
                 s->items = (stack_value_t *)mod_malloc(sizeof(stack_value_t) * s->cap);
@@ -1790,8 +2354,7 @@ int run_bytecode_file(const char *bytecode_file)
                     goto cleanup;
                 }
                 
-                result_list->hdr.refcount = 1;
-                result_list->hdr.type = OBJ_LIST;
+                INIT_OBJ_HDR(result_list, OBJ_LIST);
                 result_list->size = input_list->size;
                 result_list->cap = input_list->size > 0 ? input_list->size : 1;
                 result_list->items = (stack_value_t *)mod_malloc(sizeof(stack_value_t) * result_list->cap);
@@ -1852,8 +2415,7 @@ int run_bytecode_file(const char *bytecode_file)
                     goto cleanup;
                 }
                 
-                result_list->hdr.refcount = 1;
-                result_list->hdr.type = OBJ_LIST;
+                INIT_OBJ_HDR(result_list, OBJ_LIST);
                 result_list->size = input_list->size;
                 result_list->cap = input_list->size > 0 ? input_list->size : 1;
                 result_list->items = (stack_value_t *)mod_malloc(sizeof(stack_value_t) * result_list->cap);
@@ -2405,6 +2967,7 @@ int run_bytecode_file(const char *bytecode_file)
     }
     
 cleanup:
+    if (g_dbg_map) { mod_free(g_dbg_map); g_dbg_map=NULL; g_dbg_count=0; g_dbg_cap=0; }
     cleanup_runtime_vars();
     mod_free(code);
     if (data) mod_free(data);

@@ -1,0 +1,102 @@
+/* Shared builtin list (X-macro) to keep compiler and bridge in sync.
+   Usage:
+     #define OAK_BUILTIN(name) ...
+     #include "h.builtins"
+     #undef OAK_BUILTIN
+*/
+#ifndef OAK_BUILTINS_LIST_GUARD
+#define OAK_BUILTINS_LIST_GUARD
+
+/* Exception system */
+OAK_BUILTIN(define_exception)
+OAK_BUILTIN(create_exception)
+OAK_BUILTIN(current_exception)
+OAK_BUILTIN(exception_is_a)
+OAK_BUILTIN(exception_stack_trace)
+OAK_BUILTIN(exception_description)
+OAK_BUILTIN(exception_add_frame)
+OAK_BUILTIN(try_call)
+/* Functional */
+OAK_BUILTIN(compose)
+OAK_BUILTIN(partial)
+OAK_BUILTIN(memoize)
+OAK_BUILTIN(map)
+OAK_BUILTIN(filter)
+OAK_BUILTIN(reduce)
+OAK_BUILTIN(lambda)
+/* Optional/Union */
+OAK_BUILTIN(optional_create)
+OAK_BUILTIN(optional_has_value)
+OAK_BUILTIN(optional_get)
+OAK_BUILTIN(union_create)
+OAK_BUILTIN(union_set)
+OAK_BUILTIN(union_tag)
+/* Type helpers */
+OAK_BUILTIN(typeof)
+OAK_BUILTIN(is_type)
+OAK_BUILTIN(is_null)
+OAK_BUILTIN(cast)
+/* Regex & string */
+OAK_BUILTIN(regex)
+OAK_BUILTIN(regex_match)
+OAK_BUILTIN(regex_replace)
+OAK_BUILTIN(interpolate)
+OAK_BUILTIN(multiline)
+/* Range */
+OAK_BUILTIN(range)
+/* Debug/Introspection */
+OAK_BUILTIN(debug_object_counts)
+OAK_BUILTIN(debug_object_audit)
+
+/* Math */
+OAK_BUILTIN(abs)
+OAK_BUILTIN(min)
+OAK_BUILTIN(max)
+OAK_BUILTIN(mod)
+OAK_BUILTIN(clamp)
+OAK_BUILTIN(pow)
+OAK_BUILTIN(isqrt)
+OAK_BUILTIN(square)
+OAK_BUILTIN(divide)
+OAK_BUILTIN(multiply)
+
+/* RNG */
+OAK_BUILTIN(srand)
+OAK_BUILTIN(rand)
+OAK_BUILTIN(rand_seed)
+
+/* Collections (list/dict/set) */
+OAK_BUILTIN(list)
+OAK_BUILTIN(list_size)
+OAK_BUILTIN(list_append)
+OAK_BUILTIN(list_get)
+OAK_BUILTIN(dict)
+OAK_BUILTIN(dict_size)
+OAK_BUILTIN(dict_has)
+OAK_BUILTIN(dict_set)
+OAK_BUILTIN(dict_get)
+OAK_BUILTIN(dict_remove)
+OAK_BUILTIN(dict_keys)
+OAK_BUILTIN(set)
+OAK_BUILTIN(set_size)
+OAK_BUILTIN(set_add)
+OAK_BUILTIN(set_contains)
+
+/* Optional/Union aliases & helpers */
+OAK_BUILTIN(optional) /* alias of optional_create */
+OAK_BUILTIN(union)    /* alias of union_create */
+OAK_BUILTIN(union_get)
+
+/* Functional alias */
+OAK_BUILTIN(curry) /* alias of partial */
+
+/* Exception accessors */
+OAK_BUILTIN(exception_type)
+OAK_BUILTIN(exception_message)
+OAK_BUILTIN(exception_file)
+OAK_BUILTIN(exception_line)
+
+/* Filesystem */
+OAK_BUILTIN(file_exists)
+
+#endif /* OAK_BUILTINS_LIST_GUARD */

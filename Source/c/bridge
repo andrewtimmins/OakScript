@@ -1,0 +1,484 @@
+#include "h.bridge"
+#include "h.memory"
+#include "h.strings"
+#include "h.rt_objects"
+#include <stdio.h>
+#include "h.advanced"
+
+/* Forward (file-scope) declarations for internal RNG helpers used before their definition */
+static void bridge_rng_init_once(void);
+static int builtin_rand(void);
+static unsigned int bridge_rand_state; /* defined later */
+
+/* Forward for registry_add and object header init from runtime */
+extern void registry_add(void *obj); /* runtime internal */
+extern void retain_obj(void *obj); /* if needed */
+extern void release_obj(void *obj);
+extern void *mod_calloc(size_t n, size_t sz); /* ensure available */
+extern void *mod_realloc(void *p, size_t n);
+extern char *mod_strdup(const char *s);
+extern void *rt_exception_create(const char *type,const char *msg,const char *file,int line);
+extern void rt_exception_add_frame(void *exc,const char *function,const char *file,int line);
+extern int rt_object_enumerate(int (*cb)(void*,int,int,void*), void *ud);
+
+/* Minimal wrapper turning LambdaFunc into runtime object: we piggy-back LambdaFunc memory but prepend header layout? For now we rely on legacy OBJ_LAMBDA usage and LambdaFunc allocated separately; runtime invoke casts. */
+extern LambdaFunc* lambda_create(char** params, int param_count, char* body);
+extern void lambda_destroy(LambdaFunc* func);
+
+/* Forward declarations to interpreter-side helpers we can reuse.
+ * If some symbols are currently static in interpreter files, they will need exposing via headers.
+ * For now we implement a minimal subset directly; later we refactor interpreter to call the same helpers. */
+
+static int bridge_initialized = 0;
+/* Forward prototype to avoid implicit int when called before definition */
+static void bridge_verify_parity(void);
+
+void bridge_value_init(bridge_value_t *v) {
+    if (!v) return; v->type = BRIDGE_VAL_NULL; v->data.i = 0; v->owns = 0; }
+
+void bridge_value_free(bridge_value_t *v) {
+    if (!v) return; if (v->type == BRIDGE_VAL_STRING && v->data.s && v->owns) { mod_free(v->data.s); }
+    v->type = BRIDGE_VAL_NULL; v->data.i = 0; v->owns = 0; }
+
+int bridge_init(void) { if (bridge_initialized) return 1; bridge_initialized = 1; bridge_rng_init_once();
+    bridge_verify_parity();
+    const char *verb = getenv("OAKS_VERBOSE"); if(verb && *verb && *verb!='0'){ unsigned int snap = bridge_rand_state; int r1=builtin_rand(); int r2=builtin_rand(); int r3=builtin_rand(); printf("[bridge][rng] seed=%u first=[%d,%d,%d]\n", snap, r1, r2, r3); bridge_rand_state = snap; }
+    return 1; }
+/* Parity check: Iterate declared builtins and probe dispatch returning warning if missing */
+static void bridge_verify_parity(void){
+    static int done=0; if(done) return; done=1;
+    struct { const char *name; } entries[] = {
+#define OAK_BUILTIN(n) { #n },
+#include "h.builtins"
+#undef OAK_BUILTIN
+        { NULL }
+    };
+    for (int i=0; entries[i].name; i++) {
+        bridge_value_t dummy; bridge_value_init(&dummy);
+        int r = bridge_dispatch(entries[i].name, 0, NULL, &dummy);
+        if (r == BRIDGE_ERROR) {
+            printf("[bridge] Warning: builtin '%s' not currently implemented in bridge\n", entries[i].name);
+        }
+        bridge_value_free(&dummy);
+    }
+}
+/* Call after bridge_init externally if desired */
+void bridge_shutdown(void) { bridge_initialized = 0; }
+
+/* Helper conversions for simple math/string built-ins
+ * NOTE: These will later delegate to interpreter central table. */
+static int builtin_abs_int(int a) { return (a < 0) ? -a : a; }
+static int builtin_min_int(int a, int b) { return (a < b) ? a : b; }
+static int builtin_max_int(int a, int b) { return (a > b) ? a : b; }
+static int builtin_mod_int(int a, int b) { if(b==0) return 0; return (a % b); }
+static int builtin_clamp_int(int v, int lo, int hi) { if (lo>hi){int t=lo;lo=hi;hi=t;} return v<lo?lo:(v>hi?hi:v); }
+static int builtin_pow_int(int base, int exp) { if (exp<0) return 0; int r=1; while (exp){ if (exp&1) r*=base; base*=base; exp>>=1;} return r; }
+static int builtin_isqrt_int(int n){ if(n<=0) return 0; int x=n; int y=(x+1)/2; while (y<x){ x=y; y=(x+n/x)/2;} return x; }
+static int builtin_square_int(int a){ return a*a; }
+static int builtin_divide_int(int a,int b){ if(b==0) return 0; return (a/b); }
+static int builtin_multiply_int(int a,int b){ return a*b; }
+
+/* ---- Object audit support (file-scope) ---- */
+typedef struct { int bad; int total; int zero_ref; int neg_ref; int null_hdr; } audit_ctx_t;
+static int audit_callback(void *obj,int type,int refcount,void *ud){ (void)obj; audit_ctx_t *c=(audit_ctx_t*)ud; c->total++; if(type<0) { c->bad++; c->null_hdr++; } else if(refcount==0){ c->bad++; c->zero_ref++; } else if(refcount<0){ c->bad++; c->neg_ref++; } return 1; }
+
+/* Simple LCG RAND (shared with interpreter if needed) */
+static unsigned int bridge_rand_state = 1u; /* current state */
+static unsigned int bridge_rand_initial_seed = 1u; /* canonical initial seed (may be overridden by env var) */
+static int bridge_rand_seed_locked = 0; /* once user calls srand we record that */
+static void bridge_rng_init_once(void){
+    static int done=0; if(done) return; done=1;
+    /* Environment overrides (prefer RISC OS style variable then generic) */
+    const char *sv = getenv("OakScript$Seed"); if(!sv || !*sv) sv = getenv("OAKS_SEED");
+    if(sv && *sv){ unsigned int v = (unsigned int)mod_atoi(sv); bridge_rand_initial_seed = v; }
+    bridge_rand_state = bridge_rand_initial_seed;
+}
+static void builtin_srand(unsigned int seed){ bridge_rng_init_once(); bridge_rand_state = seed; bridge_rand_initial_seed = seed; bridge_rand_seed_locked = 1; }
+static int builtin_rand(void){ bridge_rand_state = bridge_rand_state*1103515245u + 12345u; return (int)((bridge_rand_state>>16) & 0x7FFF); }
+
+/* Forward decl for file_exists (implemented minimally using OS_File if available or always 0) */
+extern int os_file_exists(const char *path); /* If not provided, we'll fallback */
+#ifndef HAVE_OS_FILE_EXISTS
+/* Stub: RISC OS specific file check not yet integrated. Always return 0 (not exists). */
+int os_file_exists(const char *path) {
+    (void)path;
+    return 0; /* TODO: implement using OS_File once available */
+}
+#endif
+
+/* Range builder: constructs a runtime list object via rt_list_* APIs.
+   Supports:
+     range(end)
+     range(start,end)
+     range(start,end,step)  (step can be negative; step != 0)
+   Semantics: end is exclusive (Python style). */
+static bridge_value_t build_range_list(int start, int end, int step) {
+    bridge_value_t v; bridge_value_init(&v);
+    if (step == 0) { return v; }
+    int count = 0;
+    if (step > 0) {
+        if (start < end) count = (end - start + step - 1) / step; else count = 0;
+    } else { /* step < 0 */
+        if (start > end) count = (start - end + (-step) - 1) / (-step); else count = 0;
+    }
+    if (count < 0) count = 0;
+    void *list = rt_list_create(count);
+    if (!list) return v;
+    int cur = start; int added = 0;
+    while ((step > 0 && cur < end) || (step < 0 && cur > end)) {
+        bridge_value_t elem; bridge_value_init(&elem); elem.type = BRIDGE_VAL_INT; elem.data.i = cur;
+        rt_list_append(list, &elem);
+        if (step > 0) {
+            if (cur > end - step) break; /* guard overflow */
+        } else {
+            if (cur < end - step) break; /* guard overflow for negative */
+        }
+        cur += step; added++;
+        if (added > 1000000) break; /* safety cap */
+    }
+    v.type = BRIDGE_VAL_HANDLE; v.data.handle = list; return v;
+}
+
+/* Convert argument to int if possible */
+static int arg_to_int(const bridge_value_t *v, int *ok) {
+    if (!v) { *ok = 0; return 0; }
+    switch (v->type) {
+        case BRIDGE_VAL_INT: *ok = 1; return v->data.i;
+        case BRIDGE_VAL_FLOAT: *ok = 1; return (int)v->data.f;
+        case BRIDGE_VAL_STRING: *ok = 0; return 0; /* TODO: numeric parse */
+        default: *ok = 0; return 0;
+    }
+}
+
+int bridge_dispatch(const char *name, int argc, bridge_value_t *args, bridge_value_t *out) {
+    bridge_rng_init_once();
+    if (mod_strcmp(name, "lambda") == 0) {
+        if (argc != 2 || args[0].type != BRIDGE_VAL_STRING || args[1].type != BRIDGE_VAL_STRING) return BRIDGE_ERROR;
+        /* Parse parameter list (comma separated) */
+        char *plist = args[0].data.s ? args[0].data.s : (char*)""; char *body = args[1].data.s ? args[1].data.s : (char*)"";
+        char *tmp = mod_strdup(plist); if(!tmp) return BRIDGE_ERROR;
+        char *tokens[16]; int pc=0; char *save=tmp; while (*save && pc<16) {
+            while (*save==' '||*save=='\t') save++;
+            char *start = save; while (*save && *save!=',') save++; if (*save==','){ *save='\0'; }
+            if (*start) { tokens[pc++] = start; }
+            if (*save=='\0') break; save++; /* skip comma */
+        }
+        LambdaFunc *lf = lambda_create(tokens, pc, body);
+        if (!lf) { mod_free(tmp); return BRIDGE_ERROR; }
+        /* Naive closure capture: scan body for variable names present in global variables and not params. */
+        extern Variable variables[]; extern int var_count; /* from engine */
+        int captured = 0;
+        for (int vi=0; vi<var_count; vi++) {
+            if (captured >= 32) break; /* safety */
+            const char *gname = variables[vi].name;
+            int is_param = 0; for (int pi=0; pi<lf->param_count; pi++){ if(lf->params[pi] && mod_strcmp(lf->params[pi], gname)==0){ is_param=1; break; } }
+            if (is_param) continue;
+            /* simple substring match boundary check */
+            char pattern[64]; mod_snprintf(pattern,sizeof(pattern),"%s", gname);
+            const char *p = body; int found=0;
+            while ((p = mod_strstr(p, pattern)) != NULL){
+                char before = (p==body)?' ':p[-1];
+                char after = p[strlen(pattern)];
+                int before_ok = !((before>='a'&&before<='z')||(before>='A'&&before<='Z')||(before>='0'&&before<='9')||before=='_');
+                int after_ok = !((after>='a'&&after<='z')||(after>='A'&&after<='Z')||(after>='0'&&after<='9')||after=='_');
+                if (before_ok && after_ok) { found=1; break; }
+                p += 1; /* continue searching */
+            }
+            if (!found) continue;
+            /* Capture by shallow copy; allocate closure array if first time */
+            if (captured==0) {
+                lf->closure = (Variable*)mod_calloc(32, sizeof(Variable));
+                if (!lf->closure) { /* allocation failure - continue without capture */ }
+            }
+            if (lf->closure) {
+                lf->closure[captured] = variables[vi];
+                captured++;
+            }
+        }
+        lf->closure_count = captured;
+        /* Register as runtime object with type OBJ_LAMBDA by ensuring LambdaFunc begins with object header fields? If not, allocate wrapper */
+        /* For now rely on runtime treating LambdaFunc pointer as handle (legacy path). */
+        registry_add(lf);
+        out->type = BRIDGE_VAL_HANDLE; out->data.handle = lf;
+        mod_free(tmp);
+        return BRIDGE_OK;
+    }
+    if (!bridge_initialized) bridge_init();
+    if (!name) return BRIDGE_ERROR;
+
+    /* Core math subset */
+    if (mod_strcmp(name, "abs") == 0) {
+        if (argc < 1) return BRIDGE_ERROR; int ok=0; int a = arg_to_int(&args[0], &ok); if (!ok) return BRIDGE_ERROR;
+        out->type = BRIDGE_VAL_INT; out->data.i = builtin_abs_int(a); return BRIDGE_OK;
+    }
+    if (mod_strcmp(name, "min") == 0) {
+        if (argc < 2) return BRIDGE_ERROR; int ok1=0, ok2=0; int a = arg_to_int(&args[0], &ok1); int b = arg_to_int(&args[1], &ok2); if (!ok1||!ok2) return BRIDGE_ERROR;
+        out->type = BRIDGE_VAL_INT; out->data.i = builtin_min_int(a,b); return BRIDGE_OK;
+    }
+    if (mod_strcmp(name, "max") == 0) {
+        if (argc < 2) return BRIDGE_ERROR; int ok1=0, ok2=0; int a = arg_to_int(&args[0], &ok1); int b = arg_to_int(&args[1], &ok2); if (!ok1||!ok2) return BRIDGE_ERROR;
+        out->type = BRIDGE_VAL_INT; out->data.i = builtin_max_int(a,b); return BRIDGE_OK;
+    }
+    if (mod_strcmp(name, "mod") == 0) {
+        if (argc < 2) return BRIDGE_ERROR; int ok1=0,ok2=0; int a=arg_to_int(&args[0],&ok1); int b=arg_to_int(&args[1],&ok2); if(!ok1||!ok2) return BRIDGE_ERROR; if(b==0) return BRIDGE_ERROR; out->type=BRIDGE_VAL_INT; out->data.i=builtin_mod_int(a,b); return BRIDGE_OK; }
+    if (mod_strcmp(name, "clamp") == 0) {
+        if (argc < 3) return BRIDGE_ERROR; int o1=0,o2=0,o3=0; int v=arg_to_int(&args[0],&o1); int lo=arg_to_int(&args[1],&o2); int hi=arg_to_int(&args[2],&o3); if(!o1||!o2||!o3) return BRIDGE_ERROR; out->type=BRIDGE_VAL_INT; out->data.i=builtin_clamp_int(v,lo,hi); return BRIDGE_OK; }
+    if (mod_strcmp(name, "pow") == 0) {
+        if (argc < 2) return BRIDGE_ERROR; int o1=0,o2=0; int a=arg_to_int(&args[0],&o1); int b=arg_to_int(&args[1],&o2); if(!o1||!o2) return BRIDGE_ERROR; out->type=BRIDGE_VAL_INT; out->data.i=builtin_pow_int(a,b); return BRIDGE_OK; }
+    if (mod_strcmp(name, "isqrt") == 0) {
+        if (argc < 1) return BRIDGE_ERROR; int o1=0; int a=arg_to_int(&args[0],&o1); if(!o1) return BRIDGE_ERROR; out->type=BRIDGE_VAL_INT; out->data.i=builtin_isqrt_int(a); return BRIDGE_OK; }
+    if (mod_strcmp(name, "square") == 0) {
+        if (argc < 1) return BRIDGE_ERROR; int o1=0; int a=arg_to_int(&args[0],&o1); if(!o1) return BRIDGE_ERROR; out->type=BRIDGE_VAL_INT; out->data.i=builtin_square_int(a); return BRIDGE_OK; }
+    if (mod_strcmp(name, "divide") == 0) {
+        if (argc < 2) return BRIDGE_ERROR; int o1=0,o2=0; int a=arg_to_int(&args[0],&o1); int b=arg_to_int(&args[1],&o2); if(!o1||!o2 || b==0) return BRIDGE_ERROR; out->type=BRIDGE_VAL_INT; out->data.i=builtin_divide_int(a,b); return BRIDGE_OK; }
+    if (mod_strcmp(name, "multiply") == 0) {
+        if (argc < 2) return BRIDGE_ERROR; int o1=0,o2=0; int a=arg_to_int(&args[0],&o1); int b=arg_to_int(&args[1],&o2); if(!o1||!o2) return BRIDGE_ERROR; out->type=BRIDGE_VAL_INT; out->data.i=builtin_multiply_int(a,b); return BRIDGE_OK; }
+    if (mod_strcmp(name, "srand") == 0) {
+        if (argc < 1) return BRIDGE_ERROR; int ok=0; int seed=arg_to_int(&args[0],&ok); if(!ok) return BRIDGE_ERROR; builtin_srand((unsigned int)seed); out->type=BRIDGE_VAL_INT; out->data.i=(int)seed; return BRIDGE_OK; }
+    if (mod_strcmp(name, "rand_seed") == 0) {
+        if (argc != 0) return BRIDGE_ERROR; out->type=BRIDGE_VAL_INT; out->data.i=(int)bridge_rand_state; return BRIDGE_OK; }
+    if (mod_strcmp(name, "rand") == 0) {
+        if (argc == 0) { out->type=BRIDGE_VAL_INT; out->data.i=builtin_rand(); return BRIDGE_OK; }
+        if (argc == 2) { int o1=0,o2=0; int lo=arg_to_int(&args[0],&o1); int hi=arg_to_int(&args[1],&o2); if(!o1||!o2) return BRIDGE_ERROR; if (hi<lo){int t=lo;lo=hi;hi=t;} int span = (hi-lo)+1; if (span<=0) span=1; int r = lo + (builtin_rand() % span); out->type=BRIDGE_VAL_INT; out->data.i=r; return BRIDGE_OK; } return BRIDGE_ERROR; }
+    if (mod_strcmp(name, "list_size") == 0) {
+        if (argc < 1 || args[0].type != BRIDGE_VAL_HANDLE) return BRIDGE_ERROR;
+        int sz = runtime_list_size(args[0].data.handle);
+        out->type = BRIDGE_VAL_INT; out->data.i = sz; return BRIDGE_OK;
+    }
+    if (mod_strcmp(name, "dict_size") == 0) {
+        if (argc < 1 || args[0].type != BRIDGE_VAL_HANDLE) return BRIDGE_ERROR;
+        out->type = BRIDGE_VAL_INT; out->data.i = runtime_dict_size(args[0].data.handle); return BRIDGE_OK; }
+    if (mod_strcmp(name, "set_size") == 0) {
+        if (argc < 1 || args[0].type != BRIDGE_VAL_HANDLE) return BRIDGE_ERROR;
+        out->type = BRIDGE_VAL_INT; out->data.i = runtime_set_size(args[0].data.handle); return BRIDGE_OK; }
+    if (mod_strcmp(name, "dict_has") == 0) {
+        if (argc < 2 || args[0].type != BRIDGE_VAL_HANDLE || args[1].type != BRIDGE_VAL_STRING) return BRIDGE_ERROR;
+        out->type = BRIDGE_VAL_INT; out->data.i = runtime_dict_has(args[0].data.handle, args[1].data.s) ? 1 : 0; return BRIDGE_OK; }
+
+    /* Data structure creation & mutation via wrappers */
+    if (mod_strcmp(name, "list") == 0) {
+        void *l = rt_list_create(argc > 0 ? argc : 0);
+        if (!l) return BRIDGE_ERROR;
+        for (int i = 0; i < argc; i++) {
+            if (!rt_list_append(l, &args[i])) { /* failure - we keep partial but report error */ }
+        }
+        out->type = BRIDGE_VAL_HANDLE; out->data.handle = l; return BRIDGE_OK; }
+    if (mod_strcmp(name, "list_append") == 0) {
+        if (argc < 2 || args[0].type != BRIDGE_VAL_HANDLE) return BRIDGE_ERROR;
+        if (!rt_list_append(args[0].data.handle, &args[1])) return BRIDGE_ERROR;
+        out->type = BRIDGE_VAL_HANDLE; out->data.handle = args[0].data.handle; return BRIDGE_OK; }
+    if (mod_strcmp(name, "list_get") == 0) {
+        if (argc < 2 || args[0].type != BRIDGE_VAL_HANDLE || args[1].type != BRIDGE_VAL_INT) return BRIDGE_ERROR;
+        if (!rt_list_get(args[0].data.handle, args[1].data.i, out)) { bridge_value_init(out); out->type = BRIDGE_VAL_NULL; }
+        return BRIDGE_OK; }
+
+    if (mod_strcmp(name, "dict") == 0) {
+        void *d = rt_dict_create(0); if (!d) return BRIDGE_ERROR; out->type = BRIDGE_VAL_HANDLE; out->data.handle = d; return BRIDGE_OK; }
+    if (mod_strcmp(name, "dict_set") == 0) {
+        if (argc < 3 || args[0].type != BRIDGE_VAL_HANDLE || args[1].type != BRIDGE_VAL_STRING) return BRIDGE_ERROR;
+        if (!rt_dict_set(args[0].data.handle, args[1].data.s, &args[2])) return BRIDGE_ERROR;
+        out->type = BRIDGE_VAL_HANDLE; out->data.handle = args[0].data.handle; return BRIDGE_OK; }
+    if (mod_strcmp(name, "dict_get") == 0) {
+        if (argc < 2 || args[0].type != BRIDGE_VAL_HANDLE || args[1].type != BRIDGE_VAL_STRING) return BRIDGE_ERROR;
+        if (!rt_dict_get(args[0].data.handle, args[1].data.s, out)) { bridge_value_init(out); out->type = BRIDGE_VAL_NULL; }
+        return BRIDGE_OK; }
+    if (mod_strcmp(name, "dict_remove") == 0) {
+        if (argc < 2 || args[0].type != BRIDGE_VAL_HANDLE || args[1].type != BRIDGE_VAL_STRING) return BRIDGE_ERROR;
+        int removed = rt_dict_remove(args[0].data.handle, args[1].data.s);
+        out->type = BRIDGE_VAL_INT; out->data.i = removed; return BRIDGE_OK; }
+    if (mod_strcmp(name, "dict_keys") == 0) {
+        if (argc < 1 || args[0].type != BRIDGE_VAL_HANDLE) return BRIDGE_ERROR;
+        void *kl = rt_dict_keys(args[0].data.handle);
+        out->type = BRIDGE_VAL_HANDLE; out->data.handle = kl; return BRIDGE_OK; }
+
+    if (mod_strcmp(name, "set") == 0) { void *s = rt_set_create(0); if (!s) return BRIDGE_ERROR; out->type = BRIDGE_VAL_HANDLE; out->data.handle = s; return BRIDGE_OK; }
+    if (mod_strcmp(name, "set_add") == 0) { if (argc < 2 || args[0].type != BRIDGE_VAL_HANDLE) return BRIDGE_ERROR; if (!rt_set_add(args[0].data.handle, &args[1])) return BRIDGE_ERROR; out->type = BRIDGE_VAL_HANDLE; out->data.handle = args[0].data.handle; return BRIDGE_OK; }
+    if (mod_strcmp(name, "set_contains") == 0) { if (argc < 2 || args[0].type != BRIDGE_VAL_HANDLE) return BRIDGE_ERROR; int present = rt_set_contains(args[0].data.handle, &args[1]); out->type = BRIDGE_VAL_INT; out->data.i = present ? 1 : 0; return BRIDGE_OK; }
+
+    /* Regex */
+    if (mod_strcmp(name, "regex") == 0) {
+        if (argc < 1 || args[0].type != BRIDGE_VAL_STRING) return BRIDGE_ERROR;
+        void *r = rt_regex_create(args[0].data.s, 0);
+        if (!r) return BRIDGE_ERROR;
+        out->type = BRIDGE_VAL_HANDLE; out->data.handle = r; return BRIDGE_OK; }
+    if (mod_strcmp(name, "regex_match") == 0) {
+        if (argc < 2) return BRIDGE_ERROR;
+        if (args[0].type == BRIDGE_VAL_HANDLE && args[1].type == BRIDGE_VAL_STRING) {
+            int m = rt_regex_match(args[0].data.handle, args[1].data.s ? args[1].data.s : "");
+            out->type = BRIDGE_VAL_INT; out->data.i = m; return BRIDGE_OK;
+        } else if (args[0].type == BRIDGE_VAL_STRING && args[1].type == BRIDGE_VAL_STRING) {
+            /* Compile ad-hoc pattern */
+            void *r = rt_regex_create(args[0].data.s, 0);
+            if (!r) { out->type = BRIDGE_VAL_INT; out->data.i = 0; return BRIDGE_OK; }
+            int m = rt_regex_match(r, args[1].data.s ? args[1].data.s : "");
+            out->type = BRIDGE_VAL_INT; out->data.i = m; return BRIDGE_OK; /* leak acceptable until GC; TODO: release */
+        }
+        return BRIDGE_ERROR; }
+    if (mod_strcmp(name, "regex_replace") == 0) {
+        if (argc < 3) return BRIDGE_ERROR;
+        if (args[0].type == BRIDGE_VAL_HANDLE && args[1].type == BRIDGE_VAL_STRING && args[2].type == BRIDGE_VAL_STRING) {
+            char *res = rt_regex_replace(args[0].data.handle, args[1].data.s ? args[1].data.s : "", args[2].data.s ? args[2].data.s : "");
+            out->type = BRIDGE_VAL_STRING; out->data.s = res ? res : mod_strdup(""); out->owns = res ? 1 : 1; return BRIDGE_OK;
+        } else if (args[0].type == BRIDGE_VAL_STRING && args[1].type == BRIDGE_VAL_STRING && args[2].type == BRIDGE_VAL_STRING) {
+            void *r = rt_regex_create(args[0].data.s, 0);
+            if (!r) { out->type = BRIDGE_VAL_STRING; out->data.s = mod_strdup(""); out->owns = 1; return BRIDGE_OK; }
+            char *res = rt_regex_replace(r, args[1].data.s ? args[1].data.s : "", args[2].data.s ? args[2].data.s : "");
+            out->type = BRIDGE_VAL_STRING; out->data.s = res ? res : mod_strdup(""); out->owns = 1; return BRIDGE_OK;
+        }
+        return BRIDGE_ERROR; }
+
+    /* Interpolation & multiline */
+    if (mod_strcmp(name, "interpolate") == 0) {
+        if (argc < 1 || args[0].type != BRIDGE_VAL_STRING) return BRIDGE_ERROR;
+        char *res = rt_interpolate_template(args[0].data.s ? args[0].data.s : "");
+        out->type = BRIDGE_VAL_STRING; out->data.s = res ? res : mod_strdup(""); out->owns = 1; return BRIDGE_OK; }
+    if (mod_strcmp(name, "multiline") == 0) {
+        if (argc < 1 || args[0].type != BRIDGE_VAL_STRING) return BRIDGE_ERROR;
+        char *res = rt_multiline_process(args[0].data.s ? args[0].data.s : "");
+        out->type = BRIDGE_VAL_STRING; out->data.s = res ? res : mod_strdup(""); out->owns = 1; return BRIDGE_OK; }
+    /* ================= Batch4: Optional / Union / Type ================= */
+    if (mod_strcmp(name, "optional") == 0 || mod_strcmp(name, "optional_create") == 0) {
+        if (argc > 1) return BRIDGE_ERROR; void *h = NULL; if (argc == 1) h = rt_optional_create(&args[0]); else h = rt_optional_create(NULL); if (!h) return BRIDGE_ERROR; out->type = BRIDGE_VAL_HANDLE; out->data.handle = h; return BRIDGE_OK; }
+    if (mod_strcmp(name, "optional_has_value") == 0) {
+        if (argc < 1 || args[0].type != BRIDGE_VAL_HANDLE) return BRIDGE_ERROR; int hv = rt_optional_has_value(args[0].data.handle); out->type = BRIDGE_VAL_INT; out->data.i = hv; return BRIDGE_OK; }
+    if (mod_strcmp(name, "optional_get") == 0) {
+        if (argc < 1 || args[0].type != BRIDGE_VAL_HANDLE) return BRIDGE_ERROR; bridge_value_t tmp; if (!rt_optional_get(args[0].data.handle, &tmp)) return BRIDGE_ERROR; *out = tmp; return BRIDGE_OK; }
+    if (mod_strcmp(name, "union") == 0 || mod_strcmp(name, "union_create") == 0) {
+        if (argc < 1 || argc > 2 || args[0].type != BRIDGE_VAL_STRING) return BRIDGE_ERROR; void *h = rt_union_create(args[0].data.s, (argc==2)? &args[1] : NULL); if (!h) return BRIDGE_ERROR; out->type = BRIDGE_VAL_HANDLE; out->data.handle = h; return BRIDGE_OK; }
+    if (mod_strcmp(name, "union_set") == 0) {
+        if (argc < 2 || argc > 3 || args[0].type != BRIDGE_VAL_HANDLE || args[1].type != BRIDGE_VAL_STRING) return BRIDGE_ERROR; if (!rt_union_set(args[0].data.handle, args[1].data.s, (argc==3)? &args[2] : NULL)) return BRIDGE_ERROR; out->type = BRIDGE_VAL_NULL; return BRIDGE_OK; }
+    if (mod_strcmp(name, "union_get") == 0) {
+        if (argc < 1 || args[0].type != BRIDGE_VAL_HANDLE) return BRIDGE_ERROR; bridge_value_t tmp; if (!rt_union_get(args[0].data.handle, &tmp)) return BRIDGE_ERROR; *out = tmp; return BRIDGE_OK; }
+    if (mod_strcmp(name, "union_tag") == 0) {
+        if (argc < 1 || args[0].type != BRIDGE_VAL_HANDLE) return BRIDGE_ERROR; const char *tag = rt_union_tag(args[0].data.handle); if (!tag) return BRIDGE_ERROR; out->type = BRIDGE_VAL_STRING; out->data.s = mod_strdup(tag); out->owns = 1; return BRIDGE_OK; }
+    if (mod_strcmp(name, "typeof") == 0) {
+        if (argc < 1) return BRIDGE_ERROR; const char *tn = rt_typeof_value(&args[0]); out->type = BRIDGE_VAL_STRING; out->data.s = mod_strdup(tn); out->owns = 1; return BRIDGE_OK; }
+    if (mod_strcmp(name, "is_type") == 0) {
+        if (argc < 2 || args[1].type != BRIDGE_VAL_STRING) return BRIDGE_ERROR; int r = rt_is_type(&args[0], args[1].data.s); out->type = BRIDGE_VAL_INT; out->data.i = r; return BRIDGE_OK; }
+    if (mod_strcmp(name, "is_null") == 0) {
+        if (argc < 1) return BRIDGE_ERROR; int r = rt_is_null(&args[0]); out->type = BRIDGE_VAL_INT; out->data.i = r; return BRIDGE_OK; }
+    if (mod_strcmp(name, "cast") == 0) {
+        if (argc < 2 || args[1].type != BRIDGE_VAL_STRING) return BRIDGE_ERROR; bridge_value_t tmp; if (!rt_cast_value(&args[0], args[1].data.s, &tmp)) return BRIDGE_ERROR; *out = tmp; return BRIDGE_OK; }
+    if (mod_strcmp(name, "file_exists") == 0) {
+        if (argc < 1 || args[0].type != BRIDGE_VAL_STRING || !args[0].data.s) return BRIDGE_ERROR; int exists = 0; if (os_file_exists) exists = os_file_exists(args[0].data.s); out->type=BRIDGE_VAL_INT; out->data.i= exists ? 1 : 0; return BRIDGE_OK; }
+    if (mod_strcmp(name, "range") == 0) {
+        // range(end) / range(start,end) / range(start,end,step)
+        int o1=0,o2=0,o3=0;
+        if (argc == 1) {
+            int endv = arg_to_int(&args[0], &o1); if(!o1) return BRIDGE_ERROR; bridge_value_t rv = build_range_list(0,endv,1); *out = rv; return BRIDGE_OK; }
+        else if (argc == 2) {
+            int start = arg_to_int(&args[0], &o1); int endv = arg_to_int(&args[1], &o2); if(!o1||!o2) return BRIDGE_ERROR; bridge_value_t rv = build_range_list(start,endv,(start<=endv)?1:-1); *out = rv; return BRIDGE_OK; }
+        else if (argc >= 3) {
+            int start = arg_to_int(&args[0], &o1); int endv = arg_to_int(&args[1], &o2); int step = arg_to_int(&args[2], &o3); if(!o1||!o2||!o3||step==0) return BRIDGE_ERROR; bridge_value_t rv = build_range_list(start,endv,step); *out = rv; return BRIDGE_OK; }
+    }
+
+    /* Functional (Batch5) */
+    if (mod_strcmp(name, "compose") == 0) {
+        if (argc < 2 || args[0].type != BRIDGE_VAL_HANDLE || args[1].type != BRIDGE_VAL_HANDLE) return BRIDGE_ERROR; void *h = rt_compose_create(args[0].data.handle, args[1].data.handle); if(!h) return BRIDGE_ERROR; out->type=BRIDGE_VAL_HANDLE; out->data.handle=h; return BRIDGE_OK; }
+    if (mod_strcmp(name, "partial") == 0 || mod_strcmp(name, "curry") == 0) {
+        if (argc < 1 || args[0].type != BRIDGE_VAL_HANDLE) return BRIDGE_ERROR; void *h = rt_partial_create(args[0].data.handle, argc-1, argc>1? &args[1] : NULL); if(!h) return BRIDGE_ERROR; out->type=BRIDGE_VAL_HANDLE; out->data.handle=h; return BRIDGE_OK; }
+    if (mod_strcmp(name, "memoize") == 0) {
+        if (argc < 1 || args[0].type != BRIDGE_VAL_HANDLE) return BRIDGE_ERROR; void *h = rt_memoize_create(args[0].data.handle); if(!h) return BRIDGE_ERROR; out->type=BRIDGE_VAL_HANDLE; out->data.handle=h; return BRIDGE_OK; }
+    if (mod_strcmp(name, "map") == 0) {
+        if (argc < 2 || args[0].type != BRIDGE_VAL_HANDLE || args[1].type != BRIDGE_VAL_HANDLE) return BRIDGE_ERROR; void *nl = rt_map(args[0].data.handle, args[1].data.handle); if(!nl) return BRIDGE_ERROR; out->type=BRIDGE_VAL_HANDLE; out->data.handle=nl; return BRIDGE_OK; }
+    if (mod_strcmp(name, "filter") == 0) {
+        if (argc < 2 || args[0].type != BRIDGE_VAL_HANDLE || args[1].type != BRIDGE_VAL_HANDLE) return BRIDGE_ERROR; void *nl = rt_filter(args[0].data.handle, args[1].data.handle); if(!nl) return BRIDGE_ERROR; out->type=BRIDGE_VAL_HANDLE; out->data.handle=nl; return BRIDGE_OK; }
+    if (mod_strcmp(name, "reduce") == 0) {
+        if (argc < 3 || args[0].type != BRIDGE_VAL_HANDLE || args[1].type != BRIDGE_VAL_HANDLE) return BRIDGE_ERROR; bridge_value_t acc; if(!rt_reduce(args[0].data.handle, args[1].data.handle, &args[2], &acc)) return BRIDGE_ERROR; *out = acc; return BRIDGE_OK; }
+
+    /* Exceptions */
+    if (mod_strcmp(name, "create_exception") == 0) {
+        if (argc < 1 || args[0].type != BRIDGE_VAL_STRING) return BRIDGE_ERROR;
+        const char *type = args[0].data.s;
+        const char *msg = (argc >= 2 && args[1].type == BRIDGE_VAL_STRING) ? args[1].data.s : "";
+        void *e = rt_exception_create(type, msg, NULL, 0);
+        if(!e) return BRIDGE_ERROR;
+        out->type = BRIDGE_VAL_HANDLE; out->data.handle = e; return BRIDGE_OK; }
+    if (mod_strcmp(name, "exception_type") == 0) {
+        if (argc < 1 || args[0].type != BRIDGE_VAL_HANDLE) return BRIDGE_ERROR; const char *t = rt_exception_type(args[0].data.handle); if(!t) return BRIDGE_ERROR; out->type=BRIDGE_VAL_STRING; out->data.s = mod_strdup(t); out->owns=1; return BRIDGE_OK; }
+    if (mod_strcmp(name, "exception_message") == 0) {
+        if (argc < 1 || args[0].type != BRIDGE_VAL_HANDLE) return BRIDGE_ERROR; const char *m = rt_exception_message(args[0].data.handle); if(!m) return BRIDGE_ERROR; out->type=BRIDGE_VAL_STRING; out->data.s = mod_strdup(m); out->owns=1; return BRIDGE_OK; }
+    if (mod_strcmp(name, "throw") == 0) {
+        /* throw(exception_handle) OR throw(type, message[, file, line]) */
+        void *e = NULL; const char *file = NULL; int line = 0;
+        if (argc == 1 && args[0].type == BRIDGE_VAL_HANDLE) {
+            e = args[0].data.handle;
+        } else if (argc >= 1 && args[0].type == BRIDGE_VAL_STRING) {
+            const char *type = args[0].data.s;
+            const char *msg = (argc >= 2 && args[1].type == BRIDGE_VAL_STRING) ? args[1].data.s : "";
+            if (argc >= 3 && args[2].type == BRIDGE_VAL_STRING) file = args[2].data.s;
+            if (argc >= 4 && args[3].type == BRIDGE_VAL_INT) line = args[3].data.i;
+            e = rt_exception_create(type, msg, file, line);
+        }
+        if (!e) return BRIDGE_ERROR; if (!rt_exception_throw(e)) return BRIDGE_ERROR; out->type = BRIDGE_VAL_NULL; return BRIDGE_OK; }
+    if (mod_strcmp(name, "current_exception") == 0) {
+        void *e = rt_exception_current(); if(!e){ out->type=BRIDGE_VAL_NULL; return BRIDGE_OK; } out->type=BRIDGE_VAL_HANDLE; out->data.handle=e; return BRIDGE_OK; }
+    if (mod_strcmp(name, "define_exception") == 0) {
+        if (argc < 1 || args[0].type != BRIDGE_VAL_STRING) return BRIDGE_ERROR; const char *type = args[0].data.s; const char *parent = (argc>=2 && args[1].type==BRIDGE_VAL_STRING)? args[1].data.s : NULL; const char *desc = (argc>=3 && args[2].type==BRIDGE_VAL_STRING)? args[2].data.s : ""; int ok = rt_exception_define(type,parent,desc); out->type=BRIDGE_VAL_INT; out->data.i = ok?1:0; return BRIDGE_OK; }
+    if (mod_strcmp(name, "exception_is_a") == 0) {
+        if (argc < 2 || args[0].type != BRIDGE_VAL_HANDLE || args[1].type != BRIDGE_VAL_STRING) return BRIDGE_ERROR; int r = rt_exception_is_a(args[0].data.handle, args[1].data.s); out->type=BRIDGE_VAL_INT; out->data.i=r; return BRIDGE_OK; }
+    if (mod_strcmp(name, "exception_stack_trace") == 0) {
+        if (argc < 1 || args[0].type != BRIDGE_VAL_HANDLE) return BRIDGE_ERROR; char *st = rt_exception_stack_trace(args[0].data.handle); if(!st) st = mod_strdup(""); out->type=BRIDGE_VAL_STRING; out->data.s=st; out->owns=1; return BRIDGE_OK; }
+    if (mod_strcmp(name, "exception_file") == 0) {
+        if (argc < 1 || args[0].type != BRIDGE_VAL_HANDLE) return BRIDGE_ERROR;
+        const char *file = rt_exception_file(args[0].data.handle);
+        if(!file){ out->type=BRIDGE_VAL_NULL; }
+        else { out->type=BRIDGE_VAL_STRING; out->data.s = mod_strdup(file); out->owns=1; }
+        return BRIDGE_OK; }
+    if (mod_strcmp(name, "exception_line") == 0) {
+        if (argc < 1 || args[0].type != BRIDGE_VAL_HANDLE) return BRIDGE_ERROR;
+        int line = rt_exception_line(args[0].data.handle);
+        out->type=BRIDGE_VAL_INT; out->data.i = line; return BRIDGE_OK; }
+    if (mod_strcmp(name, "exception_description") == 0) {
+        if (argc < 1 || args[0].type != BRIDGE_VAL_HANDLE) return BRIDGE_ERROR;
+        const char *d = rt_exception_description(args[0].data.handle);
+        out->type = BRIDGE_VAL_STRING; out->data.s = mod_strdup(d?d:""); out->owns=1; return BRIDGE_OK; }
+    if (mod_strcmp(name, "exception_add_frame") == 0) {
+        if (argc < 2 || args[0].type != BRIDGE_VAL_HANDLE || args[1].type != BRIDGE_VAL_STRING) return BRIDGE_ERROR;
+        void *e = args[0].data.handle; const char *func = args[1].data.s;
+        const char *file = (argc>=3 && args[2].type==BRIDGE_VAL_STRING)? args[2].data.s : NULL;
+        int line = (argc>=4 && args[3].type==BRIDGE_VAL_INT)? args[3].data.i : 0;
+        rt_exception_add_frame(e, func, file, line);
+        out->type = BRIDGE_VAL_HANDLE; out->data.handle = e; return BRIDGE_OK; }
+    if (mod_strcmp(name, "debug_object_counts") == 0) {
+        /* Return dict: total plus type_<id> entries for nonzero counts (0..31) */
+        void *dict = rt_dict_create(32);
+        if(!dict) return BRIDGE_ERROR;
+        bridge_value_t val; bridge_value_init(&val);
+        val.type = BRIDGE_VAL_INT; val.data.i = rt_object_count_total();
+        bridge_value_t keyv; bridge_value_init(&keyv);
+        /* We assume rt_dict_set handles key duplication internally */
+        rt_dict_set(dict, "total", &val);
+        for(int t=0;t<32;++t){
+            int c = rt_object_count_by_type(t);
+            if(c>0){
+                char keybuf[24];
+                mod_snprintf(keybuf,sizeof(keybuf),"type_%d",t);
+                val.data.i = c; rt_dict_set(dict, keybuf, &val);
+            }
+        }
+        out->type = BRIDGE_VAL_HANDLE; out->data.handle = dict; return BRIDGE_OK; }
+    if (mod_strcmp(name, "debug_object_audit") == 0) {
+        audit_ctx_t ctx; ctx.bad=ctx.total=ctx.zero_ref=ctx.neg_ref=ctx.null_hdr=0;
+        rt_object_enumerate(audit_callback,&ctx);
+        void *dict = rt_dict_create(8); if(!dict) return BRIDGE_ERROR; bridge_value_t v; bridge_value_init(&v);
+        v.type=BRIDGE_VAL_INT; v.data.i=ctx.total; rt_dict_set(dict, "total", &v);
+        v.data.i=ctx.bad; rt_dict_set(dict, "bad", &v);
+        v.data.i=ctx.zero_ref; rt_dict_set(dict, "zero_ref", &v);
+        v.data.i=ctx.neg_ref; rt_dict_set(dict, "neg_ref", &v);
+        v.data.i=ctx.null_hdr; rt_dict_set(dict, "null_hdr", &v);
+        out->type=BRIDGE_VAL_HANDLE; out->data.handle=dict; return BRIDGE_OK; }
+    if (mod_strcmp(name, "try_call") == 0) {
+        /* try_call(try_fn, catch_fn?, finally_fn?) returns result or null; catch receives exception */
+        if (argc < 1) return BRIDGE_ERROR;
+        void *tryh = (args[0].type==BRIDGE_VAL_HANDLE)? args[0].data.handle: NULL;
+        void *catchh = (argc>=2 && args[1].type==BRIDGE_VAL_HANDLE)? args[1].data.handle: NULL;
+        void *finallyh = (argc>=3 && args[2].type==BRIDGE_VAL_HANDLE)? args[2].data.handle: NULL;
+        bridge_value_t tmp; bridge_value_init(&tmp);
+        int ok = rt_try_call(tryh, catchh, finallyh, &tmp);
+        if(!ok){ bridge_value_free(&tmp); return BRIDGE_ERROR; }
+        *out = tmp; return BRIDGE_OK; }
+
+    /* Placeholder: real dispatcher should hook into interpreter's table. */
+    return BRIDGE_UNKNOWN;
+}

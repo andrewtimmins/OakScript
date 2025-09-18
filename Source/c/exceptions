@@ -40,6 +40,7 @@ void init_exception_system(void) {
     // Register standard exception types
     register_exception_type("Exception", "Base exception type", NULL);
     register_exception_type("RuntimeError", "Runtime execution error", "Exception");
+    register_exception_type("BuiltinError", "Builtin call failure", "RuntimeError");
     register_exception_type("TypeError", "Type-related error", "Exception");
     register_exception_type("ValueError", "Invalid value error", "Exception");
     register_exception_type("IndexError", "Array/list index out of range", "Exception");
@@ -346,7 +347,8 @@ void try_statement(void) {
 extern int expression(void);
 extern char* evaluate_string_expr(void);
 
-int builtin_throw(void) {
+/* Legacy interpreter-only exception builtins now superseded by bridge. Keeping code commented for reference. */
+/*int builtin_throw(void) {
     // throw("ExceptionType", "message")
     char* exc_type = evaluate_string_expr();
     
@@ -374,9 +376,9 @@ int builtin_throw(void) {
     }
     
     return 0;
-}
+}*/
 
-int builtin_exception_type(void) {
+/*int builtin_exception_type(void) {
     // exception_type(exception_variable)
     char* var_name = evaluate_string_expr();
     if (next_token()->type != TOKEN_RPAREN) {
@@ -397,9 +399,9 @@ int builtin_exception_type(void) {
     // Return type as string (simplified - would set a string variable)
     printf("Exception type: %s\n", exc->type);
     return 1;
-}
+}*/
 
-int builtin_exception_message(void) {
+/*int builtin_exception_message(void) {
     // exception_message(exception_variable)
     char* var_name = evaluate_string_expr();
     if (next_token()->type != TOKEN_RPAREN) {
@@ -420,9 +422,9 @@ int builtin_exception_message(void) {
     // Return message as string (simplified)
     printf("Exception message: %s\n", exc->message);
     return 1;
-}
+}*/
 
-int builtin_create_exception(void) {
+/*int builtin_create_exception(void) {
     // create_exception("Type", "Message")
     char* exc_type = evaluate_string_expr();
     
@@ -449,9 +451,9 @@ int builtin_create_exception(void) {
     // Return exception handle (would store in registry)
     static int exc_counter = 7000;
     return exc ? exc_counter++ : 0;
-}
+}*/
 
-int builtin_define_exception(void) {
+/*int builtin_define_exception(void) {
     // define_exception("NewExceptionType", "ParentType", "Description")
     char* name = evaluate_string_expr();
     
@@ -482,7 +484,7 @@ int builtin_define_exception(void) {
     if (description) mod_free(description);
     
     return new_type ? 1 : 0;
-}
+}*/
 
 // Stack trace support
 
