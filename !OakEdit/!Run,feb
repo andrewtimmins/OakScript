@@ -1,0 +1,14 @@
+|
+| >!Run
+|
+
+IconSprites <Obey$Dir>.!Sprites
+Set OakEdit$Dir <Obey$Dir>
+Set OakEdit$Path <OakEdit$Dir>.
+
+Set File$Type_EEA OSD
+Set File$Type_EEE OSC
+Set File$Type_EEF OXF
+
+Wimpslot -Min 128k -Max 512k
+Run <OakEdit$Dir>.!RunImage %%*0

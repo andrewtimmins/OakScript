@@ -1,0 +1,11 @@
+|
+| >!Boot
+|
+
+IconSprites <Obey$Dir>.!Sprites
+Set OakEdit$Dir <Obey$Dir>
+Set OakEdit$Path <OakEdit$Dir>.
+
+Set File$Type_EEA OSD
+Set File$Type_EEE OSC
+Set File$Type_EEF OXF

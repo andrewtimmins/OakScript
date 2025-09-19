@@ -1,0 +1,30 @@
+/* OakEdit - Text Editor for RISC OS
+ * Header file
+ */
+
+#ifndef __editor_h
+#define __editor_h
+
+/* Desk Includes */
+#include "C:Desk.Core.h"
+#include "C:Desk.Event.h"
+#include "C:Desk.Menu.h"
+#include "C:Desk.Window.h"
+#include <stdlib.h>
+
+/* Constants */
+#define INITIAL_BUFFER_SIZE 4096
+
+/* External Variables */
+extern Desk_bool app_quit;
+extern Desk_menu_ptr iconbar_menu_handle;
+extern Desk_window_handle proginfo_window;
+extern Desk_window_handle text_window;
+
+extern int iconbar_menu_info;
+extern int iconbar_menu_quit;
+
+extern char app_name[];
+extern char app_version[];
+
+#endif /* __editor_h */

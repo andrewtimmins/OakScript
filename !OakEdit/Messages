@@ -1,0 +1,5 @@
+app.version: 1.00 (19-Sep-25)
+iconbar.title: Oak Edit
+iconbar.menu: Info,Quit
+text.title: Oak Edit
+text.menu: Misc, Save, Select, Edit, Display

@@ -1,0 +1,80 @@
+# MakeMod - Builds OakScript module only
+
+CC        = cc
+CMHG      = cmhg
+LINK      = link
+
+TARGET    = <OakScript$Dir>.OakScript
+OBJS      = o.module o.header o.engine o.core o.memory o.variables o.math o.swi o.debug o.compile o.runtime o.value o.advanced o.strings o.control_flow o.functional o.exceptions o.types o.bridge
+LIBS      = C:o.stubs
+CFLAGS    = -c -depend !Depend -I,C: -apcs 3/32bit -Wcdp -throwback -fan
+CMHGFLAGS = -depend !Depend -throwback
+
+all: $(TARGET)
+
+$(TARGET): $(OBJS)
+	$(LINK) -rmf -o $(TARGET) $(OBJS) $(LIBS)
+
+o.header h.header: cmhg.header
+	$(CMHG) $(CMHGFLAGS) cmhg.header -o o.header -d h.header
+
+o.module: c.module h.header
+	$(CC) $(CFLAGS) c.module -o o.module
+
+o.engine: c.engine h.engine
+	$(CC) $(CFLAGS) c.engine -o o.engine
+
+o.core: c.script h.engine
+	$(CC) $(CFLAGS) c.script -o o.core
+
+o.memory: c.memory
+	$(CC) $(CFLAGS) c.memory -o o.memory
+
+o.variables: c.variables h.variables h.engine h.memory
+	$(CC) $(CFLAGS) c.variables -o o.variables
+
+o.math: c.math h.math
+	$(CC) $(CFLAGS) c.math -o o.math
+
+o.swi: c.swi h.swi h.engine h.memory
+	$(CC) $(CFLAGS) c.swi -o o.swi
+
+o.debug: c.debug h.debug
+	$(CC) $(CFLAGS) c.debug -o o.debug
+
+o.compile: c.compile h.compile
+	$(CC) $(CFLAGS) c.compile -o o.compile
+
+o.runtime: c.runtime h.runtime h.compile
+	$(CC) $(CFLAGS) c.runtime -o o.runtime
+
+o.bridge: c.bridge h.bridge h.memory h.strings
+	$(CC) $(CFLAGS) c.bridge -o o.bridge
+
+o.advanced: c.advanced h.advanced h.engine h.memory
+	$(CC) $(CFLAGS) c.advanced -o o.advanced
+
+o.strings: c.strings h.advanced h.engine h.memory h.strings
+	$(CC) $(CFLAGS) c.strings -o o.strings
+
+o.control_flow: c.control_flow h.advanced h.engine h.memory
+	$(CC) $(CFLAGS) c.control_flow -o o.control_flow
+
+o.functional: c.functional h.advanced h.engine h.memory
+	$(CC) $(CFLAGS) c.functional -o o.functional
+
+o.exceptions: c.exceptions h.advanced h.engine h.memory
+	$(CC) $(CFLAGS) c.exceptions -o o.exceptions
+
+o.value: c.value h.value h.memory
+	$(CC) $(CFLAGS) c.value -o o.value
+
+o.types: c.types h.advanced h.engine h.memory
+	$(CC) $(CFLAGS) c.types -o o.types
+
+clean:
+	-wipe o.* ~C~V
+	-wipe $(TARGET) ~C~V
+
+install: $(TARGET)
+	copy $(TARGET) rm.$(TARGET) ~C~V~N

@@ -1,0 +1,69 @@
+# MakeEdit - Builds OakEdit editor application using PlutoEmail-based text editor
+
+CC     = cc
+LINK   = link
+LIBS   = C:o.stubs C:Desk.o.Desk
+CFLAGS = -c -depend !Depend -I,C: -apcs 3/32bit -Wcdp -throwback -fan
+
+TARGET = <OakEdit$Dir>.!RunImage
+OBJS   = o.editor
+
+all: $(TARGET)
+
+$(TARGET): $(OBJS)
+	$(LINK) -o $(TARGET) $(OBJS) $(LIBS)
+
+o.editor: c.editor h.editor
+	$(CC) $(CFLAGS) c.editor -o o.editor
+
+clean:
+	-wipe o.editor ~C~V
+	-wipe $(TARGET) ~C~V
+
+# Dynamic dependencies:
+o.editor:	c.editor
+o.editor:	C:h.kernel
+o.editor:	C:h.swis
+o.editor:	C:Desk.h.Core
+o.editor:	C:h.kernel
+o.editor:	C:Desk.h.Event
+o.editor:	Desk.h.Wimp
+o.editor:	C:Desk.h.EventMsg
+o.editor:	C:Desk.h.Resource
+o.editor:	Desk.h.Sprite
+o.editor:	Desk.h.Coord
+o.editor:	Desk.h.Core
+o.editor:	C:Desk.h.Handler
+o.editor:	C:Desk.h.File
+o.editor:	Desk.h.SWI
+o.editor:	Desk.h.Error2
+o.editor:	Desk.h.Error
+o.editor:	Desk.h.JumpRaw
+o.editor:	Desk.h.Debug
+o.editor:	C:Desk.h.Icon
+o.editor:	Desk.h.DragASpr
+o.editor:	C:Desk.h.Menu
+o.editor:	C:Desk.h.Screen
+o.editor:	C:Desk.h.Msgs
+o.editor:	C:Desk.h.Template
+o.editor:	Desk.h.LinkList
+o.editor:	C:Desk.h.Dialog
+o.editor:	C:Desk.h.Window
+o.editor:	Desk.h.WimpSWIs
+o.editor:	Desk.h.Pointer
+o.editor:	C:Desk.h.Dialog2
+o.editor:	C:Desk.h.Sound
+o.editor:	C:Desk.h.Str
+o.editor:	C:Desk.h.Sprite
+o.editor:	C:Desk.h.Font
+o.editor:	C:Desk.h.GFX
+o.editor:	C:Desk.h.Coord
+o.editor:	C:Desk.h.Wimp
+o.editor:	C:Desk.h.WimpSWIs
+o.editor:	C:Desk.h.Window
+o.editor:	C:Desk.h.KeyCodes
+o.editor:	h.editor
+o.editor:	C:Desk.h.Core
+o.editor:	C:Desk.h.Event
+o.editor:	C:Desk.h.Menu
+o.editor:	C:Desk.h.Window

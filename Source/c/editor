@@ -1,0 +1,1030 @@
+/* OakEdit - Text Editor for RISC OS
+ */
+
+/* Standard ANSI Includes */
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include <string.h>
+#include <time.h>
+#include <math.h>
+
+/* OS Specific Includes */
+#include "C:kernel.h"
+#include "C:swis.h"
+
+/* Desk Includes */
+#include "C:Desk.Core.h"
+#include "C:Desk.Event.h"
+#include "C:Desk.EventMsg.h"
+#include "C:Desk.Resource.h"
+#include "C:Desk.Handler.h"
+#include "C:Desk.File.h"
+#include "C:Desk.Icon.h"
+#include "C:Desk.Menu.h"
+#include "C:Desk.Screen.h"
+#include "C:Desk.Msgs.h"
+#include "C:Desk.Template.h"
+#include "C:Desk.Dialog.h"
+#include "C:Desk.Dialog2.h"
+#include "C:Desk.Sound.h"
+#include "C:Desk.Str.h"
+#include "C:Desk.Sprite.h"
+#include "C:Desk.Font.h"
+#include "C:Desk.GFX.h"
+#include "C:Desk.Coord.h"
+#include "C:Desk.Wimp.h"
+#include "C:Desk.WimpSWIs.h"
+#include "C:Desk.Window.h"
+#include "C:Desk.KeyCodes.h"
+
+/* Our Includes */
+#include "editor.h"
+
+/* Local Variables */
+Desk_bool app_quit = Desk_bool_FALSE;
+
+Desk_icon_handle iconbar_icon_handle;
+Desk_menu_ptr iconbar_menu_handle = NULL;
+Desk_menu_ptr text_menu_handle = NULL;
+Desk_window_handle proginfo_window = 0;
+Desk_window_handle text_window = 0;
+Desk_window_handle xfer_send_window = 0;
+
+/* Text Editor Variables */
+char *text_buffer = NULL;
+size_t text_buffer_size = 0;
+int text_length = 0;
+int cursor_pos = 0;
+int cursor_x = 0;
+int cursor_y = 0;
+Desk_bool caret_visible = Desk_bool_FALSE;
+Desk_bool text_modified = Desk_bool_FALSE;
+
+/* Font handle (lazy-initialized) */
+static Desk_font_handle g_font = 0;
+/* Derived font metrics (OS units) with safe defaults */
+static int g_baseline_offset = 8;   /* distance from top-of-line to baseline */
+static int g_line_height = 20;      /* baseline-to-baseline spacing */
+static int g_char_width = 10;       /* approx mono width for caret only */
+
+/* Wrapping state */
+static int *g_wrap_start = NULL;    /* buffer indices where each wrapped line starts */
+static int *g_wrap_len   = NULL;    /* lengths of each wrapped line */
+static int   g_wrap_count = 0;      /* number of wrapped lines */
+static int   g_wrap_cap   = 0;      /* capacity of arrays */
+static int   g_page_width = 800;    /* work-area width used for wrapping/extents */
+static Desk_bool g_wrap_enabled = Desk_bool_FALSE; /* disable wrapping by default */
+
+static void ensure_font(void)
+{
+    if (g_font != 0) return;
+    /* Use Homerton.Medium at 12pt (12*16 = 192 in 1/16 point units) */
+    Desk_Font_FindFont(&g_font, "Homerton.Medium", 12*16, 12*16, 90, 90);
+    if (g_font == 0)
+    {
+        /* Fallback to Trinity */
+        Desk_Font_FindFont(&g_font, "Trinity.Medium", 12*16, 12*16, 90, 90);
+    }
+
+    /* Derive better metrics if we have a font; fall back if anything fails */
+    if (g_font)
+    {
+        Desk_Font_SetFont(g_font);
+        Desk_font_info mi, mg;
+        /* Use single-character bboxes around baseline */
+        /* Ascender from 'M' */
+        Desk_Font_CharBBox(g_font, 'M', 0, &mi);
+        int ascent = mi.maxy;                  /* above baseline */
+        if (ascent < 0) ascent = 0;
+        /* Descender from 'g' */
+        Desk_Font_CharBBox(g_font, 'g', 0, &mg);
+        int descent = -mg.miny;                /* mg.miny is negative below baseline */
+        if (descent < 0) descent = 0;
+        int lh = ascent + descent + 2;        /* add tiny leading */
+        if (lh > 0 && lh < 256) g_line_height = lh;
+        int bo = ascent + 2;
+        if (bo > 0 && bo < 256) g_baseline_offset = bo;
+
+        /* Approx caret step width from 'M' */
+        int cw = mi.maxx - mi.minx;
+        if (cw > 0 && cw < 256) g_char_width = cw;
+    }
+}
+
+/* Simple rendering metrics (left margin in work-area units) */
+static const int text_margin_x = 8;
+
+/* Forward decls for wrapping helpers */
+static void editor_rebuild_wrap(void);
+static void editor_wrap_clear(void);
+static void editor_wrap_append(int start, int len);
+static void editor_wrap_reserve(int need);
+static int  editor_font_width_n(const char *s, int n);
+static int  editor_find_break_len(const char *s, int maxn, int max_width);
+
+/* (newline-only helpers removed; replaced by wrapped model) */
+
+/* Forward - paints text buffer within the current redraw clip */
+static void editor_paint_text(const Desk_window_redrawblock *redraw)
+{
+    if (!text_buffer || text_length <= 0) return;
+
+    /* Ensure we have a font and set it active */
+    ensure_font();
+    if (g_font)
+    {
+        Desk_Font_SetFont(g_font);
+        /* Set outline font colours explicitly: white background, black foreground */
+        /* Values are ColourTrans (0xRRGGBB00). Offset 14 matches typical palette mapping. */
+            Desk_Font_SetFontColours(g_font, (int)0xffffff00, (int)0x00000000, 14);
+    }
+    else
+    {
+        /* Fallback: set text colour to black */
+        Desk_GFX_VDU(17); /* set text colour */
+        Desk_GFX_VDU(Desk_colour_BLACK);
+    }
+
+    /* Do not fill the window background here; let the Wimp draw the work-area background. */
+
+    /* If wrapping is enabled, tie wrap width to current window width */
+    if (g_wrap_enabled)
+    {
+        int win_width = redraw->rect.max.x - redraw->rect.min.x;
+        int desired_page_width = win_width;
+        if (desired_page_width < 64) desired_page_width = 64;
+        if (desired_page_width != g_page_width)
+        {
+            g_page_width = desired_page_width;
+            editor_rebuild_wrap();
+        }
+    }
+
+    /* Work-area vertical range overlapped by this clip rectangle */
+    int min_y = (redraw->rect.max.y - redraw->cliprect.max.y) - redraw->scroll.y;
+    int max_y = (redraw->rect.max.y - redraw->cliprect.min.y) - redraw->scroll.y;
+
+    /* Visible line range (clamped) */
+    int first_line = (min_y - g_baseline_offset) / g_line_height;
+    int last_line  = (max_y - g_baseline_offset) / g_line_height;
+    if (first_line < 0) first_line = 0;
+    /* Ensure wrap table exists for current width */
+    editor_rebuild_wrap();
+    int total_lines = g_wrap_count;
+    if (last_line >= total_lines) last_line = total_lines - 1;
+    if (last_line < first_line) return; /* nothing visible */
+
+    /* Base OS coordinates for left/top of work area: x0,y0 in screen coords */
+    int base_x = redraw->rect.min.x - redraw->scroll.x;
+    int x_left = base_x + text_margin_x;
+
+    /* Iterate visible wrapped lines only */
+    for (int line = first_line; line <= last_line; line++)
+    {
+        /* Compute y baseline in OS coords (y = box.y1 - scy - (line*lh + TEXT_Y_OFFSET)) */
+        int y_baseline = redraw->rect.max.y - redraw->scroll.y - (line * g_line_height + g_baseline_offset);
+        if (line < 0 || line >= g_wrap_count) continue;
+        int start = g_wrap_start[line];
+        int len   = g_wrap_len[line];
+        if (len <= 0)
+            continue; /* blank line */
+
+        if (g_font)
+        {
+            /* Use Paint3 with OS coordinates, explicit length, and kerning */
+            unsigned int opts = (1<<4) /* Desk_font_plot_OSCOORS */
+                              | (1<<7) /* Desk_font_STRLEN */
+                              | (1<<9) /* Desk_font_plot_KERN */;
+            Desk_Font_Paint3(
+                g_font,
+                &text_buffer[start],
+                opts,
+                x_left,
+                y_baseline,
+                NULL,
+                NULL,
+                len);
+        }
+        else
+        {
+            /* System font fallback */
+            Desk_GFX_Move(x_left, y_baseline - 2);
+            Desk_GFX_WriteN(&text_buffer[start], len);
+        }
+    }
+}
+
+int iconbar_menu_proginfo = 0;
+int iconbar_menu_quit = 1;
+
+/* Function Prototypes */
+Desk_bool wimp_handle_poll(Desk_event_pollblock *event, void *ref);
+Desk_bool wimp_handle_iconbar_click(Desk_event_pollblock *event, void *ref);
+Desk_bool wimp_handle_iconbar_menu_choice(Desk_event_pollblock *event, void *ref);
+Desk_bool wimp_handle_text_menu_choice(Desk_event_pollblock *event, void *ref);
+Desk_bool wimp_handle_window_close(Desk_event_pollblock *event, void *ref);
+Desk_bool wimp_handle_button_click(Desk_event_pollblock *event, void *ref);
+Desk_bool wimp_handle_redraw(Desk_event_pollblock *event, void *ref);
+Desk_bool wimp_handle_key_press(Desk_event_pollblock *event, void *ref);
+void editor_init(void);
+void editor_set_caret(void);
+void editor_insert_char(char c);
+void editor_delete_char(void);
+void editor_move_cursor(int dx, int dy);
+void editor_update_title(void);
+static void editor_update_extent(void);
+void main_shutdown(void);
+
+/* *********************************************************************************************************************************************************************************** */
+/* Main Polling Point                                                                                                                 */
+/* *********************************************************************************************************************************************************************************** */
+
+Desk_bool wimp_handle_poll(Desk_event_pollblock *event, void *ref)
+{
+    Desk_UNUSED(ref);
+
+    switch(event->type)
+    {
+        case Desk_event_NULL:
+            return Desk_bool_TRUE;
+            break;
+
+        case Desk_event_USERMESSAGE:
+        case Desk_event_USERMESSAGERECORDED:
+            switch(event->data.message.header.action)
+            {
+                case Desk_message_QUIT:
+                    Desk_Event_CloseDown();
+                    app_quit = Desk_bool_TRUE;
+                    break;
+            }
+            break;
+    }
+
+    return Desk_bool_TRUE;
+}
+
+/* *********************************************************************************************************************************************************************************** */
+/* Iconbar Handling                                                                                                                   */
+/* *********************************************************************************************************************************************************************************** */
+
+Desk_bool wimp_handle_iconbar_click(Desk_event_pollblock *event, void *ref)
+{
+    Desk_UNUSED(ref);
+
+    if(event->data.mouse.button.data.select)
+    {
+        /* Select click - open text window */
+        if(!text_window)
+        {
+            text_window = Desk_Window_Create("text", NULL);
+            Desk_Window_Show(text_window, Desk_open_CENTERED);
+            
+            /* Initialize text editor */
+            editor_init();
+            editor_set_caret();
+            Desk_Window_GainCaret(text_window);  /* Ensure window gains input focus */
+        }
+        else
+        {
+            Desk_Window_BringToFront(text_window);
+        }
+    }
+
+    if(event->data.mouse.button.data.menu)
+    {
+        Desk_Menu_Show(iconbar_menu_handle, event->data.mouse.pos.x, -1);
+        Desk_Event_Claim(Desk_event_MENU, Desk_event_ANY, Desk_event_ANY, wimp_handle_iconbar_menu_choice, NULL);
+    }
+
+    return Desk_bool_TRUE;
+}
+
+Desk_bool wimp_handle_iconbar_menu_choice(Desk_event_pollblock *event, void *ref)
+{
+    Desk_UNUSED(ref);
+
+    if(event->data.selection[0] == iconbar_menu_quit)
+    {
+        Desk_Event_CloseDown();
+        app_quit = Desk_bool_TRUE;
+    }
+
+    return Desk_bool_TRUE;
+}
+
+Desk_bool wimp_handle_text_menu_choice(Desk_event_pollblock *event, void *ref)
+{
+    Desk_UNUSED(ref);
+
+    /* Handle text menu selections here */
+    /* event->data.selection[0] contains the menu item selected (0-based) */
+    
+    return Desk_bool_TRUE;
+}
+
+/* *********************************************************************************************************************************************************************************** */
+/* Window Handling                                                                                                                    */
+/* *********************************************************************************************************************************************************************************** */
+
+Desk_bool wimp_handle_window_close(Desk_event_pollblock *event, void *ref)
+{
+    Desk_UNUSED(ref);
+
+    if(event->data.openblock.window == text_window)
+    {
+        text_window = 0;
+    }
+
+    Desk_Window_Hide(event->data.openblock.window);
+    return Desk_bool_TRUE;
+}
+
+Desk_bool wimp_handle_button_click(Desk_event_pollblock *event, void *ref)
+{
+    Desk_UNUSED(ref);
+
+    if (event->data.mouse.window == proginfo_window)
+    {
+        /* Handle any proginfo button clicks here if needed */
+        Desk_Window_Hide(event->data.mouse.window);
+    }
+    else if (event->data.mouse.window == text_window)
+    {
+        /* Check for left mouse button (Select) to set input focus */
+        if (event->data.mouse.button.data.select)
+        {
+            /* Set caret to give window input focus */
+            editor_set_caret();
+            Desk_Window_GainCaret(text_window);  /* Ensure window gains input focus */
+            Desk_Window_ForceWholeRedraw(text_window);  /* Redraw on click */
+            
+            /* TODO: Calculate exact cursor position from click coordinates */
+            /* int char_width = 16; */
+            /* int char_height = 20; */
+            /* int click_x = event->data.mouse.pos.x; */
+            /* int click_y = event->data.mouse.pos.y; */
+        }
+        /* Check for middle mouse button (Menu button) */
+        else if (event->data.mouse.button.data.menu)
+        {
+            /* Show text menu at mouse position */
+            if (text_menu_handle)
+            {
+                Desk_Menu_Show(text_menu_handle, event->data.mouse.pos.x, event->data.mouse.pos.y);
+                Desk_Event_Claim(Desk_event_MENU, Desk_event_ANY, Desk_event_ANY, wimp_handle_text_menu_choice, NULL);
+            }
+        }
+    }
+
+    return Desk_bool_TRUE;
+}
+
+Desk_bool wimp_handle_redraw(Desk_event_pollblock *event, void *ref)
+{
+    Desk_window_redrawblock redraw;
+    Desk_bool more;
+    
+    Desk_UNUSED(ref);
+
+    redraw.window = event->data.openblock.window;
+    
+    /* Add bounds checking to prevent crashes */
+    if (redraw.window <= 0) return Desk_bool_TRUE;
+    
+    Desk_Wimp_RedrawWindow(&redraw, &more);
+
+    while (more)
+    {
+        if (redraw.window == text_window)
+        {
+            /* No origin changes, no CLG; paint only visible lines using OS coords */
+            editor_paint_text(&redraw);
+        }
+        
+        Desk_Wimp_GetRectangle(&redraw, &more);
+    }
+
+    return Desk_bool_TRUE;
+}
+
+Desk_bool wimp_handle_key_press(Desk_event_pollblock *event, void *ref)
+{
+    Desk_UNUSED(ref);
+
+    /* Handle key presses - simplified check */
+    /* If we have a text window and it should have focus, handle the key */
+    if (!text_window || !caret_visible)
+    {
+        /* Pass key to system if no text window or no caret */
+        Desk_Wimp_ProcessKey(event->data.key.code);
+        return Desk_bool_TRUE;
+    }
+
+    /* Handle key presses */
+    switch (event->data.key.code)
+    {
+        case Desk_keycode_BACKSPACE:
+            if (cursor_pos > 0)
+            {
+                cursor_pos--;
+                editor_delete_char();
+                text_modified = Desk_bool_TRUE;
+                editor_update_title();
+                editor_set_caret();
+                Desk_Window_ForceWholeRedraw(text_window);
+            }
+            break;
+
+        case Desk_keycode_DELETE:
+            if (cursor_pos < text_length)
+            {
+                editor_delete_char();
+                text_modified = Desk_bool_TRUE;
+                editor_update_title();
+                editor_set_caret();
+                Desk_Window_ForceWholeRedraw(text_window);
+            }
+            break;
+
+        case Desk_keycode_RETURN:
+            editor_insert_char('\n');
+            text_modified = Desk_bool_TRUE;
+            editor_update_title();
+            editor_set_caret();
+            Desk_Window_ForceWholeRedraw(text_window);
+            break;
+
+        case Desk_keycode_CURSORLEFT:
+            if (cursor_pos > 0)
+            {
+                cursor_pos--;
+                editor_set_caret();
+            }
+            break;
+
+        case Desk_keycode_CURSORRIGHT:
+            if (cursor_pos < text_length)
+            {
+                cursor_pos++;
+                editor_set_caret();
+            }
+            break;
+
+        case Desk_keycode_CURSORDOWN:
+            editor_move_cursor(0, -1);
+            break;
+
+        case Desk_keycode_CURSORUP:
+            editor_move_cursor(0, 1);
+            break;
+
+        default:
+            /* Handle printable characters */
+            if (event->data.key.code >= 32 && event->data.key.code < 127)
+            {
+                editor_insert_char((char)event->data.key.code);
+                text_modified = Desk_bool_TRUE;
+                editor_update_title();
+                editor_set_caret();
+                Desk_Window_ForceWholeRedraw(text_window);
+            }
+            else
+            {
+                /* Pass unhandled keys to system */
+                Desk_Wimp_ProcessKey(event->data.key.code);
+            }
+            break;
+    }
+
+    return Desk_bool_TRUE;
+}
+
+/* *********************************************************************************************************************************************************************************** */
+/* Text Editor Functions                                                                                                              */
+/* *********************************************************************************************************************************************************************************** */
+
+void editor_init(void)
+{
+    /* Initialize text buffer with malloc */
+    text_buffer_size = INITIAL_BUFFER_SIZE;
+    text_buffer = malloc(text_buffer_size);
+    
+    if (!text_buffer)
+    {
+        fprintf(stderr, "Failed to allocate text buffer\n");
+        exit(1);
+    }
+    
+    /* Initialize text buffer */
+    text_buffer[0] = '\0';
+    text_length = 0;
+    cursor_pos = 0;
+    cursor_x = 0;
+    cursor_y = 0;
+    caret_visible = Desk_bool_FALSE;
+    text_modified = Desk_bool_FALSE;
+    
+    /* Set initial window title */
+    editor_update_title();
+
+    /* Set initial extent */
+    editor_update_extent();
+}
+
+void editor_set_caret(void)
+{
+    /* Ensure wrap table and map cursor to wrapped line/column */
+    editor_rebuild_wrap();
+    int line = 0;
+    int col = 0;
+    if (g_wrap_count > 0)
+    {
+        int pos = cursor_pos;
+        int lo = 0, hi = g_wrap_count - 1, found = -1;
+        while (lo <= hi)
+        {
+            int mid = (lo + hi) >> 1;
+            int s = g_wrap_start[mid];
+            int e = s + g_wrap_len[mid];
+            if (pos < s) hi = mid - 1; else if (pos > e) lo = mid + 1; else { found = mid; break; }
+        }
+        if (found < 0)
+        {
+            if (pos >= g_wrap_start[g_wrap_count-1] + g_wrap_len[g_wrap_count-1]) found = g_wrap_count - 1; else found = 0;
+        }
+        line = found;
+        int start = g_wrap_start[line];
+        int len   = g_wrap_len[line];
+        if (pos < start) pos = start; if (pos > start + len) pos = start + len;
+        col = pos - start;
+    }
+
+    /* Compute caret position in work-area coordinates. */
+    if (text_window)
+    {
+        /* Use measured width for proportional font */
+        int xoff = 0;
+        if (g_font && col > 0)
+        {
+            int start = g_wrap_start[line];
+            xoff = editor_font_width_n(&text_buffer[start], col);
+        }
+        else
+        {
+            xoff = col * g_char_width;
+        }
+        cursor_x = text_margin_x + xoff;
+        cursor_y = -(line * g_line_height + g_baseline_offset); /* work-area y goes negative downwards */
+
+        /* Use official API to set caret */
+        Desk_caret_block caret;
+        caret.window = text_window;
+        caret.icon = -1;
+        caret.offset.x = cursor_x;
+        caret.offset.y = cursor_y;
+    caret.height = g_line_height;
+        caret.index = -1;
+        Desk_Wimp_SetCaretPosition(&caret);
+        caret_visible = Desk_bool_TRUE;
+    }
+}
+
+void editor_insert_char(char c)
+{
+    /* Check if we need to expand the buffer */
+    if (text_length >= text_buffer_size - 1)
+    {
+        /* Expand by 1KB */
+        size_t new_size = text_buffer_size + 1024;
+        char *new_buffer = realloc(text_buffer, new_size);
+        if (!new_buffer)
+        {
+            /* Failed to expand - ignore character */
+            return;
+        }
+        text_buffer = new_buffer;
+        text_buffer_size = new_size;
+    }
+    
+    /* Move text after cursor position */
+    int i;
+    for (i = text_length; i > cursor_pos; i--)
+    {
+        text_buffer[i] = text_buffer[i-1];
+    }
+    
+    /* Insert character */
+    text_buffer[cursor_pos] = c;
+    text_length++;
+    cursor_pos++;
+    text_buffer[text_length] = '\0';
+    
+    /* Mark as modified and update title */
+    text_modified = Desk_bool_TRUE;
+    editor_update_title();
+    editor_update_extent();
+}
+
+void editor_delete_char(void)
+{
+    /* Check if there's a character to delete */
+    if (cursor_pos >= text_length) return;
+    
+    /* Move text after cursor position */
+    int i;
+    for (i = cursor_pos; i < text_length - 1; i++)
+    {
+        text_buffer[i] = text_buffer[i+1];
+    }
+    
+    text_length--;
+    text_buffer[text_length] = '\0';
+    
+    /* Mark as modified and update title */
+    text_modified = Desk_bool_TRUE;
+    editor_update_title();
+    editor_update_extent();
+}
+
+void editor_move_cursor(int dx, int dy)
+{
+    /* Wrapped vertical movement preserving x column */
+    Desk_UNUSED(dx);
+    if (dy == 0) return;
+
+    editor_rebuild_wrap();
+    if (g_wrap_count <= 0) return;
+
+    /* Find current wrapped line and column */
+    int pos = cursor_pos;
+    int cur = 0;
+    {
+        int lo = 0, hi = g_wrap_count - 1, found = -1;
+        while (lo <= hi)
+        {
+            int mid = (lo + hi) >> 1;
+            int s = g_wrap_start[mid];
+            int e = s + g_wrap_len[mid];
+            if (pos < s) hi = mid - 1; else if (pos > e) lo = mid + 1; else { found = mid; break; }
+        }
+        if (found < 0) found = (pos >= g_wrap_start[g_wrap_count-1] + g_wrap_len[g_wrap_count-1]) ? g_wrap_count - 1 : 0;
+        cur = found;
+    }
+
+    /* Target line */
+    int tgt = cur + (dy > 0 ? -1 : 1); /* Up: dy>0 means move visually up which is previous line index? Our baseline numbers increase downward so previous line is cur-1. Here dy>0 (up) -> tgt=cur-1 */
+    if (dy > 0) tgt = cur - 1; else if (dy < 0) tgt = cur + 1;
+    if (tgt < 0 || tgt >= g_wrap_count) return;
+
+    /* Desired x column in pixels from margin */
+    int col_px = 0;
+    if (g_font)
+    {
+        int start = g_wrap_start[cur];
+        int col = pos - start; if (col < 0) col = 0; if (col > g_wrap_len[cur]) col = g_wrap_len[cur];
+        col_px = editor_font_width_n(&text_buffer[start], col);
+        if (col_px < 0) col_px = 0;
+    }
+    else
+    {
+        int start = g_wrap_start[cur];
+        int col = pos - start; if (col < 0) col = 0; if (col > g_wrap_len[cur]) col = g_wrap_len[cur];
+        col_px = col * g_char_width;
+    }
+
+    /* Find character index on target line closest to desired pixel column */
+    int tstart = g_wrap_start[tgt];
+    int tlen   = g_wrap_len[tgt];
+    int new_col = 0;
+    if (g_font && tlen > 0)
+    {
+        /* Binary search using width measurement */
+        int lo = 0, hi = tlen, best = 0;
+        while (lo <= hi)
+        {
+            int mid = (lo + hi) >> 1;
+            int w = editor_font_width_n(&text_buffer[tstart], mid);
+            if (w <= col_px) { best = mid; lo = mid + 1; } else hi = mid - 1;
+        }
+        new_col = best;
+    }
+    else
+    {
+        new_col = (col_px + g_char_width/2) / g_char_width; if (new_col > tlen) new_col = tlen;
+    }
+
+    cursor_pos = tstart + new_col;
+    editor_set_caret();
+}
+
+void editor_update_title(void)
+{
+    if (text_window)
+    {
+        char title[100];
+        
+        if (text_modified)
+        {
+            sprintf(title, "OakEdit*[%d/%d]", text_length, (int)text_buffer_size);
+        }
+        else
+        {
+            sprintf(title, "OakEdit[%d/%d]", text_length, (int)text_buffer_size);
+        }
+        
+        Desk_Window_SetTitle(text_window, title);
+    }
+}
+
+static void editor_update_extent(void)
+{
+    /* Set work-area extent based on wrapped content */
+    if (text_window)
+    {
+        ensure_font();
+        editor_rebuild_wrap();
+        int lines = g_wrap_count > 0 ? g_wrap_count : 1;
+        int extent_y = lines * g_line_height + g_baseline_offset + g_line_height/4;
+        if (extent_y < 400) extent_y = 400; /* minimum */
+        int extent_x = g_page_width;
+        if (!g_wrap_enabled)
+        {
+            /* Compute max line width for unwrapped text */
+            int maxw = 0;
+            int i = 0;
+            while (i < text_length)
+            {
+                int line_start = i;
+                int line_end = i;
+                while (line_end < text_length && text_buffer[line_end] != '\n') line_end++;
+                int len = line_end - line_start;
+                if (len > 0)
+                {
+                    int w = editor_font_width_n(&text_buffer[line_start], len);
+                    if (w > maxw) maxw = w;
+                }
+                i = (line_end < text_length && text_buffer[line_end] == '\n') ? line_end + 1 : line_end;
+            }
+            extent_x = text_margin_x * 2 + maxw;
+            if (extent_x < 800) extent_x = 800; /* keep a sensible minimum */
+            g_page_width = extent_x;
+        }
+        Desk_Window_SetExtent(text_window, 0, -extent_y, extent_x, 0);
+    }
+}
+
+/* ========================= */
+/* Wrapping helper functions */
+/* ========================= */
+
+static void editor_wrap_clear(void)
+{
+    g_wrap_count = 0;
+}
+
+static void editor_wrap_reserve(int need)
+{
+    if (need <= g_wrap_cap) return;
+    int new_cap = g_wrap_cap ? g_wrap_cap : 64;
+    while (new_cap < need) new_cap *= 2;
+    int *new_start = (int *)realloc(g_wrap_start, new_cap * sizeof(int));
+    int *new_len   = (int *)realloc(g_wrap_len,   new_cap * sizeof(int));
+    if (!new_start || !new_len)
+        return; /* allocation failure: keep old tables */
+    g_wrap_start = new_start;
+    g_wrap_len   = new_len;
+    g_wrap_cap   = new_cap;
+}
+
+static void editor_wrap_append(int start, int len)
+{
+    editor_wrap_reserve(g_wrap_count + 1);
+    if (g_wrap_count < g_wrap_cap)
+    {
+        g_wrap_start[g_wrap_count] = start;
+        g_wrap_len[g_wrap_count]   = len;
+        g_wrap_count++;
+    }
+}
+
+static int editor_font_width_n(const char *s, int n)
+{
+    if (!g_font || !s || n <= 0) return 0;
+    Desk_Font_SetFont(g_font);
+    Desk_font_info bb;
+    /* Measure only the first n characters by temporarily NUL-terminating. */
+    char *m = (char *)s;
+    char saved = m[n];
+    m[n] = '\0';
+    Desk_Font_StringBBox(m, &bb);
+    m[n] = saved;
+    int w = bb.maxx - bb.minx;
+    if (w <= 0) w = n * g_char_width; /* fallback */
+    return w;
+}
+
+static int editor_find_break_len(const char *s, int maxn, int max_width)
+{
+    if (maxn <= 0) return 0;
+    int lo = 1, hi = maxn, best = 0;
+    while (lo <= hi)
+    {
+        int mid = (lo + hi) >> 1;
+        int w = editor_font_width_n(s, mid);
+        if (w <= max_width) { best = mid; lo = mid + 1; }
+        else hi = mid - 1;
+    }
+    return best;
+}
+
+static void editor_rebuild_wrap(void)
+{
+    if (!text_buffer)
+    {
+        editor_wrap_clear();
+        return;
+    }
+
+    ensure_font();
+    int wrap_width = g_page_width - 2 * text_margin_x;
+    if (wrap_width < 32) wrap_width = 32;
+
+    editor_wrap_clear();
+
+    int i = 0;
+    while (i < text_length)
+    {
+        /* Unwrapped: each physical line becomes a single wrapped entry */
+        if (!g_wrap_enabled)
+        {
+            int line_start = i;
+            int line_end = i;
+            while (line_end < text_length && text_buffer[line_end] != '\n') line_end++;
+            int len = line_end - line_start;
+            editor_wrap_append(line_start, len);
+            i = (line_end < text_length && text_buffer[line_end] == '\n') ? line_end + 1 : line_end;
+            continue;
+        }
+
+        /* Wrapped: split long paragraphs against wrap_width */
+        if (text_buffer[i] == '\n')
+        {
+            editor_wrap_append(i, 0);
+            i++;
+            continue;
+        }
+
+        int para_start = i;
+        int para_end = i;
+        while (para_end < text_length && text_buffer[para_end] != '\n') para_end++;
+
+        int pos = para_start;
+        while (pos < para_end)
+        {
+            int remaining = para_end - pos;
+            int take = 0;
+            int w_all = editor_font_width_n(&text_buffer[pos], remaining);
+            if (w_all <= wrap_width)
+            {
+                take = remaining;
+            }
+            else
+            {
+                take = editor_find_break_len(&text_buffer[pos], remaining, wrap_width);
+                if (take <= 0) take = 1;
+            }
+
+            if (pos + take < para_end)
+            {
+                int last_space = -1;
+                for (int k = take - 1; k >= 0; k--)
+                {
+                    char ch = text_buffer[pos + k];
+                    if (ch == ' ' || ch == '\t') { last_space = k; break; }
+                }
+                if (last_space > 0)
+                {
+                    editor_wrap_append(pos, last_space);
+                    pos += last_space + 1; /* skip space */
+                    continue;
+                }
+            }
+
+            editor_wrap_append(pos, take);
+            pos += take;
+        }
+
+        i = para_end;
+    }
+
+    if (text_length > 0 && text_buffer[text_length - 1] == '\n')
+    {
+        editor_wrap_append(text_length, 0);
+    }
+
+    if (text_length == 0 && g_wrap_count == 0)
+    {
+        editor_wrap_append(0, 0);
+    }
+}
+
+/* *********************************************************************************************************************************************************************************** */
+/* Main Shutdown Point                                                                                                                */
+/* *********************************************************************************************************************************************************************************** */
+
+void main_shutdown(void)
+{
+    /* Cleanup malloc'd buffer */
+    if (text_buffer)
+    {
+        free(text_buffer);
+        text_buffer = NULL;
+    }
+    if (g_wrap_start) { free(g_wrap_start); g_wrap_start = NULL; g_wrap_cap = 0; g_wrap_count = 0; }
+    if (g_wrap_len)   { free(g_wrap_len);   g_wrap_len = NULL; }
+    
+    Desk_Event_CloseDown();
+    exit(0);
+}
+
+/* *********************************************************************************************************************************************************************************** */
+/* Main Entry Point                                                                                                                   */
+/* *********************************************************************************************************************************************************************************** */
+
+int main(int argc, char *argv[])
+{
+    char iconbar_menu_title[100];
+    char iconbar_menu[150];
+    char text_menu_title[100];
+    char text_menu[150];
+    char app_name[35];
+    char app_version[100];
+
+    Desk_UNUSED(argc);
+    Desk_UNUSED(argv);
+
+    /* Initialize resources */
+    strcpy(app_name, "Oak Edit");
+    Desk_Resource_Initialise("OakEdit");
+
+    /* Load messages */
+    Desk_Msgs_LoadFile("Messages");
+    Desk_Msgs_Lookup("app.version", app_version, 100);
+    Desk_Msgs_Lookup("iconbar.title", iconbar_menu_title, 100);
+    Desk_Msgs_Lookup("iconbar.menu", iconbar_menu, 150);
+    Desk_Msgs_Lookup("text.title", text_menu_title, 100);
+    Desk_Msgs_Lookup("text.menu", text_menu, 150);
+
+    /* Initialize Desk systems */
+    Desk_Event_Initialise(app_name);
+    Desk_EventMsg_Initialise();
+    Desk_Screen_CacheModeInfo();
+
+    /* Create iconbar icon */
+    iconbar_icon_handle = Desk_Icon_BarIcon("!OakEdit", Desk_iconbar_RIGHT);
+    
+    /* Create iconbar menu */
+    iconbar_menu_handle = Desk_Menu_New(iconbar_menu_title, iconbar_menu);
+
+    /* Create text menu */
+    text_menu_handle = Desk_Menu_New(text_menu_title, text_menu);
+
+    /* Claim events */
+    Desk_Event_Claim(Desk_event_NULL, Desk_event_ANY, Desk_event_ANY, wimp_handle_poll, NULL);
+    Desk_Event_Claim(Desk_event_REDRAW, Desk_event_ANY, Desk_event_ANY, wimp_handle_redraw, NULL);
+    Desk_Event_Claim(Desk_event_OPEN, Desk_event_ANY, Desk_event_ANY, Desk_Handler_OpenWindow, NULL);
+    Desk_Event_Claim(Desk_event_CLOSE, Desk_event_ANY, Desk_event_ANY, wimp_handle_window_close, NULL);
+    Desk_Event_Claim(Desk_event_CLICK, Desk_event_ANY, Desk_event_ANY, wimp_handle_button_click, NULL);
+    Desk_Event_Claim(Desk_event_CLICK, Desk_window_ICONBAR, iconbar_icon_handle, wimp_handle_iconbar_click, NULL);
+    Desk_Event_Claim(Desk_event_KEY, Desk_event_ANY, Desk_event_ANY, wimp_handle_key_press, NULL);
+    Desk_Event_Claim(Desk_event_USERMESSAGE, Desk_event_ANY, Desk_event_ANY, wimp_handle_poll, NULL);
+    Desk_Event_Claim(Desk_event_USERMESSAGERECORDED, Desk_event_ANY, Desk_event_ANY, wimp_handle_poll, NULL);
+
+    /* Initialize templates */
+    Desk_Template_Initialise();
+    Desk_Template_UseOutlineFonts();
+    Desk_Template_LoadFile("Templates");
+
+    /* Create windows */
+    proginfo_window = Desk_Window_Create("proginfo", NULL);
+    xfer_send_window = Desk_Window_Create("xfer_send", NULL);
+    
+    /* Set up program info */
+    Desk_Icon_SetText(proginfo_window, 0, app_version);
+
+    /* Attach proginfo as submenu to Info entry */
+    Desk_Menu_AddSubMenu(iconbar_menu_handle, iconbar_menu_proginfo, (Desk_menu_block *)proginfo_window);
+
+    /* Attach xfer_send as submenu to Save entry in text menu */
+    Desk_Menu_AddSubMenu(text_menu_handle, 1, (Desk_menu_block *)xfer_send_window);
+
+    atexit(main_shutdown);
+
+    /* Main polling loop */
+    while(app_quit == Desk_bool_FALSE) 
+        Desk_Event_Poll();
+
+    return 0;
+}

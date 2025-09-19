@@ -15,6 +15,4 @@ Set Alias$@RunType_EEF "OakRun %%*0"
 
 Set OakScript$Debug 1
 
-RMEnsure OakScript 0.0 RMLoad <OakScript$Dir>.OakScript
-
-Filer_OpenDir OakScript:Logs
+RMEnsure OakScript 0.00 RMLoad <OakScript$Dir>.OakScript
